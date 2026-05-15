@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import pynetbox
+from requests.adapters import HTTPAdapter
 
 
 # --------------------------------------------------------------------------- #
@@ -68,6 +69,7 @@ class NetBoxClient:
         threading: bool = False,
         strict_filters: bool = True,
         log: Optional[logging.Logger] = None,
+        pool_size: int = 20,
     ) -> None:
         self.base_url       = base_url.rstrip("/")
         self.token          = token
@@ -80,6 +82,15 @@ class NetBoxClient:
         self.nb.http_session.verify = verify_ssl
         if threading:
             self.nb.threading = True
+
+        # Raise the urllib3 connection pool size so concurrent threads never
+        # exhaust the pool and trigger "Connection pool is full" warnings.
+        # The default HTTPAdapter pool is 10; with multi-threaded workers that
+        # exceeds the limit quickly.  pool_size=20 comfortably covers the
+        # default --max-workers=5 with headroom for bursts.
+        _adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size)
+        self.nb.http_session.mount("https://", _adapter)
+        self.nb.http_session.mount("http://",  _adapter)
 
     # ----------------------------------------------------------------------- #
     # Device methods                                                           #
