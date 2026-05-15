@@ -1,0 +1,43 @@
+# requirements.txt
+# =============================================================================
+# Core dependencies — always required
+# =============================================================================
+
+# HTTP client (RESTCONF transport + pynetbox HTTP layer)
+requests>=2.31.0
+
+# SSH / CLI automation for Cisco IOS, IOS-XE, NX-OS
+netmiko>=4.3.0
+
+# TextFSM templates for Netmiko structured CLI output.
+# Provides the "textfsm" parser path in CiscoDeviceClient.
+ntc-templates>=5.0.0
+
+# NETCONF client (ncclient)
+ncclient>=0.6.15
+
+# XML ↔ dict conversion for NETCONF responses
+xmltodict>=0.13.0
+
+# NetBox REST API client
+pynetbox>=7.3.0
+
+
+# =============================================================================
+# Optional — Genie / pyATS structured CLI parsing
+# =============================================================================
+# Installing either option below enables the "genie" parser path in
+# CiscoDeviceClient and produces richer structured output for Cisco commands.
+#
+# The full pyATS suite is recommended for production pipelines and CI/CD
+# because it includes all platform parsers and test-framework utilities:
+#
+#   pip install "pyats[full]>=23.0"
+#
+# For a smaller footprint (parser support only, no test framework):
+#
+#   pip install "genie>=23.0" "pyats>=23.0"
+#
+# Uncomment ONE of the following lines to pin a version in this file:
+#pyats[full]>=23.0
+genie>=23.0
