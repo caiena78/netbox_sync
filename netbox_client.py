@@ -2104,6 +2104,89 @@ class NetBoxClient:
                 f"{interface_name!r}: {exc}"
             ) from exc
 
+    def update_interface_state_cf(
+        self,
+        device_id: int,
+        interface_name: str,
+        state_value: str,
+    ) -> dict:
+        """
+        Idempotently update the ``interface_state`` custom field on a NetBox
+        interface.
+
+        Only the ``interface_state`` key inside ``custom_fields`` is written;
+        all other custom fields on the record are untouched (NetBox merges
+        partial ``custom_fields`` dicts on PATCH).
+
+        Parameters
+        ----------
+        device_id : int
+            NetBox device primary key.
+        interface_name : str
+            Exact interface name as it appears in NetBox.
+        state_value : str
+            One of ``"UP"``, ``"DOWN"``, ``"ADMIN DOWN"``, or ``"UNKNOWN"``.
+
+        Returns
+        -------
+        dict
+            Interface record with ``"_action": "updated"|"skipped"``.
+
+        Raises
+        ------
+        NetBoxClientError
+            When the interface cannot be found or the API call fails.
+        """
+        self.log.debug(
+            "update_interface_state_cf device_id=%s iface=%r state=%r",
+            device_id, interface_name, state_value,
+        )
+        try:
+            existing = list(
+                self.nb.dcim.interfaces.filter(
+                    device_id=device_id, name=interface_name
+                )
+            )
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"update_interface_state_cf: lookup failed for "
+                f"{interface_name!r} on device_id={device_id}: {exc}"
+            ) from exc
+
+        if not existing:
+            # Interface not yet in NetBox — graceful skip; will be created
+            # on the next full sync run.
+            self.log.debug(
+                "update_interface_state_cf: %r not found on device_id=%s "
+                "— skipped",
+                interface_name, device_id,
+            )
+            return {"_action": "skipped", "name": interface_name}
+
+        rec      = existing[0]
+        rec_dict = self._to_dict(rec)
+        cur_cf   = rec_dict.get("custom_fields") or {}
+        cur_val  = str(cur_cf.get("interface_state") or "")
+
+        if cur_val == state_value:
+            self.log.debug(
+                "update_interface_state_cf: %r already %r — skipped",
+                interface_name, state_value,
+            )
+            rec_dict["_action"] = "skipped"
+            return rec_dict
+
+        try:
+            rec.update({"custom_fields": {"interface_state": state_value}})
+            d = self._to_dict(rec)
+            d["_action"] = "updated"
+            return d
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"update_interface_state_cf: update failed for "
+                f"{interface_name!r} payload={{'interface_state': {state_value!r}}}: {exc}"
+            ) from exc
+
     # ----------------------------------------------------------------------- #
     # Device and interface custom fields                                        #
     # ----------------------------------------------------------------------- #

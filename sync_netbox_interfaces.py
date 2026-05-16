@@ -1689,18 +1689,31 @@ def _sync_interface_states(
         iface_name     = expand_interface_name(state["name"])
         enabled        = state["enabled"]
         mark_connected = state["mark_connected"]
+        iface_state    = state.get("state") or "UNKNOWN"
 
         # Route to the correct VC member device, just like _sync_trunks does.
         target_id = resolve_target_device_id(iface_name, device_id, vc_member_map)
 
+        log.debug(
+            "%-30s  Interface %s state detected as %s",
+            device_name, iface_name, iface_state,
+        )
+
         if dry_run:
             log.info(
-                "DRY-RUN  %-30s  state %-38s  dev_id=%-6s  enabled=%s  connected=%s",
-                device_name, iface_name, target_id, enabled, mark_connected,
+                "DRY-RUN  %-30s  state %-38s  dev_id=%-6s  enabled=%s  "
+                "connected=%s  interface_state=%s",
+                device_name, iface_name, target_id,
+                enabled, mark_connected, iface_state,
+            )
+            log.info(
+                "DRY-RUN  %-30s  Would update interface_state to %s on %s",
+                device_name, iface_state, iface_name,
             )
             updated += 1
             continue
 
+        # ── Update enabled + mark_connected (existing logic) ─────────────
         try:
             result = nb.update_interface_admin_oper(
                 target_id, iface_name, enabled, mark_connected
@@ -1713,6 +1726,31 @@ def _sync_interface_states(
                 )
         except NetBoxClientError as exc:
             errors.append(f"State {iface_name!r}: {exc}")
+
+        # ── Update interface_state custom field ───────────────────────────
+        try:
+            cf_result = nb.update_interface_state_cf(
+                target_id, iface_name, iface_state
+            )
+            cf_action = cf_result.get("_action", "skipped")
+            if cf_action == "updated":
+                log.info(
+                    "%-30s  Updating NetBox interface %s custom field "
+                    "interface_state → %s",
+                    device_name, iface_name, iface_state,
+                )
+            else:
+                log.debug(
+                    "%-30s  No change needed for %s (state already %s)",
+                    device_name, iface_name, iface_state,
+                )
+        except NetBoxClientError as exc:
+            log.error(
+                "%-30s  interface_state CF update failed for %r payload=%r: %s",
+                device_name, iface_name,
+                {"interface_state": iface_state}, exc,
+            )
+            errors.append(f"interface_state CF {iface_name!r}: {exc}")
 
     return updated, errors
 

@@ -159,6 +159,55 @@ def _normalize_duplex(raw: Any) -> Optional[str]:
     return "auto"
 
 
+# ---------------------------------------------------------------------------
+# Interface operational-state normalisation
+# ---------------------------------------------------------------------------
+
+# Maps ``show interfaces status`` keywords to the three canonical state
+# strings used by the NetBox ``interface_state`` custom field.
+# Keys that are absent from this dict are treated as ``"DOWN"``.
+_IFACE_STATE_FROM_STATUS: Dict[str, str] = {
+    "connected":    "UP",
+    "disabled":     "ADMIN DOWN",
+    "err-disabled": "ADMIN DOWN",
+    "errdisabled":  "ADMIN DOWN",
+}
+
+
+def normalize_interface_state(status: str, protocol: str = "") -> str:
+    """
+    Map a Cisco interface status + line-protocol pair to a canonical state.
+
+    This function targets the verbose output of ``show interfaces`` (one
+    interface per block) where two independent values are reported::
+
+        GigabitEthernet1/0/1 is up, line protocol is up
+        GigabitEthernet1/0/2 is administratively down, line protocol is down
+        GigabitEthernet1/0/3 is down, line protocol is down
+
+    Parameters
+    ----------
+    status : str
+        The interface status string (the portion after ``"is "`` on the first
+        line of a ``show interfaces`` block), e.g. ``"up"``,
+        ``"administratively down"``, ``"down"``.
+    protocol : str
+        The line-protocol string, e.g. ``"up"`` or ``"down"``.
+
+    Returns
+    -------
+    str
+        ``"UP"``, ``"DOWN"``, or ``"ADMIN DOWN"``.
+    """
+    s = (status or "").strip().lower()
+    p = (protocol or "").strip().lower()
+    if "administratively down" in s:
+        return "ADMIN DOWN"
+    if s == "up" and p == "up":
+        return "UP"
+    return "DOWN"
+
+
 # NETCONF XML filters for VLAN and IP/interface operational data.
 _VLAN_NETCONF_FILTER: Dict[str, Optional[str]] = {
     "iosxe": (
@@ -3641,6 +3690,15 @@ class CiscoDeviceClient:
         Parse ``show interfaces status`` into state records.
 
         Finds the status keyword on each data line regardless of column shift.
+
+        Each entry in the returned list::
+
+            {
+                "name":           str,
+                "enabled":        bool,
+                "mark_connected": bool,
+                "state":          "UP" | "DOWN" | "ADMIN DOWN",
+            }
         """
         # Admin-shutdown states — map to enabled=False in NetBox.
         _DOWN_STATES  = {"disabled", "err-disabled", "errdisabled"}
@@ -3669,13 +3727,16 @@ class CiscoDeviceClient:
                     break
             if status_lc is None:
                 continue
-            iface_name = self._expand_iface(parts[0])
+            iface_name     = self._expand_iface(parts[0])
             enabled        = status_lc not in _DOWN_STATES
             mark_connected = status_lc in _UP_OP_STATES
+            # Derive the three-state operational value from the status keyword.
+            iface_state    = _IFACE_STATE_FROM_STATUS.get(status_lc, "DOWN")
             result.append({
                 "name":           iface_name,
                 "enabled":        enabled,
                 "mark_connected": mark_connected,
+                "state":          iface_state,
             })
         return result
 
