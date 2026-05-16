@@ -694,6 +694,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--transport",
         choices=["auto", "cli", "restconf", "netconf"],
         default="auto",
+        type=str.lower,   # accept "CLI", "NetConf", etc. — normalise to lowercase
         help="Transport (auto applies OS fallback chain; default: auto)",
     )
     run.add_argument("--dry-run", action="store_true",
@@ -2558,6 +2559,123 @@ def _relocate_interface(
 
 
 # --------------------------------------------------------------------------- #
+# Transport selection                                                          #
+# --------------------------------------------------------------------------- #
+
+def _collect_interface_inventory(
+    cisco: "CiscoDeviceClient",
+    transport: str,
+    device_name: str,
+) -> Tuple[List[dict], Optional[str], List[dict]]:
+    """
+    Collect the interface inventory from a Cisco device using the requested
+    transport, applying strict enforcement rules.
+
+    **Explicit transport** (``"cli"``, ``"netconf"``, ``"restconf"``)
+        A single attempt is made against that transport.  On failure the
+        exception propagates immediately — **no fallback is attempted**.
+
+    **Auto transport** (``"auto"``)
+        Transports are tried in the OS-appropriate order
+        (``NETCONF → RESTCONF → CLI`` for IOS-XE; ``CLI`` for NX-OS / IOS).
+        Each attempt is logged individually so the caller can see exactly
+        what succeeded or failed.
+
+    Parameters
+    ----------
+    cisco : CiscoDeviceClient
+        Already-constructed (but not necessarily connected) client.
+    transport : str
+        One of ``"auto"``, ``"cli"``, ``"netconf"``, ``"restconf"``
+        (lowercase; normalisation is the caller's responsibility).
+    device_name : str
+        Used in log messages.
+
+    Returns
+    -------
+    tuple
+        ``(interfaces, transport_used, attempts)``
+
+        - *interfaces* — list of normalised interface dicts
+        - *transport_used* — the transport that succeeded, or ``None``
+        - *attempts* — list of ``{"transport": str, "ok": bool, "error": str|None}``
+          dicts, one per attempted transport
+
+    Raises
+    ------
+    CiscoDeviceClientError
+        When the selected transport fails (explicit mode) or all transports
+        fail (auto mode).
+    """
+    transport = transport.lower()
+
+    # ── Explicit transport: one attempt, zero fallback ─────────────────────
+    if transport != "auto":
+        t_label = transport.upper()
+        log.info(
+            "%-30s  Transport mode set to %s (no fallback)",
+            device_name, t_label,
+        )
+        log.info(
+            "%-30s  Attempting %s only (fallback disabled)",
+            device_name, t_label,
+        )
+        try:
+            interfaces = cisco.get_interfaces_inventory(transport=transport)
+            attempts   = [{"transport": transport, "ok": True, "error": None}]
+            return interfaces, transport, attempts
+        except CiscoDeviceClientError as exc:
+            log.error(
+                "%-30s  %s connection failed — no fallback due to explicit "
+                "transport setting: %s",
+                device_name, t_label, exc,
+            )
+            raise   # propagate to sync_device for summary recording
+
+    # ── Auto transport: OS-aware fallback chain ─────────────────────────────
+    # The CiscoDeviceClient already knows the correct per-OS order
+    # (NETCONF → RESTCONF → CLI for IOS-XE; CLI for NX-OS / IOS).
+    # We delegate the actual connection attempts to get_interfaces_inventory_auto()
+    # and emit INFO-level logs per attempt so operators see the full picture.
+    from cisco_device_client import _AUTO_TRANSPORT_ORDER   # module constant
+    order = _AUTO_TRANSPORT_ORDER.get(cisco.os_type, ["cli"])
+    order_str = " → ".join(t.upper() for t in order)
+    log.info(
+        "%-30s  Transport mode AUTO: trying %s",
+        device_name, order_str,
+    )
+
+    result = cisco.get_interfaces_inventory_auto()
+
+    # Emit one INFO line per attempt so the log tells the full story.
+    for attempt in result.get("attempts", []):
+        t_label = attempt["transport"].upper()
+        if attempt["ok"]:
+            log.info("%-30s  Attempting %s... succeeded", device_name, t_label)
+        else:
+            err = attempt.get("error") or "unknown error"
+            log.info("%-30s  Attempting %s... failed: %s", device_name, t_label, err)
+
+    interfaces     = result.get("interfaces") or []
+    transport_used = result.get("transport_used")
+    attempts       = result.get("attempts") or []
+
+    if not transport_used:
+        log.error(
+            "%-30s  All transport methods failed for device", device_name
+        )
+        raise CiscoDeviceClientError(
+            f"All transports failed for {device_name}: "
+            + "; ".join(
+                f"{a['transport']}={a.get('error', 'failed')}"
+                for a in attempts
+            )
+        )
+
+    return interfaces, transport_used, attempts
+
+
+# --------------------------------------------------------------------------- #
 # Per-device orchestration                                                     #
 # --------------------------------------------------------------------------- #
 
@@ -2717,23 +2835,18 @@ def sync_device(
 
     # ── Stage 1: interface inventory (speed / duplex / description) ────────
     try:
-        if args.transport == "auto":
-            inv_result = cisco.get_interfaces_inventory_auto()
-            interfaces            = inv_result["interfaces"]
-            summary["transport_used"] = inv_result["transport_used"]
-            summary["attempts"]       = inv_result["attempts"]
-        else:
-            interfaces = cisco.get_interfaces_inventory(transport=args.transport)
-            summary["transport_used"] = args.transport
-            summary["attempts"] = [
-                {"transport": args.transport, "ok": True, "error": None}
-            ]
+        interfaces, transport_used, attempts = _collect_interface_inventory(
+            cisco=cisco,
+            transport=args.transport,
+            device_name=device_name,
+        )
+        summary["transport_used"] = transport_used
+        summary["attempts"]       = attempts
     except CiscoDeviceClientError as exc:
         summary["errors"].append(f"Interface collection failed: {exc}")
-        if args.transport != "auto":
-            summary["attempts"] = [
-                {"transport": args.transport, "ok": False, "error": str(exc)}
-            ]
+        summary["attempts"] = [
+            {"transport": args.transport, "ok": False, "error": str(exc)}
+        ]
         cisco._cli_disconnect()
         return summary
 
