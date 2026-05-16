@@ -13,8 +13,9 @@ from __future__ import annotations
 import ipaddress
 import json
 import logging
+import re
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pynetbox
 from requests.adapters import HTTPAdapter
@@ -502,6 +503,205 @@ class NetBoxClient:
                 f"update_interface(id={interface_id}) failed: {exc}"
             ) from exc
 
+    def find_interface_by_name_vc(
+        self,
+        device_ids: List[int],
+        name: str,
+    ) -> Optional[dict]:
+        """
+        Search for an interface by *name* across all device IDs in *device_ids*.
+
+        Returns the first matching interface dict (with all fields from
+        ``_to_dict``), or ``None`` when the interface is not found on any
+        of the listed devices.  Useful for detecting mis-placed interfaces
+        across Virtual Chassis members before relocating them.
+
+        Parameters
+        ----------
+        device_ids : list[int]
+            NetBox device primary keys to search, in order.
+        name : str
+            Exact interface name (e.g. ``"TwentyFiveGigE2/1/0/28"``).
+
+        Returns
+        -------
+        dict or None
+        """
+        for dev_id in device_ids:
+            self.log.debug(
+                "find_interface_by_name_vc dev_id=%s name=%r", dev_id, name
+            )
+            try:
+                recs = list(
+                    self.nb.dcim.interfaces.filter(device_id=dev_id, name=name)
+                )
+            except pynetbox.RequestError as exc:
+                self.log.debug(
+                    "find_interface_by_name_vc: lookup failed dev_id=%s name=%r: %s",
+                    dev_id, name, exc,
+                )
+                continue
+            if recs:
+                return self._to_dict(recs[0])
+        return None
+
+    def list_interface_ips(self, interface_id: int) -> List[dict]:
+        """
+        Return all IP address records currently assigned to *interface_id*.
+
+        Parameters
+        ----------
+        interface_id : int
+            NetBox interface primary key.
+
+        Returns
+        -------
+        list[dict]
+            Zero or more IP address records.
+
+        Raises
+        ------
+        NetBoxClientError
+            On API failure.
+        """
+        self.log.debug("list_interface_ips interface_id=%s", interface_id)
+        try:
+            recs = list(
+                self.nb.ipam.ip_addresses.filter(interface_id=interface_id)
+            )
+            return [self._to_dict(r) for r in recs]
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"list_interface_ips(id={interface_id}) failed: {exc}"
+            ) from exc
+
+    def delete_interface(self, interface_id: int) -> None:
+        """
+        Delete a NetBox interface by primary key.
+
+        Raises
+        ------
+        NetBoxClientError
+            On API failure, including dependency conflicts (e.g. a cable is
+            attached — caller should catch and skip relocation in that case).
+        """
+        self.log.debug("delete_interface id=%s", interface_id)
+        try:
+            rec = self.nb.dcim.interfaces.get(interface_id)
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"delete_interface: lookup for id={interface_id} failed: {exc}"
+            ) from exc
+
+        if rec is None:
+            self.log.debug("delete_interface: id=%s already absent", interface_id)
+            return
+
+        try:
+            ok = rec.delete()
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"delete_interface(id={interface_id}) failed: {exc}"
+            ) from exc
+
+        if not ok:
+            raise NetBoxClientError(
+                f"delete_interface(id={interface_id}): API returned false"
+            )
+
+    # ----------------------------------------------------------------------- #
+    # Module bay + installed module methods                                    #
+    # ----------------------------------------------------------------------- #
+
+    def build_device_module_map(self, device_id: int) -> Dict[int, int]:
+        """
+        Return ``{slot_number: module_id}`` for all installed modules on a device.
+
+        Slot numbers are extracted from module-bay name/label using a
+        tolerant numeric search: ``"Slot 1"``, ``"LC-1"``, ``"Bay1"``,
+        ``"1"``, etc.  When multiple numeric tokens appear in a label the
+        last one is used (e.g. ``"LC-Slot-1"`` → 1).
+
+        Module bays that have no installed module are skipped.  When two
+        bays resolve to the same slot number the first one is kept and a
+        debug message is emitted.
+
+        Parameters
+        ----------
+        device_id : int
+            NetBox device primary key.
+
+        Returns
+        -------
+        dict
+            ``{slot_int: module_id_int}``; empty when no modules are
+            installed or the device has no module bays.
+
+        Raises
+        ------
+        NetBoxClientError
+            On API failure.
+        """
+        self.log.debug("build_device_module_map device_id=%s", device_id)
+        mapping: Dict[int, int] = {}
+
+        try:
+            bays = list(self.nb.dcim.module_bays.filter(device_id=device_id))
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"build_device_module_map: bay lookup failed for "
+                f"device_id={device_id}: {exc}"
+            ) from exc
+
+        for bay in bays:
+            bay_dict = self._to_dict(bay)
+            bay_id   = bay_dict.get("id")
+            label    = bay_dict.get("name") or bay_dict.get("label") or ""
+            slot_num = self._extract_slot_number(label)
+            if slot_num is None:
+                self.log.debug(
+                    "build_device_module_map: bay_id=%s label=%r — "
+                    "no numeric slot token; skipped", bay_id, label,
+                )
+                continue
+
+            try:
+                mods = list(self.nb.dcim.modules.filter(module_bay_id=bay_id))
+            except pynetbox.RequestError as exc:
+                self.log.debug(
+                    "build_device_module_map: module lookup for bay_id=%s: %s",
+                    bay_id, exc,
+                )
+                continue
+
+            if not mods:
+                continue
+
+            mod_id = int(mods[0].id)
+            if slot_num in mapping:
+                self.log.debug(
+                    "build_device_module_map: duplicate slot_num=%s for "
+                    "device_id=%s — keeping first match", slot_num, device_id,
+                )
+            else:
+                mapping[slot_num] = mod_id
+
+        self.log.debug(
+            "build_device_module_map device_id=%s → %d slot(s): %s",
+            device_id, len(mapping), mapping,
+        )
+        return mapping
+
+    @staticmethod
+    def _extract_slot_number(label: str) -> Optional[int]:
+        """
+        Extract the last numeric token from a module-bay name/label.
+
+        Returns ``None`` when no digit sequence is found.
+        """
+        tokens = re.findall(r"\d+", label or "")
+        return int(tokens[-1]) if tokens else None
+
     # ----------------------------------------------------------------------- #
     # Helper / private methods                                                 #
     # ----------------------------------------------------------------------- #
@@ -986,6 +1186,121 @@ class NetBoxClient:
             ) from exc
 
     # ----------------------------------------------------------------------- #
+    # VRF methods                                                              #
+    # ----------------------------------------------------------------------- #
+
+    def get_vrf_by_name(self, name: str) -> Optional[dict]:
+        """
+        Return the first NetBox VRF whose name matches *name* exactly,
+        or ``None`` when not found.
+
+        The lookup is case-sensitive (NetBox VRF names are case-sensitive).
+
+        Parameters
+        ----------
+        name : str
+            VRF name, e.g. ``"CORP"`` or ``"MGMT"``.
+
+        Returns
+        -------
+        dict or None
+
+        Raises
+        ------
+        NetBoxClientError
+            On API failure.
+        """
+        self.log.debug("get_vrf_by_name name=%r", name)
+        try:
+            recs = list(self.nb.ipam.vrfs.filter(name=name))
+            return self._to_dict(recs[0]) if recs else None
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"get_vrf_by_name({name!r}) failed: {exc}"
+            ) from exc
+
+    def create_vrf(
+        self,
+        name: str,
+        enforce_unique: bool = False,
+    ) -> dict:
+        """
+        Create a new VRF in NetBox.
+
+        Parameters
+        ----------
+        name : str
+            VRF name, e.g. ``"CORP"``.
+        enforce_unique : bool
+            Whether NetBox should prevent duplicate IP addresses within this
+            VRF (default ``False`` — flexible for automated environments).
+
+        Returns
+        -------
+        dict
+            The newly created VRF record.
+
+        Raises
+        ------
+        NetBoxClientError
+            On API failure.
+        """
+        self.log.debug("create_vrf name=%r enforce_unique=%s", name, enforce_unique)
+        payload: dict = {
+            "name":           name,
+            "enforce_unique": enforce_unique,
+        }
+        try:
+            rec = self.nb.ipam.vrfs.create(payload)
+            return self._to_dict(rec)
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"create_vrf({name!r}) failed: {exc}"
+            ) from exc
+
+    def ensure_vrf(
+        self,
+        name: str,
+        enforce_unique: bool = False,
+    ) -> dict:
+        """
+        Idempotently ensure a VRF named *name* exists in NetBox.
+
+        Returns the existing record when already present
+        (``"_action": "existing"``), or the newly created record
+        (``"_action": "created"``).
+
+        Parameters
+        ----------
+        name : str
+            VRF name (case-sensitive).
+        enforce_unique : bool
+            Passed to :meth:`create_vrf` when the VRF is absent.
+
+        Returns
+        -------
+        dict
+            VRF record with ``"_action": "existing"|"created"``.
+
+        Raises
+        ------
+        NetBoxClientError
+            On API failure.
+        """
+        self.log.debug("ensure_vrf name=%r", name)
+        existing = self.get_vrf_by_name(name)
+        if existing:
+            existing["_action"] = "existing"
+            self.log.debug("ensure_vrf: %r already exists id=%s", name, existing["id"])
+            return existing
+
+        self.log.info("ensure_vrf: VRF %r not found in NetBox — creating", name)
+        rec = self.create_vrf(name, enforce_unique=enforce_unique)
+        rec["_action"] = "created"
+        self.log.info("ensure_vrf: VRF %r created id=%s", name, rec["id"])
+        return rec
+
+    # ----------------------------------------------------------------------- #
     # Prefix methods                                                           #
     # ----------------------------------------------------------------------- #
 
@@ -994,19 +1309,22 @@ class NetBoxClient:
         prefix_cidr: str,
         site_id: int,
         vlan_id: Optional[int] = None,
+        vrf_id: Optional[int] = None,
     ) -> dict:
         """
-        Ensure a prefix exists in NetBox, assigned to the correct site.
+        Ensure a prefix exists in NetBox, assigned to the correct site and VRF.
 
         Behaviour
         ---------
-        - **Not found**: create with site scope (and optional VLAN).
-        - **Found, same site, correct VLAN**: return as-is
-          (``_action="existing"``).
-        - **Found, wrong site**: update site scope
-          (``_action="moved_site"``).
-        - **Found, VLAN differs**: update VLAN field
+        - **Not found** (matching CIDR *and* VRF): create with site scope,
+          optional VLAN, and optional VRF.
+        - **Found, all fields match**: return as-is (``_action="existing"``).
+        - **Found, wrong site**: update site scope (``_action="moved_site"``).
+        - **Found, VLAN or VRF differs**: update those fields
           (``_action="updated"``).
+
+        When *vrf_id* is supplied the lookup is scoped to that VRF so the
+        same CIDR can coexist under multiple VRFs without conflict.
 
         Parameters
         ----------
@@ -1016,24 +1334,36 @@ class NetBoxClient:
             NetBox site ID to assign.
         vlan_id : int, optional
             NetBox VLAN ID to link to the prefix.
+        vrf_id : int, optional
+            NetBox VRF primary key.  ``None`` means the global routing table.
 
         Returns
         -------
         dict
             Prefix record plus ``"_action"`` metadata key.
         """
-        self.log.debug("ensure_prefix %s site_id=%s vlan_id=%s",
-                       prefix_cidr, site_id, vlan_id)
+        self.log.debug(
+            "ensure_prefix %s site_id=%s vlan_id=%s vrf_id=%s",
+            prefix_cidr, site_id, vlan_id, vrf_id,
+        )
+
+        # Scope the lookup to the correct VRF so the same CIDR under different
+        # VRFs is treated as a distinct prefix.
         try:
-            existing = list(self.nb.ipam.prefixes.filter(prefix=prefix_cidr))
+            filter_kwargs: dict = {"prefix": prefix_cidr}
+            if vrf_id is not None:
+                filter_kwargs["vrf_id"] = vrf_id
+            else:
+                filter_kwargs["vrf"] = "null"   # global table
+            existing = list(self.nb.ipam.prefixes.filter(**filter_kwargs))
         except pynetbox.RequestError as exc:
             raise NetBoxClientError(
                 f"Prefix lookup failed {prefix_cidr!r}: {exc}"
             ) from exc
 
         if not existing:
-            payload = self._build_prefix_payload(prefix_cidr, site_id, vlan_id)
-            self.log.debug("ensure_prefix: creating %s", prefix_cidr)
+            payload = self._build_prefix_payload(prefix_cidr, site_id, vlan_id, vrf_id)
+            self.log.debug("ensure_prefix: creating %s vrf_id=%s", prefix_cidr, vrf_id)
             try:
                 rec = self.nb.ipam.prefixes.create(payload)
                 d = self._to_dict(rec)
@@ -1046,7 +1376,7 @@ class NetBoxClient:
 
         rec = existing[0]
         rec_dict = self._to_dict(rec)
-        changes = self._diff_prefix_site_vlan(rec_dict, site_id, vlan_id)
+        changes = self._diff_prefix_site_vlan(rec_dict, site_id, vlan_id, vrf_id)
         if not changes:
             rec_dict["_action"] = "existing"
             return rec_dict
@@ -1314,6 +1644,7 @@ class NetBoxClient:
         prefix_cidr: str,
         site_id: int,
         vlan_id: Optional[int] = None,
+        vrf_id: Optional[int] = None,
     ) -> dict:
         """Build a minimal prefix creation payload with correct site scoping."""
         payload: dict = {"prefix": prefix_cidr}
@@ -1324,6 +1655,8 @@ class NetBoxClient:
             payload["site"] = site_id
         if vlan_id is not None:
             payload["vlan"] = vlan_id
+        if vrf_id is not None:
+            payload["vrf"] = vrf_id
         return payload
 
     def _diff_prefix_site_vlan(
@@ -1331,8 +1664,9 @@ class NetBoxClient:
         existing: dict,
         site_id: int,
         vlan_id: Optional[int],
+        vrf_id: Optional[int] = None,
     ) -> dict:
-        """Return changes needed to align a prefix's site/scope and VLAN."""
+        """Return changes needed to align a prefix's site/scope, VLAN, and VRF."""
         changes: dict = {}
 
         current_site_id = self._extract_site_id_from_prefix(existing)
@@ -1351,6 +1685,14 @@ class NetBoxClient:
                 changes["vlan"] = vlan_id
                 self.log.debug(
                     "_diff_prefix_site_vlan: vlan %s → %s", cur_vlan_id, vlan_id
+                )
+
+        if vrf_id is not None:
+            cur_vrf_id = self._extract_nested_id(existing.get("vrf"))
+            if cur_vrf_id != vrf_id:
+                changes["vrf"] = vrf_id
+                self.log.debug(
+                    "_diff_prefix_site_vlan: vrf %s → %s", cur_vrf_id, vrf_id
                 )
 
         return changes
@@ -1984,16 +2326,22 @@ class NetBoxClient:
         ip_cidr: str,
         device_id: int,
         interface_name: str,
+        vrf_id: Optional[int] = None,
     ) -> dict:
         """
         Create (or confirm) a NetBox IP address and assign it to an interface.
 
         Idempotent
         ----------
-        - IP already exists **and** is assigned to this interface → ``"skipped"``.
-        - IP already exists but assigned elsewhere (or unassigned) → update
-          the assignment to this interface (``"updated"``).
-        - IP does not exist → create it and assign it (``"created"``).
+        - IP exists, correct interface, correct VRF → ``"skipped"``.
+        - IP exists, correct interface, **wrong VRF** → controlled delete +
+          recreate with the correct VRF and all preserved metadata
+          (``"created"``).
+        - IP exists, wrong interface, correct VRF → update assignment
+          (``"updated"``).
+        - IP exists, wrong interface, wrong VRF → delete + recreate on the
+          correct interface with the correct VRF (``"created"``).
+        - IP does not exist → create with VRF and assign it (``"created"``).
 
         Parameters
         ----------
@@ -2003,6 +2351,10 @@ class NetBoxClient:
             NetBox device primary key that owns the interface.
         interface_name : str
             Exact interface name as it appears in NetBox, e.g. ``"Vlan20"``.
+        vrf_id : int, optional
+            NetBox VRF primary key.  ``None`` means the global routing table.
+            When supplied, an existing IP in a different VRF will be detected
+            as a mismatch and safely deleted + recreated.
 
         Returns
         -------
@@ -2015,8 +2367,8 @@ class NetBoxClient:
             When the interface cannot be found or the API call fails.
         """
         self.log.debug(
-            "ensure_ip_on_interface ip=%r device_id=%s iface=%r",
-            ip_cidr, device_id, interface_name,
+            "ensure_ip_on_interface ip=%r device_id=%s iface=%r vrf_id=%s",
+            ip_cidr, device_id, interface_name, vrf_id,
         )
 
         # ── Resolve the interface record ───────────────────────────────────
@@ -2051,7 +2403,7 @@ class NetBoxClient:
             ip_rec  = existing_ips[0]
             ip_dict = self._to_dict(ip_rec)
 
-            # Check current assignment
+            # ── Evaluate assignment and VRF ────────────────────────────────
             assigned_obj  = ip_dict.get("assigned_object")
             assigned_type = ip_dict.get("assigned_object_type", "")
             assigned_id   = (
@@ -2059,23 +2411,43 @@ class NetBoxClient:
                 if isinstance(assigned_obj, dict)
                 else getattr(assigned_obj, "id", None)
             )
+            cur_vrf_id = self._extract_nested_id(ip_dict.get("vrf"))
 
-            already_here = (
+            correct_iface = (
                 "interface" in str(assigned_type).lower()
                 and assigned_id == iface_id
             )
-            if already_here:
+            correct_vrf = cur_vrf_id == vrf_id   # None == None is valid (global)
+
+            # Perfect match — nothing to do.
+            if correct_iface and correct_vrf:
                 self.log.debug(
-                    "ensure_ip_on_interface: %r already assigned to %r — skipped",
+                    "ensure_ip_on_interface: %r already assigned to %r "
+                    "with correct VRF — skipped",
                     ip_cidr, interface_name,
                 )
                 ip_dict["_action"] = "skipped"
                 return ip_dict
 
-            # Reassign to the correct interface
-            self.log.debug(
-                "ensure_ip_on_interface: updating %r assignment → %r",
-                ip_cidr, interface_name,
+            # VRF mismatch — safest recovery is delete + recreate.
+            if not correct_vrf:
+                self.log.warning(
+                    "ensure_ip_on_interface: IP %r exists in VRF id=%s "
+                    "but target VRF id=%s — performing controlled recreate",
+                    ip_cidr, cur_vrf_id, vrf_id,
+                )
+                return self._recreate_ip_with_correct_vrf(
+                    ip_rec=ip_rec,
+                    ip_dict=ip_dict,
+                    ip_cidr=ip_cidr,
+                    new_vrf_id=vrf_id,
+                    iface_id=iface_id,
+                )
+
+            # Wrong interface but correct VRF — reassign in-place.
+            self.log.info(
+                "ensure_ip_on_interface: Assigning VRF %r to IP %r → %r",
+                vrf_id, ip_cidr, interface_name,
             )
             try:
                 ip_rec.update({
@@ -2091,16 +2463,23 @@ class NetBoxClient:
                 ) from exc
 
         # ── Create the IP address and assign it ────────────────────────────
+        if vrf_id is not None:
+            self.log.info(
+                "ensure_ip_on_interface: Assigning VRF id=%s to IP %r",
+                vrf_id, ip_cidr,
+            )
         self.log.debug(
-            "ensure_ip_on_interface: creating %r and assigning to %r",
-            ip_cidr, interface_name,
+            "ensure_ip_on_interface: creating %r and assigning to %r vrf_id=%s",
+            ip_cidr, interface_name, vrf_id,
         )
-        payload = {
+        payload: dict = {
             "address":              ip_cidr,
             "assigned_object_type": "dcim.interface",
             "assigned_object_id":   iface_id,
             "status":               "active",
         }
+        if vrf_id is not None:
+            payload["vrf"] = vrf_id
         try:
             ip_rec = self.nb.ipam.ip_addresses.create(payload)
             d = self._to_dict(ip_rec)
@@ -2111,9 +2490,330 @@ class NetBoxClient:
                 f"ensure_ip_on_interface: create failed for {ip_cidr!r}: {exc}"
             ) from exc
 
+    def _recreate_ip_with_correct_vrf(
+        self,
+        ip_rec: Any,
+        ip_dict: dict,
+        ip_cidr: str,
+        new_vrf_id: Optional[int],
+        iface_id: int,
+    ) -> dict:
+        """
+        Delete an IP address record and recreate it with the correct VRF.
+
+        All restorable metadata (DNS name, description, role, status, tenant,
+        tags, custom fields, nat_inside) is preserved via :meth:`_snapshot_ip`.
+        The new record is assigned to *iface_id* with *new_vrf_id*.
+
+        Parameters
+        ----------
+        ip_rec
+            Raw pynetbox Record (needed for ``.delete()``).
+        ip_dict : dict
+            Already-converted dict of the same record.
+        ip_cidr : str
+            The address string (used for the recreated record).
+        new_vrf_id : int or None
+            Target VRF primary key (``None`` = global table).
+        iface_id : int
+            Target interface primary key.
+
+        Returns
+        -------
+        dict
+            Newly created IP record with ``"_action": "created"``.
+
+        Raises
+        ------
+        NetBoxClientError
+            When deletion or recreation fails.
+        """
+        ip_id = ip_dict.get("id")
+        snap  = self._snapshot_ip(ip_dict)
+
+        self.log.warning(
+            "_recreate_ip_with_correct_vrf: Deleting IP id=%s address=%r",
+            ip_id, ip_cidr,
+        )
+        try:
+            ip_rec.delete()
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"_recreate_ip_with_correct_vrf: delete failed for "
+                f"id={ip_id}: {exc}"
+            ) from exc
+
+        # Build recreation payload from snapshot, then override VRF + assignment
+        recreate_payload = dict(snap)
+        recreate_payload.update({
+            "address":              ip_cidr,
+            "assigned_object_type": "dcim.interface",
+            "assigned_object_id":   iface_id,
+        })
+        recreate_payload.setdefault("status", "active")
+
+        # Apply the correct VRF (or explicitly clear it for global)
+        if new_vrf_id is not None:
+            recreate_payload["vrf"] = new_vrf_id
+        else:
+            recreate_payload.pop("vrf", None)
+
+        self.log.warning(
+            "_recreate_ip_with_correct_vrf: Recreating %r with vrf_id=%s "
+            "on iface_id=%s",
+            ip_cidr, new_vrf_id, iface_id,
+        )
+        try:
+            new_rec = self.nb.ipam.ip_addresses.create(recreate_payload)
+            d = self._to_dict(new_rec)
+            d["_action"] = "created"
+            return d
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"_recreate_ip_with_correct_vrf: recreate failed for "
+                f"{ip_cidr!r} payload={recreate_payload}: {exc}"
+            ) from exc
+
+    def reassign_ip_to_interface(
+        self,
+        ip_id: int,
+        interface_id: int,
+    ) -> dict:
+        """
+        Reassign an existing IP address record to a different interface.
+
+        Used during interface relocation to move IPs from the old (deleted)
+        interface to the newly recreated one, preserving all other IP fields.
+
+        Parameters
+        ----------
+        ip_id : int
+            NetBox IP address primary key.
+        interface_id : int
+            NetBox interface primary key to assign the IP to.
+
+        Returns
+        -------
+        dict
+            Updated IP address record with ``"_action": "updated"``.
+
+        Raises
+        ------
+        NetBoxClientError
+            If the IP is not found or the update fails.
+        """
+        self.log.debug(
+            "reassign_ip_to_interface ip_id=%s iface_id=%s", ip_id, interface_id
+        )
+        try:
+            rec = self.nb.ipam.ip_addresses.get(ip_id)
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"reassign_ip_to_interface: IP lookup for id={ip_id} failed: {exc}"
+            ) from exc
+
+        if rec is None:
+            raise NetBoxClientError(
+                f"reassign_ip_to_interface: IP id={ip_id} not found."
+            )
+
+        try:
+            rec.update({
+                "assigned_object_type": "dcim.interface",
+                "assigned_object_id":   interface_id,
+            })
+            d = self._to_dict(rec)
+            d["_action"] = "updated"
+            return d
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"reassign_ip_to_interface(ip_id={ip_id}, "
+                f"iface_id={interface_id}) failed: {exc}"
+            ) from exc
+
+    def get_ip_by_address(self, address: str) -> Optional[dict]:
+        """
+        Return the first NetBox IP address record whose ``address`` field
+        matches *address* exactly (including prefix length), or ``None``.
+
+        Parameters
+        ----------
+        address : str
+            CIDR address string, e.g. ``"10.1.2.1/24"`` or ``"10.1.2.1/32"``.
+
+        Returns
+        -------
+        dict or None
+
+        Raises
+        ------
+        NetBoxClientError
+            On API failure.
+        """
+        self.log.debug("get_ip_by_address %r", address)
+        try:
+            recs = list(self.nb.ipam.ip_addresses.filter(address=address))
+            return self._to_dict(recs[0]) if recs else None
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"get_ip_by_address({address!r}) failed: {exc}"
+            ) from exc
+
+    def delete_ip(self, ip_id: int) -> None:
+        """
+        Delete an IP address record by primary key.
+
+        Raises
+        ------
+        NetBoxClientError
+            If the record is not found, cannot be deleted, or the API call
+            fails (including dependency conflicts).
+        """
+        self.log.debug("delete_ip id=%s", ip_id)
+        try:
+            rec = self.nb.ipam.ip_addresses.get(ip_id)
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"delete_ip: lookup for id={ip_id} failed: {exc}"
+            ) from exc
+
+        if rec is None:
+            self.log.debug("delete_ip: id=%s already absent", ip_id)
+            return
+
+        try:
+            ok = rec.delete()
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"delete_ip(id={ip_id}) failed: {exc}"
+            ) from exc
+
+        if not ok:
+            raise NetBoxClientError(
+                f"delete_ip(id={ip_id}): API returned false"
+            )
+
+    def create_ip(self, payload: dict) -> dict:
+        """
+        Create an IP address record from *payload*.
+
+        Parameters
+        ----------
+        payload : dict
+            Must include ``"address"``.  Any additional fields (``vrf``,
+            ``tenant``, ``status``, ``dns_name``, ``description``,
+            ``assigned_object_type``, ``assigned_object_id``, etc.) are
+            forwarded to the API as-is.
+
+        Returns
+        -------
+        dict
+            The newly created IP address record.
+
+        Raises
+        ------
+        NetBoxClientError
+            On missing required fields or API failure.
+        """
+        self._validate_payload(payload, required=["address"], context="create_ip")
+        self.log.debug("create_ip address=%r", payload.get("address"))
+        try:
+            rec = self.nb.ipam.ip_addresses.create(payload)
+            return self._to_dict(rec)
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"create_ip failed (address={payload.get('address')!r}): {exc}"
+            ) from exc
+
     # ----------------------------------------------------------------------- #
     # FHRP group management                                                    #
     # ----------------------------------------------------------------------- #
+
+    @staticmethod
+    def _snapshot_ip(ip_rec: dict) -> dict:
+        """
+        Extract all re-creatable fields from an IP address record dict.
+
+        Excludes read-only / auto-populated fields and fields that are set
+        separately during recreation (``address``, assignment fields).
+
+        Choice fields (``status``, ``role``) are unwrapped from
+        ``{"value": "...", "label": "..."}`` to the plain value string.
+        FK fields (``vrf``, ``tenant``, ``nat_inside``) are reduced to their
+        integer IDs.  Tags are reduced to a list of ``{"slug": "..."}``
+        objects as NetBox's API requires on write.
+
+        Parameters
+        ----------
+        ip_rec : dict
+            Plain dict from ``_to_dict()``.
+
+        Returns
+        -------
+        dict
+            Payload-ready dict suitable for ``create_ip``.
+        """
+        _SKIP: Set[str] = {
+            "id", "url", "display", "created", "last_updated", "_action",
+            "family",                       # auto-detected from address
+            "assigned_object",              # nested read-only, set via _type/_id
+            "assigned_object_type",         # caller sets these explicitly
+            "assigned_object_id",
+            "nat_outside",                  # reverse relation — not settable
+        }
+        snap: dict = {}
+        for key, val in ip_rec.items():
+            if key in _SKIP or val is None:
+                continue
+            if key == "tags" and isinstance(val, list):
+                slugs = [
+                    {"slug": item["slug"]}
+                    for item in val
+                    if isinstance(item, dict) and "slug" in item
+                ]
+                if slugs:
+                    snap["tags"] = slugs
+            elif isinstance(val, dict):
+                if "value" in val:
+                    snap[key] = val["value"]   # choice field → scalar
+                elif "id" in val:
+                    snap[key] = val["id"]      # FK → integer ID
+                # dicts without id/value are skipped (unresolvable nested obj)
+            elif isinstance(val, list):
+                ids = [
+                    item["id"] if isinstance(item, dict) and "id" in item
+                    else item
+                    for item in val
+                    if isinstance(item, (int, dict))
+                ]
+                if ids:
+                    snap[key] = ids
+            else:
+                snap[key] = val
+        return snap
+
+    @staticmethod
+    def _parse_duplicate_address(error_str: str) -> Optional[str]:
+        """
+        Extract the first CIDR address from a NetBox 400 "Duplicate IP"
+        error message string.
+
+        NetBox formats the error as::
+
+            {'address': ['Duplicate IP address found in global table: 10.1.2.3/24']}
+
+        Parameters
+        ----------
+        error_str : str
+            The full stringified error (from ``str(exc)`` or ``str(exc.error)``).
+
+        Returns
+        -------
+        str or None
+            CIDR string (e.g. ``"10.1.2.3/24"``), or ``None`` when not found.
+        """
+        m = re.search(r"(\d{1,3}(?:\.\d{1,3}){3}/\d{1,2})", error_str)
+        return m.group(1) if m else None
 
     def ensure_fhrp_group(
         self,
@@ -2121,6 +2821,7 @@ class NetBoxClient:
         group_id: int,
         vip: str,
         description: Optional[str] = None,
+        dry_run: bool = False,
     ) -> dict:
         """
         Ensure an FHRP group exists in NetBox with the correct virtual IP.
@@ -2141,6 +2842,9 @@ class NetBoxClient:
         description : str, optional
             Stored in the ``description`` field — used here to record the
             current operational state (e.g. ``"active"``, ``"standby"``).
+        dry_run : bool
+            When ``True``, VIP assignment is logged but no NetBox writes
+            are made inside ``_ensure_fhrp_vip``.
 
         Returns
         -------
@@ -2211,18 +2915,56 @@ class NetBoxClient:
 
         # Ensure the VIP is assigned to this FHRP group
         vip_cidr = vip if "/" in vip else f"{vip}/32"
-        self._ensure_fhrp_vip(fhrp_id, vip_cidr)
+        self._ensure_fhrp_vip(fhrp_id, vip_cidr, dry_run=dry_run)
 
         return rec_dict
 
-    def _ensure_fhrp_vip(self, fhrp_group_id: int, vip_cidr: str) -> None:
+    def _ensure_fhrp_vip(
+        self,
+        fhrp_group_id: int,
+        vip_cidr: str,
+        dry_run: bool = False,
+    ) -> None:
         """
-        Ensure *vip_cidr* is assigned to the FHRP group as a NetBox IP address.
+        Ensure *vip_cidr* is assigned to *fhrp_group_id* as a NetBox IP address.
 
-        Idempotent.  Failures are logged as warnings rather than raised so
-        that a VIP assignment error does not block the group itself from being
-        returned to the caller.
+        Idempotent.  Failures are logged as warnings (never raised) so that
+        a VIP assignment problem does not prevent the FHRP group record itself
+        from being returned to the caller.
+
+        Recovery behaviour
+        ------------------
+        When a plain ``create`` call returns a 400 "Duplicate IP address"
+        error the method attempts two escalating recovery steps before giving
+        up:
+
+        **Step 1 — non-destructive reattach**
+            The conflicting IP record is looked up in NetBox.  Its
+            ``assigned_object_type`` and ``assigned_object_id`` are updated
+            to point at *fhrp_group_id*, and the address is normalised to the
+            requested *vip_cidr* (typically ``/32``).  If this succeeds the
+            method returns immediately.
+
+        **Step 2 — controlled delete + recreate**
+            When Step 1 fails (e.g. another dependency prevents the update),
+            all metadata from the conflicting record is snapshotted, the
+            record is deleted, and a new IP record is created with:
+
+            - the requested *vip_cidr* address
+            - assignment to *fhrp_group_id*
+            - all snapshotted metadata preserved (VRF, tenant, DNS name,
+              description, role, status, tags, custom_fields, nat_inside)
+
+            If deletion fails (e.g. another IP references this one via
+            ``nat_inside``), no further action is taken and an error is
+            logged so the caller can investigate.
+
+        Dry-run
+        -------
+        When *dry_run* is ``True`` no NetBox writes are made; intended
+        actions are logged at INFO level instead.
         """
+        # ── 1. Look up the exact requested address ────────────────────────
         try:
             existing_ips = list(self.nb.ipam.ip_addresses.filter(address=vip_cidr))
         except Exception as exc:
@@ -2231,37 +2973,325 @@ class NetBoxClient:
             )
             return
 
+        # ── 2. Already correctly assigned? ────────────────────────────────
         for ip_rec in existing_ips:
             ip_d = self._to_dict(ip_rec)
             if ip_d.get("assigned_object_type") == "ipam.fhrpgroup":
-                obj = ip_d.get("assigned_object") or {}
+                obj    = ip_d.get("assigned_object") or {}
                 obj_id = (
                     obj.get("id") if isinstance(obj, dict)
                     else getattr(obj, "id", None)
                 )
                 if obj_id == fhrp_group_id:
                     self.log.debug(
-                        "_ensure_fhrp_vip: %r already on FHRP group %s",
+                        "_ensure_fhrp_vip: %r already on FHRP group %s — no action",
                         vip_cidr, fhrp_group_id,
                     )
-                    return  # already assigned to the correct group
+                    return
 
-        # Not found — create the IP address
-        payload = {
+        # ── 3. Exact address exists but is on a different object ──────────
+        #       Step 1: try non-destructive reattach first.
+        if existing_ips:
+            ip_d   = self._to_dict(existing_ips[0])
+            ip_id  = ip_d.get("id")
+            cur_assignment = ip_d.get("assigned_object_type") or "unassigned"
+
+            self.log.info(
+                "_ensure_fhrp_vip: Attempting to reattach existing IP %r "
+                "(id=%s, currently %s) to FHRP group %s",
+                vip_cidr, ip_id, cur_assignment, fhrp_group_id,
+            )
+
+            if dry_run:
+                self.log.info(
+                    "DRY-RUN _ensure_fhrp_vip: would reattach %r "
+                    "(id=%s) → FHRP group %s",
+                    vip_cidr, ip_id, fhrp_group_id,
+                )
+                return
+
+            try:
+                existing_ips[0].update({
+                    "assigned_object_type": "ipam.fhrpgroup",
+                    "assigned_object_id":   fhrp_group_id,
+                })
+                self.log.info(
+                    "_ensure_fhrp_vip: Successfully reattached IP %r "
+                    "(id=%s) to FHRP group %s",
+                    vip_cidr, ip_id, fhrp_group_id,
+                )
+                return
+            except pynetbox.RequestError as exc:
+                self.log.warning(
+                    "_ensure_fhrp_vip: Step 1 reattach failed for %r "
+                    "(id=%s): %s — proceeding to controlled recreation",
+                    vip_cidr, ip_id, exc,
+                )
+                self._recover_fhrp_vip_duplicate(
+                    fhrp_group_id=fhrp_group_id,
+                    vip_cidr=vip_cidr,
+                    conflicting_rec=ip_d,
+                    dry_run=dry_run,
+                )
+                return
+
+        # ── 4. Address not in NetBox at all — create it ───────────────────
+        if dry_run:
+            self.log.info(
+                "DRY-RUN _ensure_fhrp_vip: would create %r → FHRP group %s",
+                vip_cidr, fhrp_group_id,
+            )
+            return
+
+        create_payload: dict = {
             "address":              vip_cidr,
             "assigned_object_type": "ipam.fhrpgroup",
             "assigned_object_id":   fhrp_group_id,
             "status":               "active",
         }
         self.log.debug(
-            "_ensure_fhrp_vip: assigning %r to FHRP group %s", vip_cidr, fhrp_group_id
+            "_ensure_fhrp_vip: assigning %r to FHRP group %s",
+            vip_cidr, fhrp_group_id,
         )
         try:
-            self.nb.ipam.ip_addresses.create(payload)
+            self.nb.ipam.ip_addresses.create(create_payload)
+            return
         except pynetbox.RequestError as exc:
+            error_str = str(getattr(exc, "error", exc))
+            is_duplicate = "duplicate ip" in error_str.lower()
+
+            if not is_duplicate:
+                self.log.warning(
+                    "_ensure_fhrp_vip: could not assign %r to group %s: %s",
+                    vip_cidr, fhrp_group_id, exc,
+                )
+                return
+
+            # ── 5. Duplicate IP error from create → recovery ──────────────
+            conflicting_addr = self._parse_duplicate_address(error_str) or vip_cidr
             self.log.warning(
-                "_ensure_fhrp_vip: could not assign %r to group %s: %s",
-                vip_cidr, fhrp_group_id, exc,
+                "_ensure_fhrp_vip: Duplicate IP error for %r "
+                "(conflicting record: %r). Starting recovery...",
+                vip_cidr, conflicting_addr,
+            )
+
+            conflict_rec = self.get_ip_by_address(conflicting_addr)
+            if conflict_rec is None:
+                self.log.warning(
+                    "_ensure_fhrp_vip: conflicting address %r not found in "
+                    "NetBox — VIP %r assignment skipped",
+                    conflicting_addr, vip_cidr,
+                )
+                return
+
+            # ── Host-address validation (CRITICAL safety gate) ────────────
+            # Only proceed when the conflicting record and the target VIP share
+            # the same host address.  A mismatch means the 400 error was
+            # triggered by an unrelated IP and we must not touch it.
+            vip_host      = vip_cidr.split("/")[0]
+            conflict_host = conflicting_addr.split("/")[0]
+
+            self.log.warning(
+                "_ensure_fhrp_vip: Duplicate IP detected: %s", vip_host
+            )
+
+            if vip_host != conflict_host:
+                self.log.warning(
+                    "_ensure_fhrp_vip: Host address mismatch — device VIP %r "
+                    "vs NetBox conflicting record %r.  "
+                    "Skipping modification to avoid unintended changes.",
+                    vip_cidr, conflicting_addr,
+                )
+                return
+
+            # Same host — log mask difference and prepare correction.
+            vip_prefix      = vip_cidr.split("/")[-1]      if "/" in vip_cidr      else "32"
+            conflict_prefix = conflicting_addr.split("/")[-1] if "/" in conflicting_addr else "?"
+            if vip_prefix != conflict_prefix:
+                self.log.info(
+                    "_ensure_fhrp_vip: Device mask (/%s) differs from "
+                    "NetBox (/%s), correcting...",
+                    vip_prefix, conflict_prefix,
+                )
+            # ── End validation ─────────────────────────────────────────────
+
+            # Step 1: try to reattach the conflicting record (non-destructive)
+            conflict_id = conflict_rec.get("id")
+            cur_type    = conflict_rec.get("assigned_object_type") or "unassigned"
+            self.log.info(
+                "_ensure_fhrp_vip: Attempting to reattach existing IP %r "
+                "(id=%s, currently %s) to FHRP group %s",
+                conflicting_addr, conflict_id, cur_type, fhrp_group_id,
+            )
+            try:
+                conflict_raw = self.nb.ipam.ip_addresses.get(conflict_id)
+                if conflict_raw is None:
+                    raise NetBoxClientError(f"IP id={conflict_id} vanished")
+                conflict_raw.update({
+                    "address":              vip_cidr,   # use device-authoritative mask
+                    "assigned_object_type": "ipam.fhrpgroup",
+                    "assigned_object_id":   fhrp_group_id,
+                })
+                self.log.info(
+                    "_ensure_fhrp_vip: Successfully reattached IP id=%s "
+                    "%r→%r to FHRP group %s",
+                    conflict_id, conflicting_addr, vip_cidr, fhrp_group_id,
+                )
+                return
+            except (pynetbox.RequestError, NetBoxClientError) as exc2:
+                self.log.warning(
+                    "_ensure_fhrp_vip: Step 1 reattach failed for id=%s: %s "
+                    "— proceeding to Step 2 (delete + recreate)",
+                    conflict_id, exc2,
+                )
+
+            # Step 2: controlled delete + recreate with all preserved metadata
+            self._recover_fhrp_vip_duplicate(
+                fhrp_group_id=fhrp_group_id,
+                vip_cidr=vip_cidr,
+                conflicting_rec=conflict_rec,
+                dry_run=dry_run,
+            )
+
+    def _recover_fhrp_vip_duplicate(
+        self,
+        fhrp_group_id: int,
+        vip_cidr: str,
+        conflicting_rec: dict,
+        dry_run: bool = False,
+    ) -> None:
+        """
+        Step 2 recovery: delete the conflicting IP record and recreate it
+        assigned to *fhrp_group_id*, preserving all metadata.
+
+        Called from ``_ensure_fhrp_vip`` after the host-address validation
+        has confirmed the conflicting record has the same host as the VIP and
+        both the plain create and the non-destructive reattach (Step 1) have
+        failed.
+
+        Device data is authoritative for the IP address + mask (*vip_cidr*).
+        NetBox metadata (VRF, tenant, DNS name, description, role, status,
+        tags, custom_fields, nat_inside) is preserved from *conflicting_rec*.
+
+        Parameters
+        ----------
+        fhrp_group_id : int
+        vip_cidr : str
+            The device-authoritative address (e.g. ``"10.254.9.1/32"``).
+        conflicting_rec : dict
+            Full IP record dict of the conflicting IP (from ``_to_dict``).
+        dry_run : bool
+            When ``True``, log intended actions without making any writes.
+        """
+        conflict_id   = conflicting_rec.get("id")
+        conflict_addr = conflicting_rec.get("address") or str(conflict_id)
+        conflict_vrf  = conflicting_rec.get("vrf")
+        conflict_type = conflicting_rec.get("assigned_object_type") or "unassigned"
+
+        self.log.warning(
+            "_ensure_fhrp_vip: Duplicate IP conflict — performing controlled "
+            "recreation. Conflicting IP id=%s addr=%r (assigned to %s) "
+            "will be deleted and recreated as %r → FHRP group %s",
+            conflict_id, conflict_addr, conflict_type,
+            vip_cidr, fhrp_group_id,
+        )
+
+        # ── a. Snapshot all restorable metadata (device is authoritative  ──
+        #       for address+mask; NetBox is authoritative for everything else)
+        self.log.info(
+            "_ensure_fhrp_vip: Preserving metadata before delete — "
+            "id=%s addr=%r",
+            conflict_id, conflict_addr,
+        )
+        snap = self._snapshot_ip(conflicting_rec)
+
+        # ── b. Log VRF provenance ─────────────────────────────────────────
+        if conflict_vrf:
+            vrf_id   = (
+                conflict_vrf.get("id") if isinstance(conflict_vrf, dict)
+                else conflict_vrf
+            )
+            vrf_name = (
+                conflict_vrf.get("name") if isinstance(conflict_vrf, dict)
+                else str(conflict_vrf)
+            )
+            self.log.info(
+                "_ensure_fhrp_vip: Preserving VRF %r (id=%s) from original IP",
+                vrf_name, vrf_id,
+            )
+        else:
+            self.log.info(
+                "_ensure_fhrp_vip: Original IP is in the global table (no VRF)"
+            )
+
+        # ── Build the recreation payload now so dry-run can log it ────────
+        recreate_payload: dict = dict(snap)
+        recreate_payload.update({
+            "address":              vip_cidr,
+            "assigned_object_type": "ipam.fhrpgroup",
+            "assigned_object_id":   fhrp_group_id,
+        })
+        recreate_payload.setdefault("status", "active")
+
+        # ── Dry-run: show intent without touching NetBox ──────────────────
+        if dry_run:
+            self.log.info(
+                "DRY-RUN _ensure_fhrp_vip: Would delete conflicting IP "
+                "id=%s address=%r (mask mismatch with device VIP %r)",
+                conflict_id, conflict_addr, vip_cidr,
+            )
+            self.log.info(
+                "DRY-RUN _ensure_fhrp_vip: Would recreate IP from device "
+                "data — address=%r → FHRP group %s  "
+                "(preserved: vrf=%s  dns_name=%r  description=%r)",
+                vip_cidr, fhrp_group_id,
+                recreate_payload.get("vrf"),
+                recreate_payload.get("dns_name"),
+                recreate_payload.get("description"),
+            )
+            return
+
+        # ── c. Delete the conflicting record ──────────────────────────────
+        self.log.warning(
+            "_ensure_fhrp_vip: Deleting conflicting IP %s due to mask "
+            "mismatch (id=%s)",
+            conflict_addr, conflict_id,
+        )
+        try:
+            self.delete_ip(conflict_id)
+        except NetBoxClientError as exc:
+            self.log.error(
+                "_ensure_fhrp_vip: Delete failed for IP id=%s: %s — "
+                "cannot proceed with recreation; VIP %r assignment skipped",
+                conflict_id, exc, vip_cidr,
+            )
+            return
+
+        # ── d. Recreate from device data with all preserved metadata ───────
+        self.log.warning(
+            "_ensure_fhrp_vip: Recreating IP from device data — "
+            "address=%r  vrf=%s  dns_name=%r  description=%r",
+            vip_cidr,
+            recreate_payload.get("vrf"),
+            recreate_payload.get("dns_name"),
+            recreate_payload.get("description"),
+        )
+        self.log.debug(
+            "_ensure_fhrp_vip: recreate payload=%s", recreate_payload
+        )
+
+        try:
+            new_rec = self.nb.ipam.ip_addresses.create(recreate_payload)
+            self.log.info(
+                "_ensure_fhrp_vip: Successfully reassigned IP to FHRP group — "
+                "new id=%s address=%r → FHRP group %s",
+                new_rec.id, vip_cidr, fhrp_group_id,
+            )
+        except pynetbox.RequestError as exc:
+            self.log.error(
+                "_ensure_fhrp_vip: Recreation failed for %r: %s — "
+                "full payload was: %s",
+                vip_cidr, exc, recreate_payload,
             )
 
     def ensure_fhrp_assignment(

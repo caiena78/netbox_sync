@@ -264,6 +264,19 @@ _IP_CIDR_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ---------------------------------------------------------------------------
+# VRF running-config parsing helpers
+# ---------------------------------------------------------------------------
+
+# Matches any interface block header: "interface GigabitEthernet1/0/1"
+_IFACE_HDR_RE = re.compile(r"^interface\s+(\S+)\s*$", re.IGNORECASE)
+# IOS-XE / IOS 15.x+: "  vrf forwarding CORP"
+_VRF_FWD_RE = re.compile(r"^\s+vrf\s+forwarding\s+(\S+)\s*$", re.IGNORECASE)
+# Older IOS: "  ip vrf forwarding CORP"
+_IP_VRF_FWD_RE = re.compile(r"^\s+ip\s+vrf\s+forwarding\s+(\S+)\s*$", re.IGNORECASE)
+# NX-OS: "  vrf member CORP"
+_VRF_MEMBER_RE = re.compile(r"^\s+vrf\s+member\s+(\S+)\s*$", re.IGNORECASE)
+
 # --------------------------------------------------------------------------- #
 # Main class                                                                   #
 # --------------------------------------------------------------------------- #
@@ -2441,6 +2454,151 @@ class CiscoDeviceClient:
                         "%s: Vlan%s bad cidr %s: %s",
                         self.host, current_vid, addr_cidr, exc,
                     )
+
+        return result
+
+    # ----------------------------------------------------------------------- #
+    # Interface VRF map (running-config based)                                #
+    # ----------------------------------------------------------------------- #
+
+    def get_interface_vrf_map(self) -> Dict[str, Optional[str]]:
+        """
+        Parse the running configuration and return the VRF assignment for
+        every interface that has one.
+
+        VRF assignment patterns recognised
+        -----------------------------------
+        - IOS-XE / IOS 15.x+:  ``vrf forwarding <NAME>``
+        - Older IOS:            ``ip vrf forwarding <NAME>``
+        - NX-OS:                ``vrf member <NAME>``
+
+        Returns
+        -------
+        dict
+            ``{interface_name: vrf_name}`` — only interfaces that have an
+            explicit VRF assignment are included.  Callers should treat a
+            missing key as *global* (no VRF, ``None``).
+
+        Notes
+        -----
+        This method always uses the CLI transport because VRF assignment is
+        configuration data (not operational), regardless of which transport
+        was used to collect interface inventory.
+        """
+        self._cli_connect()
+        raw = self._get_all_interfaces_raw_config()
+        result = self._parse_interface_vrf_map(raw)
+        self.log.debug(
+            "%s: get_interface_vrf_map → %d VRF assignment(s): %s",
+            self.host, len(result), result,
+        )
+        return result
+
+    def _get_all_interfaces_raw_config(self) -> str:
+        """
+        Return raw running-config text containing ALL interface blocks.
+
+        Attempts (in order):
+
+        1. ``show run | section ^interface``      (IOS / IOS-XE)
+           ``show running-config | section interface``  (NX-OS)
+        2. Full ``show running-config`` fallback.
+
+        Returns an empty string when neither command succeeds.
+        """
+        if self.os_type == "nxos":
+            cmds: Tuple[str, ...] = (
+                "show running-config | section interface",
+                "show running-config",
+            )
+        else:
+            cmds = (
+                "show run | section ^interface",
+                "show running-config",
+            )
+
+        for cmd in cmds:
+            try:
+                raw: str = self._cli_connection.send_command(cmd)
+            except Exception as exc:
+                self.log.debug(
+                    "%s: _get_all_interfaces_raw_config %r failed: %s",
+                    self.host, cmd, exc,
+                )
+                continue
+
+            raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+
+            if not raw or not raw.strip():
+                self.log.debug(
+                    "%s: %r returned empty output", self.host, cmd
+                )
+                continue
+            if any(marker in raw for marker in self._CLI_ERROR_MARKERS):
+                self.log.debug(
+                    "%s: %r rejected (error marker): %.120s",
+                    self.host, cmd, raw.strip(),
+                )
+                continue
+            if "interface " not in raw.lower():
+                self.log.debug(
+                    "%s: %r has no interface lines — skipping", self.host, cmd
+                )
+                continue
+
+            self.log.debug(
+                "%s: VRF config source: %r (%d chars)", self.host, cmd, len(raw)
+            )
+            return raw
+
+        self.log.warning(
+            "%s: could not retrieve interface running-config for VRF parsing",
+            self.host,
+        )
+        return ""
+
+    def _parse_interface_vrf_map(self, raw: str) -> Dict[str, Optional[str]]:
+        """
+        Parse running-config text and return ``{interface_name: vrf_name}``.
+
+        Uses a line-by-line state machine:
+
+        - ``interface <NAME>``        → enter block; track interface name
+        - ``  vrf forwarding <VRF>``  → IOS-XE VRF assignment
+        - ``  ip vrf forwarding <VRF>``  → older IOS VRF assignment
+        - ``  vrf member <VRF>``      → NX-OS VRF assignment
+        - Un-indented non-``!`` line  → exit current interface block
+        """
+        result: Dict[str, Optional[str]] = {}
+        current_iface: Optional[str] = None
+
+        raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+        for line in raw.splitlines():
+            # ── Interface block header ──────────────────────────────────────
+            m = _IFACE_HDR_RE.match(line)
+            if m:
+                current_iface = m.group(1)
+                continue
+
+            # ── Un-indented non-"!" line closes the block ───────────────────
+            if line and not line[0].isspace() and line.strip() not in ("!", ""):
+                current_iface = None
+                continue
+
+            if current_iface is None:
+                continue
+
+            # ── VRF assignment line ─────────────────────────────────────────
+            for pattern in (_VRF_FWD_RE, _IP_VRF_FWD_RE, _VRF_MEMBER_RE):
+                mv = pattern.match(line)
+                if mv:
+                    vrf_name = mv.group(1).strip()
+                    result[current_iface] = vrf_name
+                    self.log.debug(
+                        "%s: interface %r → VRF %r",
+                        self.host, current_iface, vrf_name,
+                    )
+                    break
 
         return result
 

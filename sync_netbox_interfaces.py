@@ -50,7 +50,7 @@ import os
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from cisco_device_client import CiscoDeviceClient, CiscoDeviceClientError
 from netbox_client import NetBoxClient, NetBoxClientError
@@ -199,6 +199,141 @@ def get_vc_member_slot(name: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
+# --------------------------------------------------------------------------- #
+# Device model family classification                                           #
+# --------------------------------------------------------------------------- #
+
+_MODEL_FAMILY_C9600   = "c9600"    # Catalyst 9606/9610/9616 — StackWise Virtual
+_MODEL_FAMILY_C3750   = "c3750"    # Catalyst 3750 / WS-C3750 stacks
+_MODEL_FAMILY_C9K     = "c9k"      # Catalyst 9200/9300/9400/9500 — physical stacks
+_MODEL_FAMILY_GENERIC = "generic"  # All other platforms
+
+# (pattern, family) in priority order — first match wins.
+_MODEL_PATTERNS: List[Tuple["re.Pattern[str]", str]] = [
+    (re.compile(r"C9606|C9610|C9616|C96\d\d|Catalyst\s*96\d\d", re.I), _MODEL_FAMILY_C9600),
+    (re.compile(r"WS-C3750|C3750|Catalyst\s*3750",               re.I), _MODEL_FAMILY_C3750),
+    (re.compile(r"C9[2345]\d\d|Catalyst\s*9[2345]\d\d",          re.I), _MODEL_FAMILY_C9K),
+]
+
+
+def classify_device_model(model_string: str) -> str:
+    """
+    Map a Cisco device model string to a known family slug.
+
+    Parameters
+    ----------
+    model_string : str
+        The ``device_type.model`` value from NetBox (case-insensitive).
+
+    Returns
+    -------
+    str
+        One of ``_MODEL_FAMILY_*`` constants.  Falls back to
+        ``_MODEL_FAMILY_GENERIC`` when no pattern matches.
+    """
+    for pattern, family in _MODEL_PATTERNS:
+        if pattern.search(model_string or ""):
+            return family
+    return _MODEL_FAMILY_GENERIC
+
+
+def parse_cisco_interface(name: str) -> dict:
+    """
+    Parse a Cisco interface name into its structural components.
+
+    Component assignment by numeric-part count after the interface type
+    prefix (e.g. the ``2/1/0/28`` in ``TwentyFiveGigE2/1/0/28``):
+
+    ======  ===========================================
+    Parts   Interpretation
+    ======  ===========================================
+    1       port only  (e.g. Loopback0 — non-physical)
+    2       module / port  (NX-OS Ethernet2/1 style)
+    3       member / module / port
+    4       member / module / subslot / port (C9600)
+    5+      member=raw[0], module=raw[1], port=raw[-1]
+    ======  ===========================================
+
+    The *subslot* component (index 2 in 4-part names) is captured in
+    ``raw_components`` but intentionally ignored for NetBox module
+    matching per the spec.
+
+    Only interfaces whose expanded name starts with a prefix in
+    ``_VC_ROUTABLE_PREFIXES`` are treated as physical; all others
+    return ``is_physical=False`` with ``member/module/port = None``.
+
+    Parameters
+    ----------
+    name : str
+        Raw interface name as reported by the device (abbreviated or full).
+
+    Returns
+    -------
+    dict::
+
+        {
+            "is_physical":     bool,
+            "normalized_name": str,         # expand_interface_name() result
+            "member":          int | None,  # VC / stack member number
+            "module":          int | None,  # line-card / slot (subslot ignored)
+            "port":            int | None,  # final port index
+            "raw_components":  list[int],   # every numeric token, in order
+        }
+
+    Examples
+    --------
+    ``TwentyFiveGigE2/1/0/28``  → member=2, module=1, port=28, raw=[2,1,0,28]
+    ``FastEthernet3/0/9``       → member=3, module=0, port=9,  raw=[3,0,9]
+    ``GigabitEthernet1/1/1``    → member=1, module=1, port=1,  raw=[1,1,1]
+    ``GigabitEthernet1/0/24``   → member=1, module=0, port=24, raw=[1,0,24]
+    ``Ethernet2/1``             → member=None, module=2, port=1, raw=[2,1]
+    """
+    normalized = expand_interface_name(name)
+    is_physical = any(normalized.startswith(p) for p in _VC_ROUTABLE_PREFIXES)
+
+    result: dict = {
+        "is_physical":     is_physical,
+        "normalized_name": normalized,
+        "member":          None,
+        "module":          None,
+        "port":            None,
+        "raw_components":  [],
+    }
+
+    if not is_physical:
+        return result
+
+    m = re.search(r"(\d+(?:[/.]\d+)*)", normalized)
+    if not m:
+        return result
+
+    raw = [int(x) for x in re.split(r"[/.]", m.group(1))]
+    result["raw_components"] = raw
+    n = len(raw)
+
+    if n == 1:
+        result["port"] = raw[0]
+    elif n == 2:
+        # NX-OS Ethernet<module>/<port> — no separate VC member
+        result["module"] = raw[0]
+        result["port"]   = raw[1]
+    elif n == 3:
+        result["member"] = raw[0]
+        result["module"] = raw[1]
+        result["port"]   = raw[2]
+    elif n == 4:
+        # C9600 style: member / slot / subslot / port — subslot (raw[2]) ignored
+        result["member"] = raw[0]
+        result["module"] = raw[1]
+        result["port"]   = raw[3]
+    else:
+        result["member"] = raw[0]
+        result["module"] = raw[1]
+        result["port"]   = raw[-1]
+
+    return result
+
+
 # Matches SVI interface names: Vlan162, vlan2162, VLAN10, etc.
 _SVI_RE = re.compile(r"(?i)^vlan(\d+)$")
 
@@ -327,6 +462,167 @@ def resolve_target_device_id(
     if slot is None:
         return default_device_id
     return vc_member_map.get(slot, default_device_id)
+
+
+def build_vc_module_maps(
+    vc_member_map: Dict[int, int],
+    nb: NetBoxClient,
+    device_id: int,
+) -> Dict[int, Dict[int, int]]:
+    """
+    Build per-device module maps for every device in *vc_member_map*.
+
+    Queries ``dcim.module_bays`` and the installed modules for each member
+    device (plus the connected *device_id*) and returns a nested dict::
+
+        {device_id: {slot_number: module_id}, ...}
+
+    When no module bays / modules are installed on a device, its inner dict
+    is empty.  Failures per-device are logged at DEBUG level and produce an
+    empty inner dict rather than propagating an exception.
+
+    Parameters
+    ----------
+    vc_member_map : dict
+        ``{vc_position: device_id}`` map (may be empty for non-VC devices).
+    nb : NetBoxClient
+    device_id : int
+        The directly-connected device (master or only member).
+
+    Returns
+    -------
+    dict
+        ``{device_id: {slot_number: module_id}}``
+    """
+    all_device_ids: Set[int] = {device_id} | set(vc_member_map.values())
+    maps: Dict[int, Dict[int, int]] = {}
+    for dev_id in all_device_ids:
+        try:
+            maps[dev_id] = nb.build_device_module_map(dev_id)
+        except NetBoxClientError as exc:
+            log.debug(
+                "build_vc_module_maps: could not build module map for "
+                "device_id=%s: %s", dev_id, exc,
+            )
+            maps[dev_id] = {}
+    return maps
+
+
+def resolve_target_module_id(
+    module_slot: Optional[int],
+    device_module_map: Dict[int, int],
+) -> Optional[int]:
+    """
+    Return the NetBox module ID for *module_slot* from *device_module_map*.
+
+    Returns ``None`` when:
+    - *module_slot* is ``None`` (interface has no slot component)
+    - *module_slot* is ``0`` (mid-segment zero — no dedicated module bay)
+    - The slot has no installed module in the map
+
+    In all three cases the interface should be created at the device level
+    with no ``module`` association.
+
+    Parameters
+    ----------
+    module_slot : int or None
+    device_module_map : dict
+        ``{slot_number: module_id}`` for the target device.
+    """
+    if not module_slot:   # None or 0
+        return None
+    return device_module_map.get(module_slot)
+
+
+def _resolve_vrf_id(
+    vrf_name: Optional[str],
+    vrf_cache: Dict[str, int],
+    nb: NetBoxClient,
+    device_name: str,
+    dry_run: bool,
+) -> Optional[int]:
+    """
+    Resolve a VRF name to a NetBox VRF primary key.
+
+    - Returns ``None`` immediately when *vrf_name* is ``None`` or blank
+      (global routing table — no VRF assignment needed).
+    - On the first encounter of a name, calls :meth:`NetBoxClient.ensure_vrf`
+      (or just looks it up in dry-run mode) and caches the result.
+    - Subsequent calls for the same name (case-insensitive) are served from
+      the cache without additional API calls.
+    - When VRF creation / lookup fails, logs a warning and returns ``None``
+      (graceful degradation — the IP/prefix is written to the global table
+      rather than blocking the entire device sync).
+
+    Parameters
+    ----------
+    vrf_name : str or None
+        Raw VRF name from the device running-config.
+    vrf_cache : dict
+        Mutable ``{lowercase_vrf_name: vrf_id}`` dict — shared across all
+        stages of the same device sync run.
+    nb : NetBoxClient
+    device_name : str
+        Used only in log messages.
+    dry_run : bool
+
+    Returns
+    -------
+    int or None
+        NetBox VRF primary key, or ``None`` for the global table.
+    """
+    if not vrf_name or not vrf_name.strip():
+        return None
+
+    vrf_name = vrf_name.strip()
+    cache_key = vrf_name.lower()
+
+    if cache_key in vrf_cache:
+        return vrf_cache[cache_key]
+
+    if dry_run:
+        # Attempt a read-only lookup; log "would create" when absent.
+        try:
+            vrf = nb.get_vrf_by_name(vrf_name)
+        except NetBoxClientError:
+            vrf = None
+
+        if vrf:
+            vrf_id = vrf["id"]
+            vrf_cache[cache_key] = vrf_id
+            log.debug(
+                "%-30s  VRF %r exists in NetBox id=%s", device_name, vrf_name, vrf_id
+            )
+            return vrf_id
+
+        log.info(
+            "DRY-RUN  %-30s  VRF %r not in NetBox — would create",
+            device_name, vrf_name,
+        )
+        return None   # cannot create in dry-run; treat as global for this run
+
+    # Live mode — create if absent.
+    try:
+        vrf = nb.ensure_vrf(vrf_name)
+        vrf_id = vrf["id"]
+        action = vrf.get("_action", "existing")
+        if action == "created":
+            log.info(
+                "%-30s  VRF %r not found in NetBox, creating... id=%s",
+                device_name, vrf_name, vrf_id,
+            )
+        else:
+            log.debug(
+                "%-30s  VRF %r → id=%s (existing)", device_name, vrf_name, vrf_id
+            )
+        vrf_cache[cache_key] = vrf_id
+        return vrf_id
+    except NetBoxClientError as exc:
+        log.warning(
+            "%-30s  VRF %r: ensure failed: %s — treating as global",
+            device_name, vrf_name, exc,
+        )
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -895,20 +1191,29 @@ def _sync_prefixes(
     site_id: int,
     vlan_id_map: Dict[int, int],
     dry_run: bool,
+    iface_vrf_map: Optional[Dict[str, Optional[str]]] = None,
+    vrf_cache: Optional[Dict[str, int]] = None,
 ) -> tuple:
     """
     Collect interface IPs, compute their network prefixes, and ensure each
-    prefix exists in NetBox with the correct site and VLAN assignment.
+    prefix exists in NetBox with the correct site, VLAN, and VRF assignment.
 
     SVI interfaces (``Vlan<N>``) are linked to their VLAN via
     :func:`_resolve_prefix_vlan`, which first checks *vlan_id_map* then
     falls back to a direct NetBox query.  All other interface types are
     written without a VLAN (no guessing).
 
+    When *iface_vrf_map* is provided the VRF assignment for each interface
+    (collected from running-config) is resolved to a NetBox VRF ID and
+    included in the prefix create/update payload.  This ensures prefixes
+    under the same CIDR in different VRFs are written as distinct records.
+
     Returns ``(created, updated, moved_site, errors)``.
     """
     created = updated = moved = 0
     errors: List[str] = []
+    _vrf_map   = iface_vrf_map or {}
+    _vrf_cache = vrf_cache if vrf_cache is not None else {}
 
     try:
         ip_inventory = cisco.get_interface_ip_inventory()
@@ -933,6 +1238,19 @@ def _sync_prefixes(
             )
             continue
 
+        # ── Resolve VRF for this interface ────────────────────────────────
+        raw_vrf   = _vrf_map.get(iface_name) or _vrf_map.get(
+            expand_interface_name(iface_name)
+        )
+        nb_vrf_id = _resolve_vrf_id(
+            raw_vrf, _vrf_cache, nb, device_name, dry_run
+        )
+        if raw_vrf:
+            log.debug(
+                "%-30s  prefix %-22s  Detected VRF %r on interface %s",
+                device_name, prefix_net, raw_vrf, iface_name,
+            )
+
         # Determine the NetBox VLAN ID for this prefix.
         # Only SVIs give a deterministic interface→VLAN relationship.
         nb_vlan_id = _resolve_prefix_vlan(
@@ -945,8 +1263,10 @@ def _sync_prefixes(
 
         if dry_run:
             log.info(
-                "DRY-RUN  %-30s  prefix %-22s  vlan_id=%-6s  iface=%s",
-                device_name, prefix_net, nb_vlan_id, iface_name,
+                "DRY-RUN  %-30s  prefix %-22s  vlan_id=%-6s  "
+                "vrf=%s  iface=%s",
+                device_name, prefix_net, nb_vlan_id,
+                raw_vrf or "global", iface_name,
             )
             created += 1
             continue
@@ -956,25 +1276,26 @@ def _sync_prefixes(
                 prefix_cidr=prefix_net,
                 site_id=site_id,
                 vlan_id=nb_vlan_id,
+                vrf_id=nb_vrf_id,
             )
             action = result.get("_action", "existing")
             if action == "created":
                 created += 1
                 log.info(
-                    "%-30s  prefix created   %-22s  vlan_id=%s",
-                    device_name, prefix_net, nb_vlan_id,
+                    "%-30s  prefix created   %-22s  vlan_id=%s  vrf=%s",
+                    device_name, prefix_net, nb_vlan_id, raw_vrf or "global",
                 )
             elif action == "moved_site":
                 moved += 1
                 log.info(
-                    "%-30s  prefix moved site %-22s  vlan_id=%s",
-                    device_name, prefix_net, nb_vlan_id,
+                    "%-30s  prefix moved site %-22s  vlan_id=%s  vrf=%s",
+                    device_name, prefix_net, nb_vlan_id, raw_vrf or "global",
                 )
             elif action == "updated":
                 updated += 1
                 log.info(
-                    "%-30s  prefix updated   %-22s  vlan_id=%s",
-                    device_name, prefix_net, nb_vlan_id,
+                    "%-30s  prefix updated   %-22s  vlan_id=%s  vrf=%s",
+                    device_name, prefix_net, nb_vlan_id, raw_vrf or "global",
                 )
         except NetBoxClientError as exc:
             err = f"Prefix {prefix_net} (iface={iface_name}): {exc}"
@@ -993,6 +1314,8 @@ def _sync_svi_bindings(
     site_name: str,
     vlan_id_map: Dict[int, int],
     dry_run: bool,
+    iface_vrf_map: Optional[Dict[str, Optional[str]]] = None,
+    vrf_cache: Optional[Dict[str, int]] = None,
 ) -> tuple:
     """
     Enforce the full SVI → VLAN → Prefix → Site relationship for every
@@ -1017,8 +1340,10 @@ def _sync_svi_bindings(
     vlan_site_corrections = 0
     pfx_created = 0
     pfx_updated = 0
-    ips_assigned = 0          # NEW — host IPs assigned to SVI interfaces
+    ips_assigned = 0
     errors: List[str] = []
+    _vrf_map   = iface_vrf_map or {}
+    _vrf_cache = vrf_cache if vrf_cache is not None else {}
 
     # ── Collect SVI network-prefix map from running config ─────────────────
     # Returns {vid: "192.168.20.0/24"} — network address used for prefix sync.
@@ -1082,6 +1407,15 @@ def _sync_svi_bindings(
         prefix_cidr = svi_prefix_map.get(svi_vid)    # network address or None
         host_ip     = svi_host_ip_map.get(svi_vid)   # host IP with prefix or None
 
+        # ── Resolve VRF for this SVI ───────────────────────────────────────
+        raw_vrf   = _vrf_map.get(iface_name)
+        nb_vrf_id = _resolve_vrf_id(raw_vrf, _vrf_cache, nb, device_name, dry_run)
+        if raw_vrf:
+            log.debug(
+                "%-30s  Detected VRF %r on interface %s",
+                device_name, raw_vrf, iface_name,
+            )
+
         # Resolve NetBox VLAN ID — fast path from map, slow path from NetBox.
         nb_vlan_id = vlan_id_map.get(svi_vid) or nb.find_vlan_id_by_vid(svi_vid)
 
@@ -1127,9 +1461,10 @@ def _sync_svi_bindings(
         if dry_run:
             log.info(
                 "DRY-RUN  %-30s  SVI %-15s → VLAN %-5s  "
-                "host_ip=%-22s  prefix=%-22s  site=%r",
+                "host_ip=%-22s  prefix=%-22s  site=%r  vrf=%s",
                 device_name, iface_name, svi_vid,
                 host_ip or "none", prefix_cidr or "none", site_name,
+                raw_vrf or "global",
             )
             svi_bound += 1
             continue
@@ -1173,11 +1508,17 @@ def _sync_svi_bindings(
         # show run.  IOS/IOS-XE: from "ip address A.B.C.D M.M.M.M" lines.
         # Both are handled by get_svi_host_ip_map().
         if host_ip:
+            if nb_vrf_id is not None:
+                log.info(
+                    "%-30s  Assigning VRF %r to IP %s on %s",
+                    device_name, raw_vrf, host_ip, iface_name,
+                )
             try:
                 ip_result = nb.ensure_ip_on_interface(
                     ip_cidr=host_ip,
                     device_id=device_id,
                     interface_name=iface_name,
+                    vrf_id=nb_vrf_id,
                 )
                 ip_action = ip_result.get("_action", "skipped")
                 if ip_action in ("created", "updated"):
@@ -1214,19 +1555,22 @@ def _sync_svi_bindings(
                 prefix_cidr=prefix_cidr,
                 site_id=site_id,
                 vlan_id=nb_vlan_id,
+                vrf_id=nb_vrf_id,
             )
             p_action = p_result.get("_action", "existing")
             if p_action == "created":
                 pfx_created += 1
                 log.info(
-                    "%-30s  prefix created   %-22s  vlan=%s  site=%r",
+                    "%-30s  prefix created   %-22s  vlan=%s  site=%r  vrf=%s",
                     device_name, prefix_cidr, svi_vid, site_name,
+                    raw_vrf or "global",
                 )
             elif p_action in ("updated", "moved_site"):
                 pfx_updated += 1
                 log.info(
-                    "%-30s  prefix %-8s %-22s  vlan=%s  site=%r",
+                    "%-30s  prefix %-8s %-22s  vlan=%s  site=%r  vrf=%s",
                     device_name, p_action, prefix_cidr, svi_vid, site_name,
+                    raw_vrf or "global",
                 )
         except NetBoxClientError as exc:
             err = f"Prefix {prefix_cidr} → VLAN {svi_vid}: {exc}"
@@ -1611,6 +1955,65 @@ def _touch_ip_timestamps(
 # FHRP group sync (HSRP / VRRP / GLBP)                                        #
 # --------------------------------------------------------------------------- #
 
+def _resolve_fhrp_vip_cidr(
+    vip: str,
+    iface_prefix_map: Dict[str, str],
+    iface_name: str,
+    device_name: str,
+) -> str:
+    """
+    Return the CIDR form of an FHRP VIP.
+
+    Cisco devices report FHRP VIPs as bare host addresses (e.g.
+    ``"10.254.9.1"``) — the prefix length is never included because the
+    VIP is not configured with a mask; it simply belongs to the same subnet
+    as the interface IP.
+
+    The correct prefix length is therefore borrowed from the interface's own
+    IP address: if the interface has ``10.254.9.3/24``, the VIP should be
+    stored in NetBox as ``10.254.9.1/24``, **not** ``/32``.
+
+    Parameters
+    ----------
+    vip : str
+        VIP address as reported by the device.  If it already contains a
+        ``"/"`` (uncommon but possible) it is returned unchanged.
+    iface_prefix_map : dict
+        ``{expanded_interface_name: prefix_len_str}`` built once per sync
+        run from the device's IP inventory (e.g.
+        ``{"GigabitEthernet1/0/1": "24", "Vlan9": "24"}``).
+    iface_name : str
+        Expanded (canonical) interface name — used as the map lookup key
+        and in debug log messages.
+    device_name : str
+        For log messages only.
+
+    Returns
+    -------
+    str
+        VIP in CIDR notation, e.g. ``"10.254.9.1/24"``.
+        Falls back to ``"<vip>/32"`` when no interface IP is found.
+    """
+    if "/" in vip:
+        return vip  # already includes a prefix length — leave untouched
+
+    prefix_len = iface_prefix_map.get(iface_name)
+    if prefix_len:
+        vip_cidr = f"{vip}/{prefix_len}"
+        log.debug(
+            "%-30s  FHRP VIP %r on %s → using /%s from interface IP",
+            device_name, vip, iface_name, prefix_len,
+        )
+        return vip_cidr
+
+    log.debug(
+        "%-30s  FHRP VIP %r on %s — interface not found in IP inventory; "
+        "falling back to /32",
+        device_name, vip, iface_name,
+    )
+    return f"{vip}/32"
+
+
 def _sync_fhrp_groups(
     cisco: CiscoDeviceClient,
     nb: NetBoxClient,
@@ -1713,6 +2116,30 @@ def _sync_fhrp_groups(
         log.info("%-30s  FHRP: no groups found", device_name)
         return synced, errors
 
+    # ── Build interface → prefix-length map for VIP CIDR resolution ───────
+    # FHRP VIPs reported by Cisco carry only the host address; the prefix
+    # length must be borrowed from the same interface's own IP so that the
+    # VIP is stored in the correct subnet (e.g. /24) rather than as /32.
+    _iface_prefix_map: Dict[str, str] = {}
+    try:
+        for ip_entry in cisco.get_interface_ip_inventory():
+            raw_ip = ip_entry.get("ip") or ""
+            if "/" not in raw_ip:
+                continue
+            expanded = expand_interface_name(ip_entry.get("name", ""))
+            _iface_prefix_map.setdefault(expanded, raw_ip.split("/")[1])
+        if _iface_prefix_map:
+            log.debug(
+                "%-30s  FHRP: built prefix map for %d interface(s)",
+                device_name, len(_iface_prefix_map),
+            )
+    except Exception as exc:
+        log.debug(
+            "%-30s  FHRP: IP inventory unavailable for VIP mask resolution: %s "
+            "— VIPs without explicit mask will fall back to /32",
+            device_name, exc,
+        )
+
     # ── 3. Process each group ──────────────────────────────────────────────
     for entry in fhrp_entries:
         iface_name = entry["interface"]
@@ -1724,11 +2151,21 @@ def _sync_fhrp_groups(
         # Determine operational state for this interface + group
         nb_state = oper_state.get(iface_name, {}).get(group, "unknown")
 
+        # Resolve the VIP CIDR before the dry-run guard so the log always
+        # shows the correct subnet (e.g. /24 not /32).
+        expanded_iface = expand_interface_name(iface_name)
+        vip_cidr = _resolve_fhrp_vip_cidr(
+            vip=vip,
+            iface_prefix_map=_iface_prefix_map,
+            iface_name=expanded_iface,
+            device_name=device_name,
+        )
+
         if dry_run:
             log.info(
-                "DRY-RUN  %-30s  FHRP %-5s grp=%-3s vip=%-16s "
+                "DRY-RUN  %-30s  FHRP %-5s grp=%-3s vip=%-20s "
                 "iface=%-30s state=%s",
-                device_name, protocol, group, vip, iface_name, nb_state,
+                device_name, protocol, group, vip_cidr, iface_name, nb_state,
             )
             synced += 1
             continue
@@ -1759,8 +2196,9 @@ def _sync_fhrp_groups(
             grp_result = nb.ensure_fhrp_group(
                 protocol=protocol,
                 group_id=group,
-                vip=vip,
+                vip=vip_cidr,
                 description=nb_state,
+                dry_run=dry_run,
             )
             grp_action = grp_result.get("_action", "existing")
             fhrp_id    = grp_result["id"]
@@ -1869,6 +2307,219 @@ def _sync_nxos_port_channel_ips(
 
 
 # --------------------------------------------------------------------------- #
+# Interface relocation helpers (Stage 1)                                       #
+# --------------------------------------------------------------------------- #
+
+def _nb_id(obj: Any) -> Optional[int]:
+    """
+    Extract a NetBox primary key from a nested object returned by pynetbox.
+
+    Handles: plain ``int``, ``dict`` with ``"id"`` key, pynetbox Record with
+    ``id`` attribute.  Returns ``None`` when the ID cannot be determined.
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, int):
+        return obj
+    if isinstance(obj, dict):
+        v = obj.get("id")
+        return int(v) if v is not None else None
+    v = getattr(obj, "id", None)
+    return int(v) if v is not None else None
+
+
+def _snapshot_interface(iface: dict) -> dict:
+    """
+    Extract all re-creatable fields from a NetBox interface dict.
+
+    Fields that are device/module/name (set separately during recreate),
+    auto-populated timestamps, cable state, and read-only counters are
+    excluded.
+
+    Choice fields (``type``, ``mode``, ``duplex``) are unwrapped from
+    ``{"value": "...", "label": "..."}`` to the plain value string.
+    FK fields (``untagged_vlan``, ``lag``) are reduced to their integer ID.
+    List fields (``tagged_vlans``) are reduced to a list of integer IDs.
+
+    Parameters
+    ----------
+    iface : dict
+        Plain dict from ``NetBoxClient._to_dict()``.
+
+    Returns
+    -------
+    dict
+        Payload-ready dict suitable for ``create_interface``.
+    """
+    _SKIP: Set[str] = {
+        "id", "url", "display", "device", "module", "name",
+        "created", "last_updated", "_action",
+        "cable", "cable_end", "link_peers", "connected_endpoints",
+        "wireless_link", "count_ipaddresses", "count_fhrp_groups",
+        "occupied",
+    }
+    snap: dict = {}
+    for key, val in iface.items():
+        if key in _SKIP or val is None:
+            continue
+        if isinstance(val, dict):
+            if "value" in val:
+                snap[key] = val["value"]   # choice field → scalar string
+            elif "id" in val:
+                snap[key] = val["id"]      # FK / nested object → ID
+            # complex nested dicts without id/value are skipped
+        elif isinstance(val, list):
+            ids = []
+            for item in val:
+                if isinstance(item, dict) and "id" in item:
+                    ids.append(item["id"])
+                elif isinstance(item, int):
+                    ids.append(item)
+            if ids:
+                snap[key] = ids
+        else:
+            snap[key] = val
+    return snap
+
+
+def _relocate_interface(
+    nb: NetBoxClient,
+    existing: dict,
+    target_device_id: int,
+    target_module_id: Optional[int],
+    iface_name: str,
+    device_name: str,
+    summary: dict,
+) -> None:
+    """
+    Move an interface to the correct VC member device and/or module slot.
+
+    Steps
+    -----
+    a. Snapshot current interface properties (description, speed, mode, etc.).
+    b. Collect all IP addresses assigned to the interface.
+    c. Delete the misplaced interface record.
+       - If delete fails (e.g. a cable is attached), log an error and abort
+         so IPs are never orphaned from a partially-relocated interface.
+    d. Recreate the interface on the correct ``target_device_id`` /
+       ``target_module_id`` with the snapshotted properties.
+    e. Reassign every collected IP to the new interface record.
+
+    Updates ``summary["interfaces_relocated"]`` on success.
+
+    Parameters
+    ----------
+    nb : NetBoxClient
+    existing : dict
+        Full interface record (from ``find_interface_by_name_vc``).
+    target_device_id : int
+        The device the interface *should* be on.
+    target_module_id : int or None
+        The module the interface *should* be associated with (``None`` →
+        device-level, no module).
+    iface_name : str
+        Canonical interface name (expanded form).
+    device_name : str
+        Used only in log messages.
+    summary : dict
+        Running per-device summary dict — ``interfaces_relocated`` is
+        incremented on success.
+    """
+    existing_id = existing.get("id")
+    old_dev_id  = _nb_id(existing.get("device"))
+    old_mod_id  = _nb_id(existing.get("module"))
+
+    log.info(
+        "%-30s  RELOCATE %-42s  dev %s→%s  module %s→%s",
+        device_name, iface_name,
+        old_dev_id, target_device_id,
+        old_mod_id, target_module_id,
+    )
+
+    # ── a. Snapshot properties ────────────────────────────────────────────
+    snap = _snapshot_interface(existing)
+
+    # ── b. Collect assigned IPs ───────────────────────────────────────────
+    try:
+        ip_records = nb.list_interface_ips(existing_id)
+    except NetBoxClientError as exc:
+        log.error(
+            "%-30s  RELOCATE %r: IP list failed — aborting to avoid "
+            "orphaned IPs: %s", device_name, iface_name, exc,
+        )
+        summary["errors"].append(
+            f"Relocate {iface_name!r}: IP list failed: {exc}"
+        )
+        return
+
+    # ── c. Delete misplaced interface ─────────────────────────────────────
+    try:
+        nb.delete_interface(existing_id)
+    except NetBoxClientError as exc:
+        log.error(
+            "%-30s  RELOCATE %r: delete failed (cable attached?) — "
+            "aborting: %s", device_name, iface_name, exc,
+        )
+        summary["errors"].append(
+            f"Relocate {iface_name!r}: delete failed: {exc}"
+        )
+        return
+
+    # ── d. Recreate on correct device / module ────────────────────────────
+    create_payload: dict = {
+        "device": target_device_id,
+        "name":   iface_name,
+    }
+    if target_module_id is not None:
+        create_payload["module"] = target_module_id
+    create_payload.update(snap)
+    # Ensure "type" is present (required field)
+    create_payload.setdefault("type", "other")
+
+    try:
+        new_iface = nb.create_interface(create_payload)
+    except NetBoxClientError as exc:
+        log.error(
+            "%-30s  RELOCATE %r: recreate failed: %s", device_name, iface_name, exc,
+        )
+        summary["errors"].append(
+            f"Relocate {iface_name!r}: recreate failed: {exc}"
+        )
+        return
+
+    new_iface_id = new_iface["id"]
+
+    # ── e. Reassign IPs to new interface record ────────────────────────────
+    for ip_rec in ip_records:
+        ip_id   = ip_rec.get("id")
+        ip_addr = ip_rec.get("address") or ""
+        if isinstance(ip_addr, dict):
+            ip_addr = ip_addr.get("address", "")
+        try:
+            nb.reassign_ip_to_interface(ip_id, new_iface_id)
+            log.info(
+                "%-30s  RELOCATE %r: IP %s → new iface_id=%s",
+                device_name, iface_name, ip_addr, new_iface_id,
+            )
+        except NetBoxClientError as exc:
+            log.warning(
+                "%-30s  RELOCATE %r: IP %s reassign failed: %s",
+                device_name, iface_name, ip_addr, exc,
+            )
+            summary["errors"].append(
+                f"Relocate {iface_name!r}: IP {ip_addr} reassign failed: {exc}"
+            )
+
+    summary["interfaces_relocated"] = summary.get("interfaces_relocated", 0) + 1
+    log.info(
+        "%-30s  RELOCATE %-42s  DONE → dev_id=%s mod_id=%s  "
+        "%d IP(s) reassigned",
+        device_name, iface_name, target_device_id, target_module_id,
+        len(ip_records),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Per-device orchestration                                                     #
 # --------------------------------------------------------------------------- #
 
@@ -1913,6 +2564,7 @@ def sync_device(
         "fhrp_groups_synced":              0,
         "platform_updated":                0,
         "vc_members_updated":              0,
+        "interfaces_relocated":            0,
         "errors":                          [],
         "attempts":                        [],
     }
@@ -1980,6 +2632,39 @@ def sync_device(
                 device_name, vc_id,
             )
 
+    # ── Determine device model family for interface parsing ────────────────
+    _dt = device.get("device_type") or {}
+    _model_str = (_dt.get("model", "") if isinstance(_dt, dict) else "") or ""
+    device_model_family = classify_device_model(_model_str)
+    log.debug(
+        "%-30s  device_type.model=%r → family=%s",
+        device_name, _model_str, device_model_family,
+    )
+
+    # ── Build per-device module maps (slot_number → module_id) ────────────
+    # Queries NetBox module bays for every VC member.  Devices with no
+    # module bays / no installed modules produce an empty inner dict.
+    vc_member_module_maps: Dict[int, Dict[int, int]] = build_vc_module_maps(
+        vc_member_map, nb, device_id
+    )
+    if any(vc_member_module_maps.values()):
+        log.info(
+            "%-30s  module maps: %s",
+            device_name,
+            {
+                did: list(slot_map.keys())
+                for did, slot_map in vc_member_module_maps.items()
+                if slot_map
+            },
+        )
+    else:
+        log.debug("%-30s  no installed modules found in NetBox", device_name)
+
+    # ── All VC device IDs for cross-member interface lookup ────────────────
+    all_vc_device_ids: List[int] = list(
+        {device_id} | set(vc_member_map.values())
+    )
+
     # ── Connect to device ──────────────────────────────────────────────────
     enable_secret = args.enable_secret or None
     cisco = CiscoDeviceClient(
@@ -2019,15 +2704,62 @@ def sync_device(
         device_name, len(interfaces), summary["transport_used"],
     )
 
+    # ── Collect VRF assignments from running-config (always CLI) ──────────
+    # This is independent of the transport used for interface inventory.
+    # Failures are non-fatal: all interfaces fall back to the global table.
+    iface_vrf_map: Dict[str, Optional[str]] = {}
+    try:
+        iface_vrf_map = cisco.get_interface_vrf_map()
+        vrf_ifaces = {k: v for k, v in iface_vrf_map.items() if v}
+        if vrf_ifaces:
+            log.info(
+                "%-30s  VRF map: %d interface(s) have a non-global VRF",
+                device_name, len(vrf_ifaces),
+            )
+        else:
+            log.debug(
+                "%-30s  VRF map: no VRF assignments found — "
+                "all interfaces treated as global",
+                device_name,
+            )
+    except Exception as exc:
+        log.warning(
+            "%-30s  VRF map collection failed: %s "
+            "— all interfaces treated as global",
+            device_name, exc,
+        )
+
+    # Shared VRF name → NetBox VRF ID cache; mutated by _resolve_vrf_id
+    # as each VRF is encountered and (if absent) created in NetBox.
+    vrf_cache: Dict[str, int] = {}
+
     for iface in interfaces:
-        raw_name   = iface.get("name", "")
+        raw_name = iface.get("name", "")
         if not raw_name:
             continue
-        # Always write the fully-expanded canonical name to NetBox
-        iface_name = expand_interface_name(raw_name)
-        # Route to the correct VC member / line-card device
-        target_id  = resolve_target_device_id(iface_name, device_id, vc_member_map)
 
+        # ── Expand and parse the interface name ───────────────────────────
+        iface_name = expand_interface_name(raw_name)
+        parsed     = parse_cisco_interface(raw_name)
+
+        # ── Route to the correct VC member device ─────────────────────────
+        target_id = resolve_target_device_id(iface_name, device_id, vc_member_map)
+
+        # ── Resolve target module/slot ────────────────────────────────────
+        # Returns None when module==0 (no dedicated linecard bay) or when
+        # no matching module bay is found in NetBox (falls back to device-
+        # level interface creation and logs a warning via resolve_target_module_id).
+        device_module_map = vc_member_module_maps.get(target_id, {})
+        target_module_id  = resolve_target_module_id(parsed["module"], device_module_map)
+
+        if parsed["module"] and not target_module_id:
+            log.debug(
+                "%-30s  iface=%-40s  slot=%s not in module map for "
+                "dev_id=%s — creating at device level",
+                device_name, iface_name, parsed["module"], target_id,
+            )
+
+        # ── Build NetBox payload ──────────────────────────────────────────
         nb_payload: dict = {}
         if iface.get("description") is not None:
             nb_payload["description"] = iface["description"]
@@ -2035,14 +2767,86 @@ def sync_device(
             nb_payload["speed"] = iface["speed_kbps"]
         if iface.get("duplex") is not None:
             nb_payload["duplex"] = iface["duplex"]
+        if target_module_id is not None:
+            nb_payload["module"] = target_module_id
 
+        # ── Log VRF detection (Stage 1 is inventory only; VRF is set on IPs) ─
+        _stage1_vrf = iface_vrf_map.get(iface_name) or iface_vrf_map.get(raw_name)
+        if _stage1_vrf:
+            log.debug(
+                "%-30s  Detected VRF %r on interface %s",
+                device_name, _stage1_vrf, iface_name,
+            )
+
+        # ── Dry-run: log intent (including any relocation that would occur) ─
         if args.dry_run:
+            if len(all_vc_device_ids) > 1 or target_module_id is not None:
+                existing = nb.find_interface_by_name_vc(
+                    all_vc_device_ids, iface_name
+                )
+                if existing:
+                    ex_dev_id = _nb_id(existing.get("device"))
+                    ex_mod_id = _nb_id(existing.get("module"))
+                    wrong_dev = ex_dev_id is not None and ex_dev_id != target_id
+                    wrong_mod = (
+                        target_module_id is not None
+                        and ex_mod_id != target_module_id
+                    )
+                    if wrong_dev or wrong_mod:
+                        log.info(
+                            "DRY-RUN  %-30s  WOULD RELOCATE %-42s  "
+                            "dev %s→%s  module %s→%s",
+                            device_name, iface_name,
+                            ex_dev_id, target_id,
+                            ex_mod_id, target_module_id,
+                        )
             log.info(
-                "DRY-RUN  %-30s  iface=%-40s  dev_id=%-6s  %s",
-                device_name, iface_name, target_id, nb_payload,
+                "DRY-RUN  %-30s  iface=%-40s  dev_id=%-6s  mod_id=%-6s  %s",
+                device_name, iface_name, target_id, target_module_id, nb_payload,
             )
             summary["interfaces_skipped"] += 1
             continue
+
+        # ── Live: relocation check before upsert ──────────────────────────
+        # Search across ALL VC member devices for an existing record with
+        # this name.  If found on the wrong device or wrong module, delete
+        # and recreate it (preserving all properties + IPs) so every
+        # downstream stage (trunks, prefixes, LAG) operates on the correct
+        # placement.
+        if len(all_vc_device_ids) > 1 or target_module_id is not None:
+            try:
+                existing = nb.find_interface_by_name_vc(
+                    all_vc_device_ids, iface_name
+                )
+                if existing:
+                    ex_dev_id = _nb_id(existing.get("device"))
+                    ex_mod_id = _nb_id(existing.get("module"))
+                    wrong_dev = ex_dev_id is not None and ex_dev_id != target_id
+                    wrong_mod = (
+                        target_module_id is not None
+                        and ex_mod_id != target_module_id
+                    )
+                    if wrong_dev or wrong_mod:
+                        _relocate_interface(
+                            nb=nb,
+                            existing=existing,
+                            target_device_id=target_id,
+                            target_module_id=target_module_id,
+                            iface_name=iface_name,
+                            device_name=device_name,
+                            summary=summary,
+                        )
+                        # After relocation the interface now exists on the
+                        # correct device/module; upsert below will find it
+                        # and apply any remaining field updates.
+            except NetBoxClientError as exc:
+                log.warning(
+                    "%-30s  relocation check failed for %r: %s",
+                    device_name, iface_name, exc,
+                )
+                summary["errors"].append(
+                    f"Relocation check {iface_name!r}: {exc}"
+                )
 
         try:
             result = nb.upsert_interface(
@@ -2091,6 +2895,8 @@ def sync_device(
                 site_name=site_name,
                 vlan_id_map=vlan_id_map,
                 dry_run=args.dry_run,
+                iface_vrf_map=iface_vrf_map,
+                vrf_cache=vrf_cache,
             )
         summary["svi_interfaces_bound"]  = svi_bound
         summary["vlan_site_corrections"] = vlan_site_fixes
@@ -2124,6 +2930,8 @@ def sync_device(
             site_id=site_id,
             vlan_id_map=vlan_id_map,
             dry_run=args.dry_run,
+            iface_vrf_map=iface_vrf_map,
+            vrf_cache=vrf_cache,
         )
         summary["prefixes_created_count"]    = p_created
         summary["prefixes_updated_count"]    = p_updated
