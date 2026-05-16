@@ -1703,12 +1703,12 @@ def _sync_interface_states(
         if dry_run:
             log.info(
                 "DRY-RUN  %-30s  state %-38s  dev_id=%-6s  enabled=%s  "
-                "connected=%s  interface_state=%s",
+                "connected=%s  STATE=%s",
                 device_name, iface_name, target_id,
                 enabled, mark_connected, iface_state,
             )
             log.info(
-                "DRY-RUN  %-30s  Would update interface_state to %s on %s",
+                "DRY-RUN  %-30s  Would update STATE to %s on %s",
                 device_name, iface_state, iface_name,
             )
             updated += 1
@@ -1728,7 +1728,7 @@ def _sync_interface_states(
         except NetBoxClientError as exc:
             errors.append(f"State {iface_name!r}: {exc}")
 
-        # ── Update interface_state custom field ───────────────────────────
+        # ── Update STATE custom field ─────────────────────────────────────
         try:
             cf_result = nb.update_interface_state_cf(
                 target_id, iface_name, iface_state
@@ -1737,21 +1737,21 @@ def _sync_interface_states(
             if cf_action == "updated":
                 log.info(
                     "%-30s  Updating NetBox interface %s custom field "
-                    "interface_state → %s",
+                    "STATE → %s",
                     device_name, iface_name, iface_state,
                 )
             else:
                 log.debug(
-                    "%-30s  No change needed for %s (state already %s)",
+                    "%-30s  No change needed for %s (STATE already %s)",
                     device_name, iface_name, iface_state,
                 )
         except NetBoxClientError as exc:
             log.error(
-                "%-30s  interface_state CF update failed for %r payload=%r: %s",
+                "%-30s  STATE CF update failed for %r payload=%r: %s",
                 device_name, iface_name,
-                {"interface_state": iface_state}, exc,
+                {"STATE": iface_state}, exc,
             )
-            errors.append(f"interface_state CF {iface_name!r}: {exc}")
+            errors.append(f"STATE CF {iface_name!r}: {exc}")
 
     return updated, errors
 

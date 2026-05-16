@@ -2111,12 +2111,11 @@ class NetBoxClient:
         state_value: str,
     ) -> dict:
         """
-        Idempotently update the ``interface_state`` custom field on a NetBox
-        interface.
+        Idempotently update the ``STATE`` custom field on a NetBox interface.
 
-        Only the ``interface_state`` key inside ``custom_fields`` is written;
-        all other custom fields on the record are untouched (NetBox merges
-        partial ``custom_fields`` dicts on PATCH).
+        Only the ``STATE`` key inside ``custom_fields`` is written; all other
+        custom fields on the record are untouched (NetBox merges partial
+        ``custom_fields`` dicts on PATCH).
 
         Parameters
         ----------
@@ -2166,25 +2165,25 @@ class NetBoxClient:
         rec      = existing[0]
         rec_dict = self._to_dict(rec)
         cur_cf   = rec_dict.get("custom_fields") or {}
-        cur_val  = str(cur_cf.get("interface_state") or "")
+        cur_val  = str(cur_cf.get("STATE") or "")
 
         if cur_val == state_value:
             self.log.debug(
-                "update_interface_state_cf: %r already %r — skipped",
+                "update_interface_state_cf: %r STATE already %r — skipped",
                 interface_name, state_value,
             )
             rec_dict["_action"] = "skipped"
             return rec_dict
 
         try:
-            rec.update({"custom_fields": {"interface_state": state_value}})
+            rec.update({"custom_fields": {"STATE": state_value}})
             d = self._to_dict(rec)
             d["_action"] = "updated"
             return d
         except pynetbox.RequestError as exc:
             raise NetBoxClientError(
                 f"update_interface_state_cf: update failed for "
-                f"{interface_name!r} payload={{'interface_state': {state_value!r}}}: {exc}"
+                f"{interface_name!r} payload={{'STATE': {state_value!r}}}: {exc}"
             ) from exc
 
     # ----------------------------------------------------------------------- #
