@@ -413,6 +413,12 @@ class CiscoDeviceClient:
         self.netconf_port   = netconf_port
         self.log            = log or logging.getLogger(__name__)
 
+        # Governs which transport all inventory methods use when the caller
+        # does not pass an explicit transport= argument.  Set this to "cli",
+        # "netconf", or "restconf" to lock every collection to one transport;
+        # leave as "auto" to enable the per-OS fallback chain.
+        self.transport: str = "auto"
+
         self._cli_connection: Optional[ConnectHandler] = None
 
         if not verify_ssl:
@@ -1391,7 +1397,7 @@ class CiscoDeviceClient:
     # VLAN inventory                                                           #
     # ----------------------------------------------------------------------- #
 
-    def get_vlans_inventory(self, transport: str = "auto") -> List[dict]:
+    def get_vlans_inventory(self, transport: Optional[str] = None) -> List[dict]:
         """
         Return a normalised VLAN list from the device.
 
@@ -1411,9 +1417,10 @@ class CiscoDeviceClient:
         -------
         list[dict]
         """
-        if transport == "auto":
+        t = transport if transport is not None else self.transport
+        if t == "auto":
             return self._auto_collect(self._vlans_via_transport)
-        return self._vlans_via_transport(transport)
+        return self._vlans_via_transport(t)
 
     def _vlans_via_transport(self, transport: str) -> List[dict]:
         """Dispatch VLAN collection to the named transport."""
@@ -1670,7 +1677,7 @@ class CiscoDeviceClient:
     # Trunk interface inventory                                                #
     # ----------------------------------------------------------------------- #
 
-    def get_trunk_interfaces_inventory(self, transport: str = "auto") -> List[dict]:
+    def get_trunk_interfaces_inventory(self, transport: Optional[str] = None) -> List[dict]:
         """
         Return trunk interface details from the device.
 
@@ -1692,9 +1699,10 @@ class CiscoDeviceClient:
         -------
         list[dict]
         """
-        if transport == "auto":
+        t = transport if transport is not None else self.transport
+        if t == "auto":
             return self._auto_collect(self._trunk_via_transport)
-        return self._trunk_via_transport(transport)
+        return self._trunk_via_transport(t)
 
     def _trunk_via_transport(self, transport: str) -> List[dict]:
         """
@@ -1925,7 +1933,7 @@ class CiscoDeviceClient:
     # Interface IP inventory                                                   #
     # ----------------------------------------------------------------------- #
 
-    def get_interface_ip_inventory(self, transport: str = "auto") -> List[dict]:
+    def get_interface_ip_inventory(self, transport: Optional[str] = None) -> List[dict]:
         """
         Return interface IP addresses with prefix lengths.
 
@@ -1946,9 +1954,10 @@ class CiscoDeviceClient:
         -------
         list[dict]
         """
-        if transport == "auto":
+        t = transport if transport is not None else self.transport
+        if t == "auto":
             return self._auto_collect(self._ip_via_transport)
-        return self._ip_via_transport(transport)
+        return self._ip_via_transport(t)
 
     def _ip_via_transport(self, transport: str) -> List[dict]:
         """Dispatch IP inventory to the named transport."""

@@ -2832,6 +2832,11 @@ def sync_device(
         timeout=args.timeout,
         verify_ssl=False,
     )
+    # Honour the --transport flag for ALL collection methods, not just Stage 1.
+    # Every method that defaults to transport=None resolves against this value,
+    # so setting it here prevents _auto_collect from firing on VLAN, trunk, and
+    # IP inventory when an explicit transport was requested.
+    cisco.transport = args.transport
 
     # ── Stage 1: interface inventory (speed / duplex / description) ────────
     try:
