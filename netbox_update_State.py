@@ -50,6 +50,7 @@ from netbox_client import NetBoxClient, NetBoxClientError
 # so device selection, credential flags, concurrency, and transport behaviour
 # are byte-for-byte identical.
 from sync_netbox_interfaces import (
+    _configure_logging,
     build_parser,
     build_vc_member_map,
     expand_interface_name,
@@ -307,11 +308,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-        stream=sys.stderr,
-    )
+    _configure_logging(args.log_level, args.log_file)
 
     # ── Validate required fields ─────────────────────────────────────────
     missing: List[str] = []

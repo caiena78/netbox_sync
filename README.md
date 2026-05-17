@@ -13,6 +13,7 @@ classes (`CiscoDeviceClient`, `NetBoxClient`) and two runnable programs.
 | `cisco_device_client.py` | Cisco device client — CLI (Netmiko), RESTCONF, NETCONF |
 | `netbox_client.py` | NetBox REST API client — get/create/update devices and interfaces |
 | `sync_netbox_interfaces.py` | Interface, VLAN, prefix, LAG, and state sync program |
+| `netbox_update_State.py` | Dedicated interface-state poller — updates `STATE` and `state_change` custom fields |
 | `netbox_cables.py` | CDP-based physical cable discovery and creation |
 | `example_usage.py` | Short usage examples for both classes |
 | `requirements.txt` | Python package dependencies |
@@ -426,6 +427,306 @@ print(result["action"])  # "created" | "updated" | "skipped"
 ```
 
 ---
+
+---
+
+## Running `netbox_update_State.py`
+
+`netbox_update_State.py` is a focused, lightweight poller that connects to
+Cisco devices, reads the operational state of every interface via
+`show interfaces status`, and updates two NetBox interface custom fields:
+
+| Custom field | Type | Written when |
+|---|---|---|
+| `STATE` | text — `UP` \| `DOWN` \| `ADMIN DOWN` \| `UNKNOWN` | Value differs from device |
+| `state_change` | datetime (ISO 8601 UTC) | `STATE` value transitions |
+
+**Idempotent by design** — if the device state already matches what is in
+NetBox the record is not touched and `state_change` is left unchanged.
+
+State normalization:
+
+| Device reports | Written to NetBox |
+|---|---|
+| `connected` (port is up/up) | `UP` |
+| `disabled` (admin shutdown) | `ADMIN DOWN` |
+| `err-disabled` | `ADMIN DOWN` |
+| `notconnect`, `inactive`, `sfpabsent`, `down` | `DOWN` |
+| State cannot be determined | `UNKNOWN` |
+
+Logs go to **stderr**; the JSON result array goes to **stdout**.
+
+---
+
+### Quickstart — credentials from environment variables
+
+**Linux / macOS:**
+```bash
+python netbox_update_State.py \
+    --device-filter '{"platform": "iosxe", "status": "active"}'
+```
+
+**Windows PowerShell:**
+```powershell
+$f = '{"platform": "iosxe", "status": "active"}'
+python netbox_update_State.py --device-filter $f
+```
+
+### Single device
+
+```bash
+python netbox_update_State.py \
+    --device core-sw-01
+```
+
+### Comma-separated list of devices
+
+```bash
+python netbox_update_State.py \
+    --devices "core-sw-01,acc-sw-01,acc-sw-02"
+```
+
+### Device list from a file
+
+```bash
+python netbox_update_State.py \
+    --device-file /etc/netauto/devices.txt
+```
+
+### Limit to a single site
+
+```bash
+# Poll only devices in the "lakeview" site
+python netbox_update_State.py \
+    --site-slug lakeview
+
+# Combine with a device-filter (both conditions must match)
+python netbox_update_State.py \
+    --site-slug westpark \
+    --device-filter '{"status": "active"}'
+```
+
+### Dry-run (no NetBox writes)
+
+Reads device state and shows what would change without writing anything.
+
+```bash
+python netbox_update_State.py \
+    --device core-sw-01 \
+    --dry-run
+```
+
+Sample dry-run log:
+
+```
+INFO  netbox_update_State: *** DRY-RUN mode — no changes will be written to NetBox ***
+INFO  netbox_update_State: core-sw-01              ip=10.1.1.5   os_type=iosxe  transport=auto
+INFO  netbox_update_State: core-sw-01              collected state for 48 interface(s)
+INFO  netbox_update_State: DRY-RUN  core-sw-01     STATE unchanged for GigabitEthernet1/0/1 (UP), skipping
+INFO  netbox_update_State: DRY-RUN  core-sw-01     would update STATE for GigabitEthernet1/0/3: DOWN → UP; state_change=2026-05-17T14:30:01Z
+INFO  netbox_update_State: DRY-RUN  core-sw-01     would update STATE for GigabitEthernet1/0/12: (null) → ADMIN DOWN; state_change=2026-05-17T14:30:01Z
+INFO  netbox_update_State: core-sw-01              status=success   checked=48  updated=2  unchanged=46  errs=0
+```
+
+### Explicit transport (no fallback)
+
+```bash
+# SSH / CLI only — safest option for devices that do not have NETCONF/RESTCONF
+python netbox_update_State.py \
+    --device core-sw-01 \
+    --transport cli
+
+# NETCONF only
+python netbox_update_State.py \
+    --device core-sw-01 \
+    --transport netconf
+```
+
+> **Note** — `get_interface_state_inventory()` always collects data over SSH
+> (`show interfaces status`), so the transport flag controls how the
+> `CiscoDeviceClient` instance is configured but does not change which
+> protocol carries the state query.  Setting `--transport cli` is the most
+> predictable choice for this script.
+
+### Explicit credentials on the command line
+
+```bash
+python netbox_update_State.py \
+    --netbox-url https://netbox.example.org \
+    --netbox-token your-api-token \
+    --username svc-netauto \
+    --password s3cr3t \
+    --enable-secret en4bl3s3cr3t \
+    --device core-sw-01
+```
+
+### Increase concurrency and verbosity
+
+```bash
+python netbox_update_State.py \
+    --device-filter '{"status": "active"}' \
+    --max-workers 10 \
+    --timeout 60 \
+    --log-level DEBUG
+```
+
+### Redirect JSON output to a file
+
+```bash
+python netbox_update_State.py \
+    --device-filter '{"status": "active"}' \
+    > state_report.json
+```
+
+---
+
+### Log output examples
+
+**Unchanged interface (state already matches NetBox):**
+```
+DEBUG netbox_update_State: core-sw-01   Interface GigabitEthernet1/0/1 state detected as UP (dev_id=101)
+DEBUG netbox_update_State: core-sw-01   STATE unchanged for GigabitEthernet1/0/1 (UP), skipping
+```
+
+**Changed interface (STATE updated + state_change stamped):**
+```
+DEBUG netbox_update_State: core-sw-01   Interface GigabitEthernet1/0/3 state detected as UP (dev_id=101)
+INFO  netbox_update_State: core-sw-01   Updating STATE for GigabitEthernet1/0/3: DOWN → UP; state_change=2026-05-17T14:30:01Z
+```
+
+**Admin-down interface (first time seen):**
+```
+INFO  netbox_update_State: core-sw-01   Updating STATE for GigabitEthernet1/0/12: (null) → ADMIN DOWN; state_change=2026-05-17T14:30:01Z
+```
+
+**Interface not found in NetBox (warn and continue):**
+```
+WARNING netbox_update_State: core-sw-01   GigabitEthernet1/0/48 not found in NetBox (dev_id=101) — skipped
+```
+
+**State cannot be determined:**
+```
+WARNING netbox_update_State: core-sw-01   GigabitEthernet1/0/7: state could not be determined — using UNKNOWN
+INFO    netbox_update_State: core-sw-01   Updating STATE for GigabitEthernet1/0/7: DOWN → UNKNOWN; state_change=2026-05-17T14:30:01Z
+```
+
+---
+
+### Output format
+
+One JSON object per device is written to stdout:
+
+```json
+[
+  {
+    "device":             "core-sw-01",
+    "status":             "success",
+    "transport_used":     "cli",
+    "interfaces_checked": 48,
+    "states_updated":     3,
+    "states_unchanged":   45,
+    "errors":             []
+  },
+  {
+    "device":             "acc-sw-02",
+    "status":             "failed",
+    "transport_used":     null,
+    "interfaces_checked": 0,
+    "states_updated":     0,
+    "states_unchanged":   0,
+    "errors":             ["Interface state collection failed: SSH timeout"]
+  }
+]
+```
+
+Useful `jq` filters:
+
+```bash
+# Devices where at least one STATE changed
+python netbox_update_State.py ... | jq '[.[] | select(.states_updated > 0)]'
+
+# Total state changes across all devices
+python netbox_update_State.py ... | jq '[.[].states_updated] | add'
+
+# Devices with errors
+python netbox_update_State.py ... | jq '[.[] | select(.errors | length > 0)]'
+
+# Summary table: device, checked, updated
+python netbox_update_State.py ... | jq '.[] | [.device, .interfaces_checked, .states_updated] | @tsv'
+```
+
+---
+
+### Virtual chassis
+
+`netbox_update_State.py` resolves virtual chassis names the same way as
+`sync_netbox_interfaces.py` — pass the **chassis name** and the script
+selects the correct master member automatically.  Each interface is then
+routed to the correct VC member device for the NetBox update based on the
+first number in the interface name (e.g. `GigabitEthernet2/0/1` → member
+with `vc_position = 2`).
+
+```bash
+python netbox_update_State.py \
+    --device acc-stack-01
+# Log: Virtual chassis 'acc-stack-01' → using member 'acc-stack-01-m1'  ip=10.0.1.5  vc_position=1
+```
+
+---
+
+### Running on a schedule
+
+Poll interface state every 5 minutes using cron (Linux / macOS):
+
+```cron
+*/5 * * * * /usr/bin/python3 /opt/netauto/netbox_update_State.py \
+    --device-filter '{"status": "active"}' \
+    --transport cli \
+    --max-workers 10 \
+    >> /var/log/netauto/state.log 2>&1
+```
+
+Windows Task Scheduler (PowerShell action):
+
+```powershell
+python C:\netauto\netbox_update_State.py `
+    --device-filter '{\"status\": \"active\"}' `
+    --transport cli `
+    --max-workers 10
+```
+
+---
+
+### All `netbox_update_State.py` CLI flags
+
+```
+usage: netbox_update_State.py [-h]
+
+  NetBox connection:
+    --netbox-url URL          NetBox base URL (env: NETBOX_URL)
+    --netbox-token TOKEN      NetBox API token (env: NETBOX_API)
+    --netbox-verify-ssl / --no-netbox-verify-ssl
+
+  Device selection (pick one, or omit for all):
+    --device NAME             Single device name (or virtual chassis name)
+    --devices NAME,...        Comma-separated device names
+    --device-file PATH        File with one device name per line (#comments ignored)
+    --device-filter JSON      NetBox DCIM device filter as JSON (default: {})
+    --all                     Explicit "process all" flag
+    --site-slug SLUG          Limit to devices in this site (slug, optional)
+
+  Cisco credentials:
+    --username USER           SSH username (env: CISCO_SRV_ACCOUNT)
+    --password PASS           SSH password (env: CISCO_SRV_PWD)
+    --enable-secret SECRET    Enable secret (env: CISCO_ENABLE_PWD)
+
+  Runtime options:
+    --transport {auto,cli,restconf,netconf}   (default: auto)
+    --dry-run                 Show what would change; no NetBox writes
+    --max-workers N           Concurrent threads (default: 5)
+    --timeout SEC             Device SSH timeout in seconds (default: 30)
+    --log-level {DEBUG,INFO,WARNING,ERROR}    (default: INFO)
+```
 
 ---
 

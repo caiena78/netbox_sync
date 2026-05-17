@@ -710,6 +710,15 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         default="INFO",
     )
+    run.add_argument(
+        "--log-file",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Also write log output to this file (appended, UTF-8). "
+            "Stderr output is always kept regardless of this setting."
+        ),
+    )
 
     sync = p.add_argument_group("Sync stage toggles")
     sync.add_argument("--sync-vlans", action=argparse.BooleanOptionalAction,
@@ -3148,6 +3157,49 @@ def sync_device(
 
 
 # --------------------------------------------------------------------------- #
+# Logging setup                                                                #
+# --------------------------------------------------------------------------- #
+
+def _configure_logging(level: str, log_file: Optional[str] = None) -> None:
+    """
+    Configure the root logger.
+
+    Logs are always written to **stderr**.  When *log_file* is supplied they
+    are also appended (UTF-8) to that file so the operator can watch the
+    terminal in real time and keep a persistent record simultaneously.
+
+    Parameters
+    ----------
+    level : str
+        One of ``"DEBUG"``, ``"INFO"``, ``"WARNING"``, ``"ERROR"``.
+    log_file : str or None
+        Path to an optional log file.  The file is opened in append mode so
+        successive runs accumulate rather than overwrite.
+    """
+    fmt  = "%(asctime)s %(levelname)-8s %(name)s: %(message)s"
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, level))
+    root.handlers.clear()   # prevent duplicate handlers on repeated calls
+
+    stderr_h = logging.StreamHandler(sys.stderr)
+    stderr_h.setFormatter(logging.Formatter(fmt))
+    root.addHandler(stderr_h)
+
+    if log_file:
+        try:
+            file_h = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+            file_h.setFormatter(logging.Formatter(fmt))
+            root.addHandler(file_h)
+            logging.getLogger(__name__).info(
+                "Log file: %s", log_file
+            )
+        except OSError as exc:
+            logging.getLogger(__name__).warning(
+                "Cannot open log file %r: %s — logging to stderr only", log_file, exc
+            )
+
+
+# --------------------------------------------------------------------------- #
 # Entry point                                                                  #
 # --------------------------------------------------------------------------- #
 
@@ -3155,11 +3207,7 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-        stream=sys.stderr,
-    )
+    _configure_logging(args.log_level, args.log_file)
 
     # Validate required values
     missing: List[str] = []

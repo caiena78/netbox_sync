@@ -319,6 +319,15 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--log-level",
                      choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                      default="INFO")
+    run.add_argument(
+        "--log-file",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Also write log output to this file (appended, UTF-8). "
+            "Stderr output is always kept regardless of this setting."
+        ),
+    )
 
     return p
 
@@ -942,6 +951,33 @@ def process_device_cables(
 
 
 # --------------------------------------------------------------------------- #
+# Logging setup                                                                #
+# --------------------------------------------------------------------------- #
+
+def _configure_logging(level: str, log_file=None) -> None:
+    """stderr always on; optionally also append to *log_file*."""
+    fmt  = "%(asctime)s %(levelname)-8s %(name)s: %(message)s"
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, level))
+    root.handlers.clear()
+
+    stderr_h = logging.StreamHandler(sys.stderr)
+    stderr_h.setFormatter(logging.Formatter(fmt))
+    root.addHandler(stderr_h)
+
+    if log_file:
+        try:
+            file_h = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+            file_h.setFormatter(logging.Formatter(fmt))
+            root.addHandler(file_h)
+            logging.getLogger(__name__).info("Log file: %s", log_file)
+        except OSError as exc:
+            logging.getLogger(__name__).warning(
+                "Cannot open log file %r: %s — logging to stderr only", log_file, exc
+            )
+
+
+# --------------------------------------------------------------------------- #
 # Entry point                                                                  #
 # --------------------------------------------------------------------------- #
 
@@ -949,11 +985,7 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-        stream=sys.stderr,
-    )
+    _configure_logging(args.log_level, args.log_file)
 
     missing: List[str] = []
     if not args.netbox_url:
