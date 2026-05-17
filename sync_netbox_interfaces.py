@@ -1102,6 +1102,37 @@ def _sync_trunks(
 
     log.info("%-30s  trunk: %d trunk interface(s) collected", device_name, len(trunks))
 
+    # ── Build VC interface→device map ─────────────────────────────────────
+    # resolve_target_device_id relies on vc_position values being set on
+    # every NetBox VC member.  When vc_position is absent or wrong it falls
+    # back to the master device, causing GigabitEthernet2/0/1 and similar
+    # "wrong-member" interfaces to be looked up on the wrong device.
+    #
+    # To fix this without relying on vc_position, we fetch the actual
+    # interfaces from EVERY VC member device once (N API calls where N is
+    # the member count) and build an authoritative {iface_name: device_id}
+    # map.  This map is used in preference to the slot-number heuristic.
+    _vc_iface_device: Dict[str, int] = {}
+    if vc_member_map:
+        all_vc_dev_ids: List[int] = list({device_id} | set(vc_member_map.values()))
+        for _dev_id in all_vc_dev_ids:
+            try:
+                for _iface in nb.get_interfaces(device_id=_dev_id):
+                    _name = _iface.get("name", "")
+                    if _name and _name not in _vc_iface_device:
+                        _vc_iface_device[_name] = _dev_id
+            except NetBoxClientError as _exc:
+                log.debug(
+                    "%-30s  trunk: could not load interfaces for "
+                    "dev_id=%s — falling back to slot routing: %s",
+                    device_name, _dev_id, _exc,
+                )
+        log.debug(
+            "%-30s  trunk: VC iface→device map loaded (%d entries across "
+            "%d member(s))",
+            device_name, len(_vc_iface_device), len(all_vc_dev_ids),
+        )
+
     for trunk in trunks:
         raw_name    = trunk.get("name", "")
         iface_name  = expand_interface_name(raw_name)
@@ -1158,8 +1189,13 @@ def _sync_trunks(
         native_nb_id  = vid_map.get(native_vid) if native_vid else None
         tagged_nb_ids = [vid_map[v] for v in allowed_vid if v in vid_map]
 
-        # Route to correct VC member / line-card device
-        target_id = resolve_target_device_id(iface_name, device_id, vc_member_map)
+        # Route to the correct VC member / line-card device.
+        # Prefer the live map (where each interface actually lives in NetBox)
+        # over the slot-number heuristic so that stacks without vc_position
+        # set still route correctly (e.g. GigabitEthernet2/0/1 → member 2).
+        target_id = _vc_iface_device.get(iface_name) or resolve_target_device_id(
+            iface_name, device_id, vc_member_map
+        )
 
         if dry_run:
             log.info(
