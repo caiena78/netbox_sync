@@ -2186,6 +2186,143 @@ class NetBoxClient:
                 f"{interface_name!r} payload={{'STATE': {state_value!r}}}: {exc}"
             ) from exc
 
+    def get_interface_by_name(
+        self,
+        device_id: int,
+        interface_name: str,
+    ) -> Optional[dict]:
+        """
+        Return the first NetBox interface whose name matches *interface_name*
+        on *device_id*, or ``None`` when not found.
+
+        Parameters
+        ----------
+        device_id : int
+        interface_name : str
+
+        Returns
+        -------
+        dict or None
+
+        Raises
+        ------
+        NetBoxClientError
+            On API failure.
+        """
+        self.log.debug(
+            "get_interface_by_name device_id=%s name=%r", device_id, interface_name
+        )
+        try:
+            recs = list(
+                self.nb.dcim.interfaces.filter(
+                    device_id=device_id, name=interface_name
+                )
+            )
+            return self._to_dict(recs[0]) if recs else None
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"get_interface_by_name: lookup failed for "
+                f"{interface_name!r} on device_id={device_id}: {exc}"
+            ) from exc
+
+    def update_interface_state_fields(
+        self,
+        device_id: int,
+        interface_name: str,
+        state_value: str,
+        state_change_ts: str,
+    ) -> dict:
+        """
+        Idempotently update the ``STATE`` and ``state_change`` custom fields
+        on a NetBox interface.
+
+        Comparison
+        ----------
+        - Reads the current ``custom_fields["STATE"]`` from NetBox.
+        - **If it matches** *state_value*: returns ``"_action": "skipped"``
+          without any API write.  ``state_change`` is **not** updated.
+        - **If it differs**: PATCHes both ``STATE`` and ``state_change`` in
+          a single request.  All other custom fields are untouched (NetBox
+          merges partial ``custom_fields`` dicts on PATCH).
+
+        Parameters
+        ----------
+        device_id : int
+        interface_name : str
+        state_value : str
+            One of ``"UP"``, ``"DOWN"``, ``"ADMIN DOWN"``, ``"UNKNOWN"``.
+        state_change_ts : str
+            ISO 8601 UTC timestamp written only on a state transition,
+            e.g. ``"2026-05-17T14:30:00Z"``.
+
+        Returns
+        -------
+        dict::
+
+            {
+                "_action":   "updated" | "skipped" | "not_found",
+                "old_state": str | None,
+                "new_state": str,
+            }
+
+        Raises
+        ------
+        NetBoxClientError
+            On lookup or PATCH failure.
+        """
+        self.log.debug(
+            "update_interface_state_fields device_id=%s iface=%r state=%r",
+            device_id, interface_name, state_value,
+        )
+        try:
+            existing = list(
+                self.nb.dcim.interfaces.filter(
+                    device_id=device_id, name=interface_name
+                )
+            )
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"update_interface_state_fields: lookup failed for "
+                f"{interface_name!r} on device_id={device_id}: {exc}"
+            ) from exc
+
+        if not existing:
+            self.log.warning(
+                "update_interface_state_fields: %r not found on "
+                "device_id=%s — skipped",
+                interface_name, device_id,
+            )
+            return {"_action": "not_found", "old_state": None, "new_state": state_value}
+
+        rec      = existing[0]
+        rec_dict = self._to_dict(rec)
+        cur_cf   = rec_dict.get("custom_fields") or {}
+        old_state = cur_cf.get("STATE") or None
+        cur_val   = str(old_state or "")
+
+        if cur_val == state_value:
+            self.log.debug(
+                "update_interface_state_fields: %r STATE already %r — skipped",
+                interface_name, state_value,
+            )
+            return {"_action": "skipped", "old_state": old_state, "new_state": state_value}
+
+        try:
+            rec.update({
+                "custom_fields": {
+                    "STATE":         state_value,
+                    "state_change":  state_change_ts,
+                }
+            })
+            return {"_action": "updated", "old_state": old_state, "new_state": state_value}
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"update_interface_state_fields: PATCH failed for "
+                f"{interface_name!r} "
+                f"payload={{'STATE': {state_value!r}, "
+                f"'state_change': {state_change_ts!r}}}: {exc}"
+            ) from exc
+
     # ----------------------------------------------------------------------- #
     # Device and interface custom fields                                        #
     # ----------------------------------------------------------------------- #

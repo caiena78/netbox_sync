@@ -1703,18 +1703,16 @@ def _sync_interface_states(
         if dry_run:
             log.info(
                 "DRY-RUN  %-30s  state %-38s  dev_id=%-6s  enabled=%s  "
-                "connected=%s  STATE=%s",
+                "connected=%s",
                 device_name, iface_name, target_id,
-                enabled, mark_connected, iface_state,
-            )
-            log.info(
-                "DRY-RUN  %-30s  Would update STATE to %s on %s",
-                device_name, iface_state, iface_name,
+                enabled, mark_connected,
             )
             updated += 1
             continue
 
-        # ── Update enabled + mark_connected (existing logic) ─────────────
+        # ── Update enabled + mark_connected ───────────────────────────────
+        # STATE / state_change custom-field updates are handled by the
+        # dedicated netbox_update_State.py script; do not duplicate them here.
         try:
             result = nb.update_interface_admin_oper(
                 target_id, iface_name, enabled, mark_connected
@@ -1727,31 +1725,6 @@ def _sync_interface_states(
                 )
         except NetBoxClientError as exc:
             errors.append(f"State {iface_name!r}: {exc}")
-
-        # ── Update STATE custom field ─────────────────────────────────────
-        try:
-            cf_result = nb.update_interface_state_cf(
-                target_id, iface_name, iface_state
-            )
-            cf_action = cf_result.get("_action", "skipped")
-            if cf_action == "updated":
-                log.info(
-                    "%-30s  Updating NetBox interface %s custom field "
-                    "STATE → %s",
-                    device_name, iface_name, iface_state,
-                )
-            else:
-                log.debug(
-                    "%-30s  No change needed for %s (STATE already %s)",
-                    device_name, iface_name, iface_state,
-                )
-        except NetBoxClientError as exc:
-            log.error(
-                "%-30s  STATE CF update failed for %r payload=%r: %s",
-                device_name, iface_name,
-                {"STATE": iface_state}, exc,
-            )
-            errors.append(f"STATE CF {iface_name!r}: {exc}")
 
     return updated, errors
 
