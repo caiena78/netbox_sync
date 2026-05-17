@@ -2271,14 +2271,18 @@ class CiscoDeviceClient:
             # Normalise line endings — NX-OS may return \r\n
             raw = raw.replace("\r\n", "\n").replace("\r", "\n")
 
-            # Reject output that contains a device error marker
+            # Reject output that contains a device error marker.
+            # Only scan the first 15 lines — device errors always appear at
+            # the start; scanning the entire config causes false positives
+            # when descriptions or banners contain the same text.
             if not raw or not raw.strip():
                 self.log.debug("%s: %r returned empty output", self.host, cmd)
                 continue
-            if any(marker in raw for marker in self._CLI_ERROR_MARKERS):
+            head = "\n".join(raw.splitlines()[:15])
+            if any(marker in head for marker in self._CLI_ERROR_MARKERS):
                 self.log.debug(
-                    "%s: %r rejected (error in output): %.120s",
-                    self.host, cmd, raw.strip(),
+                    "%s: %r rejected (error marker in header): %.120s",
+                    self.host, cmd, head.strip(),
                 )
                 continue
 
@@ -2294,8 +2298,11 @@ class CiscoDeviceClient:
             )
             return raw
 
-        self.log.warning(
-            "%s: could not retrieve any running-config for SVI parsing", self.host
+        # SVI parsing is best-effort — the sync continues normally without it.
+        self.log.debug(
+            "%s: could not retrieve any running-config for SVI parsing "
+            "(SVI prefixes will not be synced this run)",
+            self.host,
         )
         return ""
 
@@ -2592,12 +2599,20 @@ class CiscoDeviceClient:
                     "%s: %r returned empty output", self.host, cmd
                 )
                 continue
-            if any(marker in raw for marker in self._CLI_ERROR_MARKERS):
+
+            # Only scan the first 15 lines for error markers.
+            # Device error responses always appear at the start of the output
+            # (e.g. "% Invalid input detected at '^' marker").  Scanning the
+            # entire running-config would cause false positives when an
+            # interface description or banner contains the same text.
+            head = "\n".join(raw.splitlines()[:15])
+            if any(marker in head for marker in self._CLI_ERROR_MARKERS):
                 self.log.debug(
-                    "%s: %r rejected (error marker): %.120s",
-                    self.host, cmd, raw.strip(),
+                    "%s: %r rejected (error marker in header): %.120s",
+                    self.host, cmd, head.strip(),
                 )
                 continue
+
             if "interface " not in raw.lower():
                 self.log.debug(
                     "%s: %r has no interface lines — skipping", self.host, cmd
@@ -2609,8 +2624,13 @@ class CiscoDeviceClient:
             )
             return raw
 
-        self.log.warning(
-            "%s: could not retrieve interface running-config for VRF parsing",
+        # VRF parsing is best-effort — the sync continues normally and all
+        # interfaces are treated as global when this data is unavailable.
+        # Logging at DEBUG avoids alarming operators for something non-critical.
+        self.log.debug(
+            "%s: could not retrieve interface running-config for VRF parsing "
+            "(device may not support 'show run | section', or no interface "
+            "blocks found — VRFs will not be assigned this run)",
             self.host,
         )
         return ""
