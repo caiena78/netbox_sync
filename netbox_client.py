@@ -4254,5 +4254,310 @@ class NetBoxClient:
         result["_action"] = "updated"
         return result
 
+    # ----------------------------------------------------------------------- #
+    # Prefix containment lookup (used by netbox_ap.py)                        #
+    # ----------------------------------------------------------------------- #
+
+    def get_prefixes_containing_ip(
+        self,
+        ip_str: str,
+        site_id: Optional[int] = None,
+    ) -> List[dict]:
+        """
+        Return all NetBox prefixes whose network range contains *ip_str*.
+
+        Uses the NetBox ``contains`` IPAM filter so the server computes
+        containment — no client-side scan of all prefixes is required.
+
+        Parameters
+        ----------
+        ip_str : str
+            Bare IPv4/IPv6 address, e.g. ``"10.254.175.57"`` (no mask).
+        site_id : int, optional
+            When provided, limit results to prefixes assigned to this site.
+
+        Returns
+        -------
+        list[dict]
+            List of prefix records (JSON-serialisable).  Each record includes
+            the ``"prefix"`` string (e.g. ``"10.254.175.0/24"``) and the
+            usual NetBox metadata fields.
+
+        Raises
+        ------
+        NetBoxClientError
+            On API failure.
+        """
+        kwargs: dict = {"contains": ip_str}
+        if site_id is not None:
+            kwargs["site_id"] = site_id
+        try:
+            recs = list(self.nb.ipam.prefixes.filter(**kwargs))
+            return [self._to_dict(r) for r in recs]
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"get_prefixes_containing_ip({ip_str!r}) failed: {exc}"
+            ) from exc
+
+    # ----------------------------------------------------------------------- #
+    # AP / device-type helpers (used by netbox_ap.py)                         #
+    # ----------------------------------------------------------------------- #
+
+    def get_manufacturer_by_name(self, name: str) -> Optional[dict]:
+        """Return the manufacturer record whose name matches *name*, or ``None``."""
+        try:
+            recs = list(self.nb.dcim.manufacturers.filter(name=name))
+            return self._to_dict(recs[0]) if recs else None
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"get_manufacturer_by_name({name!r}) failed: {exc}"
+            ) from exc
+
+    def ensure_manufacturer(self, name: str) -> dict:
+        """
+        Ensure a manufacturer named *name* exists in NetBox.
+
+        Creates it (with an auto-slugified name) when absent.
+
+        Returns
+        -------
+        dict
+            Manufacturer record with ``"_action": "created"|"skipped"``.
+        """
+        existing = self.get_manufacturer_by_name(name)
+        if existing:
+            existing["_action"] = "skipped"
+            return existing
+        slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+        try:
+            rec = self.nb.dcim.manufacturers.create({"name": name, "slug": slug})
+            d = self._to_dict(rec)
+            d["_action"] = "created"
+            self.log.info("ensure_manufacturer: created %r (slug=%r)", name, slug)
+            return d
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"ensure_manufacturer({name!r}) failed: {exc}"
+            ) from exc
+
+    def get_device_type_by_model(self, model: str) -> Optional[dict]:
+        """
+        Return the NetBox DeviceType whose ``model`` field matches *model*
+        (case-insensitive exact match), or ``None`` if not found.
+        """
+        try:
+            recs = list(self.nb.dcim.device_types.filter(model=model))
+            if recs:
+                return self._to_dict(recs[0])
+            # Fallback: case-insensitive search via q=
+            recs = list(self.nb.dcim.device_types.filter(q=model))
+            for rec in recs:
+                if rec.model.lower() == model.lower():
+                    return self._to_dict(rec)
+            return None
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"get_device_type_by_model({model!r}) failed: {exc}"
+            ) from exc
+
+    def get_device_role_by_name(self, name: str) -> Optional[dict]:
+        """Return the device role whose name matches *name*, or ``None``."""
+        try:
+            recs = list(self.nb.dcim.device_roles.filter(name=name))
+            return self._to_dict(recs[0]) if recs else None
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"get_device_role_by_name({name!r}) failed: {exc}"
+            ) from exc
+
+    def ensure_device_role(self, name: str, color: str = "00bcd4") -> dict:
+        """
+        Ensure a device role named *name* exists; create it if absent.
+
+        Returns
+        -------
+        dict
+            Role record with ``"_action": "created"|"skipped"``.
+        """
+        existing = self.get_device_role_by_name(name)
+        if existing:
+            existing["_action"] = "skipped"
+            return existing
+        slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+        try:
+            rec = self.nb.dcim.device_roles.create(
+                {"name": name, "slug": slug, "color": color}
+            )
+            d = self._to_dict(rec)
+            d["_action"] = "created"
+            self.log.info("ensure_device_role: created %r", name)
+            return d
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"ensure_device_role({name!r}) failed: {exc}"
+            ) from exc
+
+    def ensure_ap_device(
+        self,
+        name: str,
+        device_type_id: int,
+        role_id: int,
+        site_id: int,
+        serial: Optional[str] = None,
+        tenant_id: Optional[int] = None,
+        status: str = "active",
+    ) -> dict:
+        """
+        Idempotently create or update an AP device record in NetBox.
+
+        Decision tree
+        -------------
+        1. Device not found by name → create with all supplied fields.
+           ``"_action": "created"``
+        2. Device found → compare ``device_type``, ``serial``, ``site``,
+           ``tenant``, and ``status``; patch only fields that differ.
+           ``"_action": "updated"`` if any field changed, else ``"skipped"``.
+
+        Parameters
+        ----------
+        name : str
+            Device hostname exactly as it should appear in NetBox.
+        device_type_id : int
+            NetBox DeviceType primary key.
+        role_id : int
+            NetBox DeviceRole primary key.
+        site_id : int
+            NetBox Site primary key — inherited from the parent Cisco device.
+        serial : str, optional
+            Hardware serial number (CDP-extracted).
+        tenant_id : int, optional
+            NetBox Tenant primary key (inherited from parent device).
+        status : str
+            NetBox device status string (default ``"active"``).
+
+        Returns
+        -------
+        dict
+            Device record with ``"_action": "created"|"updated"|"skipped"``.
+        """
+        # ── Look up existing record ────────────────────────────────────────
+        try:
+            recs = list(self.nb.dcim.devices.filter(name=name))
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"ensure_ap_device: lookup failed for {name!r}: {exc}"
+            ) from exc
+
+        create_payload: dict = {
+            "name":        name,
+            "device_type": device_type_id,
+            "role":        role_id,
+            "site":        site_id,
+            "status":      status,
+        }
+        if serial:
+            create_payload["serial"] = serial
+        if tenant_id is not None:
+            create_payload["tenant"] = tenant_id
+
+        if not recs:
+            # ── Create ────────────────────────────────────────────────────
+            try:
+                rec = self.nb.dcim.devices.create(create_payload)
+                d = self._to_dict(rec)
+                d["_action"] = "created"
+                self.log.info("ensure_ap_device: created %r", name)
+                return d
+            except pynetbox.RequestError as exc:
+                raise NetBoxClientError(
+                    f"ensure_ap_device: create failed for {name!r}: {exc}"
+                ) from exc
+
+        # ── Compare and update ─────────────────────────────────────────────
+        rec      = recs[0]
+        rec_dict = self._to_dict(rec)
+        patch: dict = {}
+
+        def _id_of(field: str) -> Optional[int]:
+            val = rec_dict.get(field)
+            return val.get("id") if isinstance(val, dict) else val
+
+        if _id_of("device_type") != device_type_id:
+            patch["device_type"] = device_type_id
+        if _id_of("site") != site_id:
+            patch["site"] = site_id
+        if serial and rec_dict.get("serial") != serial:
+            patch["serial"] = serial
+        if tenant_id is not None and _id_of("tenant") != tenant_id:
+            patch["tenant"] = tenant_id
+        cur_status = rec_dict.get("status")
+        cur_status_val = (
+            cur_status.get("value") if isinstance(cur_status, dict) else cur_status
+        )
+        if cur_status_val != status:
+            patch["status"] = status
+
+        if not patch:
+            rec_dict["_action"] = "skipped"
+            return rec_dict
+
+        try:
+            rec.update(patch)
+            d = self._to_dict(rec)
+            d["_action"] = "updated"
+            self.log.info(
+                "ensure_ap_device: updated %r fields=%s", name, list(patch)
+            )
+            return d
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"ensure_ap_device: update failed for {name!r}: {exc}"
+            ) from exc
+
+    def set_device_primary_ip4(self, device_id: int, ip_id: int) -> dict:
+        """
+        Set ``primary_ip4`` on the device identified by *device_id*.
+
+        Parameters
+        ----------
+        device_id : int
+            NetBox device primary key.
+        ip_id : int
+            NetBox IP address primary key to set as primary IPv4.
+
+        Returns
+        -------
+        dict
+            Updated device record.
+        """
+        rec = self._require_device(device_id=device_id, _raw=True)
+        cur = rec_dict = self._to_dict(rec)
+        cur_ip = cur_dict = cur_rec = None
+        try:
+            cur_primary = rec_dict.get("primary_ip4")
+            cur_ip_id = (
+                cur_primary.get("id")
+                if isinstance(cur_primary, dict)
+                else cur_primary
+            )
+        except Exception:
+            cur_ip_id = None
+
+        if cur_ip_id == ip_id:
+            rec_dict["_action"] = "skipped"
+            return rec_dict
+        try:
+            rec.update({"primary_ip4": ip_id})
+            d = self._to_dict(rec)
+            d["_action"] = "updated"
+            self.log.info(
+                "set_device_primary_ip4: device_id=%s → ip_id=%s", device_id, ip_id
+            )
+            return d
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"set_device_primary_ip4(device_id={device_id}) failed: {exc}"
+            ) from exc
+
     def __repr__(self) -> str:
         return f"NetBoxClient(base_url={self.base_url!r})"
