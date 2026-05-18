@@ -13,7 +13,7 @@ netmiko>=4.3.0
 # Provides the "textfsm" parser path in CiscoDeviceClient.
 ntc-templates>=5.0.0
 
-# NETCONF client (ncclient)
+# NETCONF client
 ncclient>=0.6.15
 
 # XML ↔ dict conversion for NETCONF responses
@@ -21,6 +21,18 @@ xmltodict>=0.13.0
 
 # NetBox REST API client
 pynetbox>=7.3.0
+
+
+# =============================================================================
+# Optional — performance monitoring
+# =============================================================================
+# Required for RSS memory logging when --mem-profile is passed to any script.
+# If not installed the RSS log line is silently skipped; all other functionality
+# remains unaffected.
+#
+#   pip install psutil
+#
+psutil>=5.9.0
 
 
 # =============================================================================
@@ -39,5 +51,5 @@ pynetbox>=7.3.0
 #   pip install "genie>=23.0" "pyats>=23.0"
 #
 # Uncomment ONE of the following lines to pin a version in this file:
-#pyats[full]>=23.0
-genie>=23.0
+pyats[full]>=23.0
+#genie>=23.0

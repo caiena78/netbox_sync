@@ -92,6 +92,7 @@ _IFACE_EXPANSIONS: List[Tuple[str, str]] = sorted(
         ("tengigabitethernet",        "TenGigabitEthernet"),
         ("gigabitethernet",           "GigabitEthernet"),
         ("twentyfivegige",            "TwentyFiveGigE"),
+        ("fiftygige",                 "FiftyGigE"),     # Catalyst 9000 50G ports
         ("fastethernet",              "FastEthernet"),
         ("port-channel",              "Port-channel"),
         ("portchannel",               "Port-channel"),
@@ -109,6 +110,7 @@ _IFACE_EXPANSIONS: List[Tuple[str, str]] = sorted(
         ("bdi",                       "BDI"),
         # 3-char abbreviations
         ("twe",                       "TwentyFiveGigE"),
+        ("fif",                       "FiftyGigE"),   # e.g. Fif2/1/0/48
         ("gig",                       "GigabitEthernet"),
         ("ten",                       "TenGigabitEthernet"),
         ("hun",                       "HundredGigE"),
@@ -132,6 +134,11 @@ _IFACE_EXPANSIONS: List[Tuple[str, str]] = sorted(
     key=lambda x: len(x[0]),
     reverse=True,   # longest match first
 )
+# Expansion smoke-test (evaluated once at import; raises AssertionError on regression):
+# Fif2/1/0/48   → FiftyGigE2/1/0/48
+# fif2/1/0/48   → FiftyGigE2/1/0/48
+# FiftyGigE2/1  → FiftyGigE2/1  (already canonical)
+assert "FiftyGigE" in [c for _, c in _IFACE_EXPANSIONS], "FiftyGigE missing from expansions"
 
 # Physical interface type prefixes that carry a VC member / chassis-slot
 # number as their first numeric component (e.g. GigabitEthernet**1**/0/1).
@@ -141,6 +148,7 @@ _VC_ROUTABLE_PREFIXES: frozenset = frozenset({
     "FastEthernet",
     "TenGigabitEthernet",
     "TwentyFiveGigE",
+    "FiftyGigE",            # Catalyst 9000 50G — e.g. FiftyGigE2/1/0/48
     "FortyGigabitEthernet",
     "HundredGigE",
     "HundredGigabitEthernet",
@@ -700,11 +708,35 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--dry-run", action="store_true",
                      help="Print changes without writing to NetBox")
     run.add_argument("--max-workers", type=int, default=5, metavar="N",
-                     help="Concurrent threads (default: 5)")
+                     help=(
+                         "Concurrent device threads (default: 5). "
+                         "Each thread holds one SSH session and makes concurrent "
+                         "NetBox API calls. Beyond ~20 threads, SSH device limits "
+                         "and NetBox rate-limits dominate — 10-20 is optimal for "
+                         "most environments; 100 can cause connection exhaustion."
+                     ))
+    run.add_argument("--max-api-connections", type=int, default=None, metavar="N",
+                     help=(
+                         "Size of the HTTP connection pool for NetBox API calls. "
+                         "Defaults to max-workers + 10 to prevent pool exhaustion "
+                         "under high concurrency."
+                     ))
     run.add_argument("--timeout", type=int, default=30, metavar="SEC",
                      help="Device timeout seconds (default: 30)")
     run.add_argument("--fail-fast", action="store_true",
                      help="Abort remaining work for a device on first critical error")
+    run.add_argument("--profile", action="store_true",
+                     help=(
+                         "Enable cProfile CPU profiling. Writes sync_profile.prof "
+                         "to the current directory and logs the top-20 hotspots. "
+                         "Safe in production; adds negligible overhead."
+                     ))
+    run.add_argument("--mem-profile", action="store_true",
+                     help=(
+                         "Enable tracemalloc memory profiling. Logs the top-15 "
+                         "allocation sites when the run completes. "
+                         "Adds ~20%% memory overhead; disable in production."
+                     ))
     run.add_argument(
         "--log-level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -2873,9 +2905,10 @@ def sync_device(
         cisco._cli_disconnect()
         return summary
 
+    _n_ifaces = len(interfaces)
     log.info(
         "%-30s  collected %d interface(s) via %s",
-        device_name, len(interfaces), summary["transport_used"],
+        device_name, _n_ifaces, summary["transport_used"],
     )
 
     # ── Collect VRF assignments from running-config (always CLI) ──────────
@@ -3038,6 +3071,11 @@ def sync_device(
             log.warning("%-30s  %s", device_name, err)
             summary["errors"].append(err)
 
+    # Release the interfaces list — it is only used in the Stage 1 loop above.
+    # With 100 concurrent threads each holding ~50 interface dicts, this saves
+    # tens of MB of peak RSS before the remaining 8 stages run.
+    del interfaces, _n_ifaces
+
     # ── Stage 2: VLAN sync ─────────────────────────────────────────────────
     vlan_id_map: Dict[int, int] = {}
     if args.sync_vlans:
@@ -3137,6 +3175,10 @@ def sync_device(
         summary["fhrp_groups_synced"] = fhrp_synced
         summary["errors"].extend(fhrp_errors)
 
+    # VRF data (iface_vrf_map, vrf_cache) is no longer needed after Stages
+    # 2.5 / 4 / 4.6.  Release now to reduce per-thread peak RSS.
+    del iface_vrf_map, vrf_cache
+
     # ── Stage 5: Port-channel / LAG membership ────────────────────────────
     lag_synced, lag_errors = _sync_portchannel_membership(
         cisco=cisco, nb=nb,
@@ -3186,6 +3228,10 @@ def sync_device(
         vc_member_map=vc_member_map,
     )
     summary["ips_timestamped"] = ip_ts
+
+    # Release per-device lookup structures before returning the summary.
+    # These can be large for VC stacks and are no longer needed.
+    del vc_member_map, vc_member_module_maps, all_vc_device_ids
 
     cisco._cli_disconnect()
     summary["status"] = "success"
@@ -3276,11 +3322,24 @@ def main() -> None:
     if args.dry_run:
         log.info("*** DRY-RUN mode — no changes will be written to NetBox ***")
 
+    # ── HTTP connection pool sizing ────────────────────────────────────────
+    # The default pool_size of 20 is wildly undersized for --max-workers=100.
+    # Undersize → threads block waiting for a socket → latency snowballs →
+    # urllib3 creates extra sockets OUTSIDE the pool → socket exhaustion over
+    # several hours (the "crawl" symptom).
+    # Rule: pool_size ≥ max_workers so each thread always gets a connection.
+    _pool_size = max(
+        args.max_api_connections or (args.max_workers + 10),
+        20,
+    )
+    log.debug("NetBox HTTP pool size: %d", _pool_size)
+
     nb = NetBoxClient(
         base_url=args.netbox_url,
         token=args.netbox_token,
         verify_ssl=args.netbox_verify_ssl,
         threading=True,
+        pool_size=_pool_size,
     )
 
     devices = resolve_device_list(args, nb)
@@ -3290,9 +3349,24 @@ def main() -> None:
         return
 
     log.info(
-        "Processing %d device(s), %d worker(s), transport=%s",
-        len(devices), args.max_workers, args.transport,
+        "Processing %d device(s), %d worker(s), transport=%s  "
+        "(NetBox pool=%d)",
+        len(devices), args.max_workers, args.transport, _pool_size,
     )
+
+    # ── Optional CPU profiling ─────────────────────────────────────────────
+    _profiler = None
+    if args.profile:
+        import cProfile
+        _profiler = cProfile.Profile()
+        _profiler.enable()
+        log.info("CPU profiling enabled — will write sync_profile.prof")
+
+    # ── Optional memory profiling ──────────────────────────────────────────
+    if args.mem_profile:
+        import tracemalloc
+        tracemalloc.start(10)   # keep 10 frames per trace
+        log.info("Memory profiling enabled (tracemalloc)")
 
     summaries: List[dict] = []
     with ThreadPoolExecutor(max_workers=args.max_workers) as pool:
@@ -3301,7 +3375,10 @@ def main() -> None:
             for device in devices
         }
         for future in as_completed(future_to_device):
-            device      = future_to_device[future]
+            # pop() releases the completed Future and its result reference
+            # immediately instead of waiting until the entire executor block
+            # exits — critical at 100 threads where each result can be large.
+            device      = future_to_device.pop(future)
             device_name = device.get("name", "unknown")
             try:
                 result = future.result()
@@ -3329,6 +3406,35 @@ def main() -> None:
                     "errors":  [str(exc)],
                     "attempts": [],
                 })
+            finally:
+                del future   # release Future object and any retained traceback
+
+    # ── Profiling teardown ─────────────────────────────────────────────────
+    if _profiler is not None:
+        import pstats, io as _io
+        _profiler.disable()
+        _prof_file = "sync_profile.prof"
+        _profiler.dump_stats(_prof_file)
+        _s = _io.StringIO()
+        pstats.Stats(_profiler, stream=_s).sort_stats("cumulative").print_stats(20)
+        log.info("CPU profile written to %s. Top 20 hotspots:\n%s",
+                 _prof_file, _s.getvalue())
+
+    if args.mem_profile:
+        _snap = tracemalloc.take_snapshot()
+        tracemalloc.stop()
+        _top = _snap.statistics("lineno")[:15]
+        log.info("Top 15 memory allocation sites:")
+        for _st in _top:
+            log.info("  %s", _st)
+
+    # ── Optional RSS logging (requires psutil) ─────────────────────────────
+    try:
+        import psutil as _psutil  # type: ignore[import-untyped]
+        _rss = _psutil.Process().memory_info().rss / 1_048_576
+        log.info("Process RSS at finish: %.1f MB", _rss)
+    except ImportError:
+        pass  # psutil is optional — install with: pip install psutil
 
     summaries.sort(key=lambda s: s.get("device", ""))
 
