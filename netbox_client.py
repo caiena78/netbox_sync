@@ -1097,14 +1097,51 @@ class NetBoxClient:
             d["_action"] = "existing"
             return d
 
+        # Resolve the candidate name, then check for collisions within the
+        # same VLAN group.  NetBox enforces unique names inside a group, so if
+        # another VID already holds the same name we append "_{vid}" to avoid
+        # a 400 rejection.
+        # Example: VLAN 2 named "voice" → "voice_2" when "voice" is taken.
+        candidate_name = name or f"VLAN{vid:04d}"
+        final_name     = candidate_name
+
+        try:
+            name_collisions = [
+                v for v in self.nb.ipam.vlans.filter(
+                    name=candidate_name, group_id=vlan_group_id
+                )
+                if int(getattr(v, "vid", 0)) != vid
+            ]
+        except pynetbox.RequestError as exc:
+            # Non-fatal — proceed with the original name and let the create
+            # surface any actual conflict.
+            self.log.debug(
+                "ensure_vlan_in_site_group: name-collision check failed "
+                "vid=%s name=%r: %s — proceeding with original name",
+                vid, candidate_name, exc,
+            )
+            name_collisions = []
+
+        if name_collisions:
+            final_name = f"{candidate_name}_{vid}"
+            self.log.info(
+                "ensure_vlan_in_site_group: name %r already used in group %s "
+                "by VID %s — using %r for VID %s",
+                candidate_name, vlan_group_id,
+                getattr(name_collisions[0], "vid", "?"),
+                final_name, vid,
+            )
+
         payload: dict = {
             "vid":    vid,
-            "name":   name or f"VLAN{vid:04d}",
+            "name":   final_name,
             "group":  vlan_group_id,
             "site":   site_id,
             "status": "active",
         }
-        self.log.debug("ensure_vlan_in_site_group: creating VLAN %s", vid)
+        self.log.debug(
+            "ensure_vlan_in_site_group: creating VLAN %s name=%r", vid, final_name
+        )
         try:
             rec = self.nb.ipam.vlans.create(payload)
             d = self._to_dict(rec)
