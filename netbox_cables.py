@@ -702,14 +702,23 @@ def _resolve_neighbor(
             )
             return d
 
-        # Step 2 — regular device lookup (candidate is already lowercase)
+        # Step 2 — regular device lookup via filter() not get().
+        # pynetbox's get() raises ValueError when the API returns more than
+        # one match for the name filter — that error was previously swallowed
+        # by "except Exception: pass", silently preventing the device from
+        # being found even when it exists in NetBox.
+        # filter() always returns a list so it never raises ValueError.
         try:
-            d = nb.get_device(name=candidate)
-            if d:
+            recs = list(nb.nb.dcim.devices.filter(name=candidate))
+            if recs:
+                d = nb._to_dict(recs[0])
                 log.debug("Neighbor %r → device %r", neighbor_name, candidate)
                 return d
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug(
+                "Neighbor %r: device lookup for %r failed (%s: %s) — skipping",
+                neighbor_name, candidate, type(exc).__name__, exc,
+            )
 
     # ── Step 4: numeric-suffix strip → VC only ───────────────────────────
     # Try stripping a trailing unit number from each candidate and look for
