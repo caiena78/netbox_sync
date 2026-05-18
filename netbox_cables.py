@@ -712,7 +712,14 @@ def _resolve_neighbor(
             recs = list(nb.nb.dcim.devices.filter(name=candidate))
             if recs:
                 d = nb._to_dict(recs[0])
-                log.debug("Neighbor %r → device %r", neighbor_name, candidate)
+                if is_fqdn and candidate != clean_lower:
+                    log.info(
+                        "Neighbor %r: found in NetBox as hostname-only %r "
+                        "(after stripping FQDN suffix)",
+                        neighbor_name, candidate,
+                    )
+                else:
+                    log.debug("Neighbor %r → device %r", neighbor_name, candidate)
                 return d
         except Exception as exc:
             log.debug(
