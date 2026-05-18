@@ -314,6 +314,18 @@ def build_parser() -> argparse.ArgumentParser:
                      default="auto")
     run.add_argument("--dry-run", action="store_true",
                      help="Discover only; no NetBox writes")
+    run.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Replace cables that connect to the wrong device. "
+            "Without --force, any interface that already has a cable is "
+            "skipped unconditionally. With --force, the script checks whether "
+            "the existing cable matches the CDP-discovered peer. If it does not "
+            "match, the wrong cable is deleted and the correct one is created. "
+            "Cables that are already correct are left untouched."
+        ),
+    )
     run.add_argument("--max-workers", type=int, default=5)
     run.add_argument("--timeout",     type=int, default=30)
     run.add_argument("--log-level",
@@ -836,6 +848,7 @@ def process_device_cables(
         "status":                 "failed",
         "neighbors_seen":         0,
         "cables_created":         0,
+        "cables_replaced":        0,
         "skipped_existing_cable": 0,
         "skipped_missing_device": 0,
         "skipped_logical_iface":  0,
@@ -954,7 +967,7 @@ def process_device_cables(
         if local_id in seen_local_iface_ids:
             continue
 
-        # ── SAFETY — skip if either side already has a cable ─────────────
+        # ── Check for existing cables ─────────────────────────────────────
         try:
             local_cabled  = nb.interface_has_cable(local_id)
             remote_cabled = nb.interface_has_cable(remote_id)
@@ -963,13 +976,121 @@ def process_device_cables(
             continue
 
         if local_cabled or remote_cabled:
-            log.info(
-                "%-30s  SKIP (existing cable)  local=%s  remote=%s@%s",
-                device_name, local_iface_name, neighbor_iface_name, resolved_name,
+            if not args.force:
+                # Default (safe) mode — leave any existing cable alone.
+                log.info(
+                    "%-30s  SKIP (existing cable)  local=%s  remote=%s@%s",
+                    device_name, local_iface_name, neighbor_iface_name, resolved_name,
+                )
+                summary["skipped_existing_cable"] += 1
+                seen_local_iface_ids.add(local_id)
+                continue
+
+            # ── --force mode: inspect existing cable(s) ──────────────────
+            # Fetch full cable info (including peer interface IDs) for each
+            # side that is currently cabled.  Uses the detail endpoint so
+            # that link_peers is populated.
+            local_cable_info  = None
+            remote_cable_info = None
+
+            if local_cabled:
+                try:
+                    local_cable_info = nb.get_interface_cable_info(local_id)
+                except NetBoxClientError as exc:
+                    log.warning(
+                        "%-30s  FORCE: cannot read cable info for local %s: %s "
+                        "— skipping",
+                        device_name, local_iface_name, exc,
+                    )
+                    summary["errors"].append(
+                        f"Force cable-info {local_iface_name!r}: {exc}"
+                    )
+                    continue
+
+            if remote_cabled:
+                try:
+                    remote_cable_info = nb.get_interface_cable_info(remote_id)
+                except NetBoxClientError as exc:
+                    log.warning(
+                        "%-30s  FORCE: cannot read cable info for remote %s: %s "
+                        "— skipping",
+                        device_name, neighbor_iface_name, exc,
+                    )
+                    summary["errors"].append(
+                        f"Force cable-info {neighbor_iface_name!r}: {exc}"
+                    )
+                    continue
+
+            # A cable is correct when local's peer IS the intended remote
+            # interface (or equivalently, remote's peer IS local).
+            cable_is_correct = (
+                (local_cable_info  and remote_id in local_cable_info["peer_ids"])
+                or
+                (remote_cable_info and local_id  in remote_cable_info["peer_ids"])
             )
-            summary["skipped_existing_cable"] += 1
-            seen_local_iface_ids.add(local_id)
-            continue
+
+            if cable_is_correct:
+                log.debug(
+                    "%-30s  FORCE: cable already correct  %s ↔ %s@%s — no action",
+                    device_name, local_iface_name, neighbor_iface_name, resolved_name,
+                )
+                seen_local_iface_ids.add(local_id)
+                continue
+
+            # Cable(s) exist but connect to the wrong endpoint — delete them.
+            # Collect unique cable IDs from both sides (they may share one cable
+            # or have independent wrong cables).
+            cables_to_delete: Set[int] = set()
+            if local_cable_info:
+                cables_to_delete.add(local_cable_info["cable_id"])
+            if remote_cable_info:
+                cables_to_delete.add(remote_cable_info["cable_id"])
+
+            log.warning(
+                "%-30s  FORCE: wrong cable(s) %s on %s — will replace with "
+                "%s ↔ %s@%s",
+                device_name, sorted(cables_to_delete),
+                local_iface_name, local_iface_name, neighbor_iface_name, resolved_name,
+            )
+
+            if args.dry_run:
+                for cid in sorted(cables_to_delete):
+                    log.info(
+                        "DRY-RUN  %-30s  FORCE would delete cable id=%s",
+                        device_name, cid,
+                    )
+                log.info(
+                    "DRY-RUN  %-30s  FORCE would create cable %s ↔ %s@%s",
+                    device_name, local_iface_name, neighbor_iface_name, resolved_name,
+                )
+                summary["cables_replaced"] += 1
+                seen_local_iface_ids.add(local_id)
+                continue
+
+            # Live: delete the wrong cable(s) then fall through to creation.
+            delete_ok = True
+            for cid in sorted(cables_to_delete):
+                try:
+                    nb.delete_cable(cid)
+                    log.info(
+                        "%-30s  FORCE deleted cable id=%s",
+                        device_name, cid,
+                    )
+                except NetBoxClientError as exc:
+                    log.warning(
+                        "%-30s  FORCE: delete cable id=%s failed: %s — skipping",
+                        device_name, cid, exc,
+                    )
+                    summary["errors"].append(f"Force delete cable {cid}: {exc}")
+                    delete_ok = False
+
+            if not delete_ok:
+                continue
+
+            # Track this as a replacement; the cable creation below will
+            # increment cables_created as well so operators see both metrics.
+            summary["cables_replaced"] += 1
+            # Fall through to mark_connected clearing and cable creation.
 
         # ── Clear mark_connected on both sides before cable creation ──────
         # NetBox rejects cable creation if either endpoint has
@@ -1106,11 +1227,12 @@ def main() -> None:
                 result = future.result()
                 summaries.append(result)
                 log.info(
-                    "%-30s  status=%-8s  seen=%d  created=%d  "
+                    "%-30s  status=%-8s  seen=%d  created=%d  replaced=%d  "
                     "skip_cable=%d  skip_no_dev=%d  errs=%d",
                     device_name, result.get("status", "?"),
                     result.get("neighbors_seen", 0),
                     result.get("cables_created", 0),
+                    result.get("cables_replaced", 0),
                     result.get("skipped_existing_cable", 0),
                     result.get("skipped_missing_device", 0),
                     len(result.get("errors", [])),
@@ -1130,11 +1252,13 @@ def main() -> None:
 
     summaries.sort(key=lambda s: s.get("device", ""))
 
-    total_created = sum(s.get("cables_created", 0) for s in summaries)
-    total_skipped = sum(s.get("skipped_existing_cable", 0) for s in summaries)
+    total_created  = sum(s.get("cables_created", 0)         for s in summaries)
+    total_replaced = sum(s.get("cables_replaced", 0)        for s in summaries)
+    total_skipped  = sum(s.get("skipped_existing_cable", 0) for s in summaries)
     log.info(
-        "DONE  devices=%d  cables_created=%d  skipped_existing=%d",
-        len(summaries), total_created, total_skipped,
+        "DONE  devices=%d  cables_created=%d  cables_replaced=%d  "
+        "skipped_existing=%d",
+        len(summaries), total_created, total_replaced, total_skipped,
     )
 
     print(json.dumps(summaries, indent=2))

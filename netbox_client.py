@@ -2596,6 +2596,105 @@ class NetBoxClient:
                 f"ensure_cable({interface_a_id}, {interface_b_id}) failed: {exc}"
             ) from exc
 
+    def get_interface_cable_info(self, interface_id: int) -> Optional[dict]:
+        """
+        Return cable and peer-endpoint information for an interface.
+
+        Uses the detail endpoint (``dcim.interfaces.get``) so that the
+        ``link_peers`` field — which lists the interface(s) on the other end
+        of the attached cable — is fully populated.
+
+        Parameters
+        ----------
+        interface_id : int
+            NetBox dcim.interface primary key.
+
+        Returns
+        -------
+        dict or None
+            ``None`` when no cable is attached.  Otherwise::
+
+                {
+                    "cable_id":  int,        # NetBox dcim.cables PK
+                    "peer_ids":  list[int],  # interface IDs on the far end
+                }
+
+        Raises
+        ------
+        NetBoxClientError
+            On API failure.
+        """
+        self.log.debug("get_interface_cable_info id=%s", interface_id)
+        try:
+            rec = self.nb.dcim.interfaces.get(interface_id)
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"get_interface_cable_info: lookup failed id={interface_id}: {exc}"
+            ) from exc
+
+        if rec is None:
+            raise NetBoxClientError(
+                f"get_interface_cable_info: interface id={interface_id} not found."
+            )
+
+        rec_dict = self._to_dict(rec)
+        cable    = rec_dict.get("cable")
+        if not cable:
+            return None
+
+        cable_id = (
+            cable.get("id") if isinstance(cable, dict) else int(cable)
+        )
+
+        # link_peers is a list of the interfaces directly attached via cable.
+        peers    = rec_dict.get("link_peers") or []
+        peer_ids = [
+            int(p["id"]) for p in peers
+            if isinstance(p, dict) and p.get("id") is not None
+        ]
+
+        return {"cable_id": cable_id, "peer_ids": peer_ids}
+
+    def delete_cable(self, cable_id: int) -> None:
+        """
+        Delete a NetBox cable by primary key.
+
+        Both endpoints of the cable are released when the cable is deleted.
+
+        Parameters
+        ----------
+        cable_id : int
+            NetBox dcim.cables primary key.
+
+        Raises
+        ------
+        NetBoxClientError
+            On API failure.
+        """
+        self.log.debug("delete_cable id=%s", cable_id)
+        try:
+            rec = self.nb.dcim.cables.get(cable_id)
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"delete_cable: lookup failed id={cable_id}: {exc}"
+            ) from exc
+
+        if rec is None:
+            self.log.debug("delete_cable: id=%s already absent", cable_id)
+            return
+
+        try:
+            ok = rec.delete()
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"delete_cable(id={cable_id}) failed: {exc}"
+            ) from exc
+
+        if not ok:
+            raise NetBoxClientError(
+                f"delete_cable(id={cable_id}): API returned false"
+            )
+
     def ensure_ip_on_interface(
         self,
         ip_cidr: str,
