@@ -50,7 +50,8 @@ import logging
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Set
 
 from cisco_device_client import CiscoDeviceClient, CiscoDeviceClientError
 from netbox_client import NetBoxClient, NetBoxClientError
@@ -423,18 +424,47 @@ def _resolve_role_id(nb: NetBoxClient) -> int:
     return role["id"]
 
 
-def _resolve_device_type_id(model: str, nb: NetBoxClient) -> int:
+def _resolve_device_type_id(model: str, nb: NetBoxClient) -> Optional[int]:
     """
-    Return the NetBox DeviceType ID for *model*.
+    Return the NetBox DeviceType ID for *model*, or ``None`` when not found.
 
-    Exits with code 1 if the DeviceType is not found — callers must not
-    catch ``SystemExit`` unless they immediately re-raise it.
+    Searches by ``model`` field first, then by ``part_number`` (handled
+    inside :meth:`NetBoxClient.get_device_type_by_model`).  When neither
+    field matches, logs an ERROR and returns ``None`` so the caller can
+    accumulate all missing models before writing ``missing_ap_models.txt``
+    and exiting non-zero.
     """
     dt = nb.get_device_type_by_model(model)
     if not dt:
         log.error("ERROR: Missing NetBox DeviceType for AP model: %s", model)
-        sys.exit(1)
+        return None
     return dt["id"]
+
+
+def _write_missing_ap_models(models: Set[str]) -> None:
+    """
+    Write *models* to ``missing_ap_models.txt`` in the current directory.
+
+    The file is overwritten on each call.  Each line contains one missing
+    model string.  A brief header explains how to use the file.
+    """
+    path = "missing_ap_models.txt"
+    ts   = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(f"# Missing AP DeviceType models — generated {ts}\n")
+        fh.write(
+            "# These AP models were discovered via CDP but have no matching\n"
+            "# DeviceType in NetBox (neither 'model' nor 'part_number' matched).\n"
+            "# Create a DeviceType for each model, or set its part_number,\n"
+            "# then re-run netbox_ap.py.\n"
+            "#\n"
+        )
+        for m in sorted(models):
+            fh.write(f"{m}\n")
+    log.error(
+        "Missing DeviceType for %d AP model(s) — written to %s: %s",
+        len(models), path, sorted(models),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -495,11 +525,12 @@ def _build_ap_in_netbox(
     software_version = neighbor.get("software_version")
 
     result: dict = {
-        "name":   ap_name,
-        "model":  model,
-        "ip":     ip_str,
-        "action": "skipped",
-        "error":  None,
+        "name":               ap_name,
+        "model":              model,
+        "ip":                 ip_str,
+        "action":             "skipped",
+        "error":              None,
+        "missing_device_type": False,
     }
 
     # ── Resolve parent site ───────────────────────────────────────────────
@@ -519,13 +550,15 @@ def _build_ap_in_netbox(
         else tenant_field
     )
 
-    # ── Resolve DeviceType (fatal on missing) ─────────────────────────────
-    try:
-        device_type_id = _resolve_device_type_id(model, nb)
-    except SystemExit:
-        result["action"] = "error"
-        result["error"]  = f"Missing NetBox DeviceType for AP model: {model}"
-        raise
+    # ── Resolve DeviceType ────────────────────────────────────────────────
+    # Returns None when not found; main() aggregates all missing models and
+    # writes missing_ap_models.txt after all workers finish.
+    device_type_id = _resolve_device_type_id(model, nb)
+    if device_type_id is None:
+        result["action"]              = "error"
+        result["error"]               = f"Missing NetBox DeviceType for AP model: {model}"
+        result["missing_device_type"] = True
+        return result
 
     # ── Dry-run short-circuit ─────────────────────────────────────────────
     if dry_run:
@@ -686,15 +719,16 @@ def process_device(
     device_name = device.get("name", "unknown")
 
     summary: dict = {
-        "device":           device_name,
-        "status":           "failed",
-        "neighbors_parsed": 0,
-        "aps_discovered":   0,
-        "aps_created":      0,
-        "aps_updated":      0,
-        "aps_skipped":      0,
-        "aps":              [],
-        "errors":           [],
+        "device":               device_name,
+        "status":               "failed",
+        "neighbors_parsed":     0,
+        "aps_discovered":       0,
+        "aps_created":          0,
+        "aps_updated":          0,
+        "aps_skipped":          0,
+        "aps":                  [],
+        "missing_device_types": [],   # models with no DeviceType in NetBox
+        "errors":               [],
     }
 
     # ── Gate: must have a management IP ──────────────────────────────────
@@ -814,15 +848,14 @@ def process_device(
                 dry_run=args.dry_run,
                 prefix_cache=prefix_cache,
             )
-        except SystemExit:
-            raise   # propagate so main() can exit non-zero
         except Exception as exc:
             ap_result = {
-                "name":   ap_name,
-                "model":  neighbor["model"],
-                "ip":     neighbor["neighbor_ip"],
-                "action": "error",
-                "error":  str(exc),
+                "name":                ap_name,
+                "model":               neighbor["model"],
+                "ip":                  neighbor["neighbor_ip"],
+                "action":              "error",
+                "error":               str(exc),
+                "missing_device_type": False,
             }
             log.error(
                 "%-30s  AP %r unexpected error: %s", device_name, ap_name, exc
@@ -841,6 +874,10 @@ def process_device(
             summary["errors"].append(
                 f"AP {ap_name!r}: {ap_result.get('error', 'unknown error')}"
             )
+            if ap_result.get("missing_device_type"):
+                m = ap_result["model"]
+                if m not in summary["missing_device_types"]:
+                    summary["missing_device_types"].append(m)
 
     summary["status"] = "success"
     return summary
@@ -944,21 +981,6 @@ def main() -> None:
                     result.get("aps_updated", 0),
                     len(result.get("errors", [])),
                 )
-            except SystemExit:
-                # Missing DeviceType — emit partial JSON before exiting.
-                summaries.append({
-                    "device":           device_name,
-                    "status":           "failed",
-                    "neighbors_parsed": 0,
-                    "aps_discovered":   0,
-                    "aps_created":      0,
-                    "aps_updated":      0,
-                    "aps_skipped":      0,
-                    "aps":              [],
-                    "errors":           ["Missing DeviceType — see stderr for details"],
-                })
-                print(json.dumps(summaries, indent=2))
-                sys.exit(1)
             except Exception as exc:
                 log.error(
                     "Unexpected error for %s: %s", device_name, exc, exc_info=True
@@ -977,6 +999,15 @@ def main() -> None:
 
     summaries.sort(key=lambda s: s.get("device", ""))
 
+    # ── Collect all missing DeviceType models across every worker ─────────
+    missing_models: Set[str] = set()
+    for s in summaries:
+        for m in s.get("missing_device_types", []):
+            missing_models.add(m)
+
+    if missing_models:
+        _write_missing_ap_models(missing_models)
+
     total_ok   = sum(1 for s in summaries if s.get("status") == "success")
     total_fail = len(summaries) - total_ok
     log.info(
@@ -989,6 +1020,9 @@ def main() -> None:
     )
 
     print(json.dumps(summaries, indent=2))
+
+    if missing_models:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
