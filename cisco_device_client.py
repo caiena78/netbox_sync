@@ -3770,6 +3770,89 @@ class CiscoDeviceClient:
         return result
 
     # ----------------------------------------------------------------------- #
+    # Transceiver inventory (NX-OS)                                           #
+    # ----------------------------------------------------------------------- #
+
+    def get_interface_transceiver_map(self) -> Dict[str, dict]:
+        """
+        Return a map of interface name → transceiver presence and type for all
+        interfaces reported by ``show interface transceiver``.
+
+        Primarily useful on NX-OS; IOS/IOS-XE support varies by platform and
+        is silently returned as an empty dict on parse failure.
+
+        Returns
+        -------
+        dict
+            ``{expanded_iface_name: {"has_transceiver": bool, "type_str": str|None}}``
+
+            *has_transceiver*: ``True`` when the port reports a transceiver
+            inserted; ``False`` when "not present" or the interface is absent
+            from the output.
+
+            *type_str*: raw "type is …" string from the output, e.g.
+            ``"SFP-10G-SR"`` or ``"QSFP-100G-SR4-S"``, or ``None`` when not
+            reported.
+        """
+        self._cli_connect()
+        cmd = "show interface transceiver"
+        self.log.debug("%s: %r", self.host, cmd)
+        try:
+            raw: str = self._cli_connection.send_command(cmd)
+        except Exception as exc:
+            raise TransportError(
+                f"get_interface_transceiver_map failed on {self.host}: {exc}"
+            ) from exc
+        return self._parse_transceiver_map(raw)
+
+    def _parse_transceiver_map(self, raw: str) -> Dict[str, dict]:
+        """
+        Parse ``show interface transceiver`` output into a per-interface dict.
+
+        Example NX-OS output::
+
+            Ethernet1/1
+                transceiver is present
+                    type is SFP-10G-SR
+                    ...
+            Ethernet1/2
+                transceiver is not present
+
+        Lines that start with a non-whitespace character are treated as
+        interface headers; all following indented lines belong to that
+        interface until the next header appears.
+        """
+        result: Dict[str, dict] = {}
+        current_iface: Optional[str] = None
+
+        for line in raw.splitlines():
+            if not line:
+                continue
+            # Interface header: no leading whitespace and looks like an iface name
+            if line[0] not in (" ", "\t"):
+                name = line.strip()
+                # Skip error messages and table separators
+                if not name or name.startswith("%") or name.startswith("-"):
+                    current_iface = None
+                    continue
+                current_iface = self._expand_iface(name)
+                result[current_iface] = {"has_transceiver": False, "type_str": None}
+                continue
+
+            if current_iface is None:
+                continue
+
+            stripped = line.strip()
+            if stripped == "transceiver is present":
+                result[current_iface]["has_transceiver"] = True
+            elif stripped == "transceiver is not present":
+                result[current_iface]["has_transceiver"] = False
+            elif stripped.startswith("type is "):
+                result[current_iface]["type_str"] = stripped[len("type is "):]
+
+        return result
+
+    # ----------------------------------------------------------------------- #
     # Software facts                                                           #
     # ----------------------------------------------------------------------- #
 

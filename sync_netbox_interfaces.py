@@ -184,6 +184,107 @@ def expand_interface_name(name: str) -> str:
     return name
 
 
+# Map from expanded canonical interface prefix → NetBox type identifier.
+# Ordered longest-first so a more specific prefix takes priority if two
+# entries share a common leading substring.
+_NETBOX_TYPE_MAP: List[Tuple[str, str]] = sorted(
+    [
+        ("HundredGigabitEthernet", "100gbase-x-qsfp28"),
+        ("HundredGigE",            "100gbase-x-qsfp28"),
+        ("FortyGigabitEthernet",   "40gbase-x-qsfpp"),
+        ("TwentyFiveGigE",         "25gbase-x-sfp28"),
+        ("FiftyGigE",              "50gbase-x-sfp28"),
+        ("TenGigabitEthernet",     "10gbase-x-sfpp"),
+        ("AppGigabitEthernet",     "1000base-t"),
+        ("GigabitEthernet",        "1000base-t"),
+        ("FastEthernet",           "100base-tx"),
+        ("Management",             "1000base-t"),
+        ("mgmt",                   "1000base-t"),
+        ("Port-channel",           "lag"),
+        ("Loopback",               "virtual"),
+        ("Vlan",                   "virtual"),
+        ("Tunnel",                 "virtual"),
+        ("BDI",                    "virtual"),
+        ("nve",                    "virtual"),
+    ],
+    key=lambda x: len(x[0]),
+    reverse=True,
+)
+
+
+# Speed-based NetBox type for NX-OS "Ethernet" ports (speed in kbps).
+# Sorted descending so the first match wins on the highest speed tier.
+_ETHERNET_SPEED_KBPS: List[Tuple[int, str]] = sorted(
+    [
+        (400_000_000, "400gbase-x-qsfpdd"),
+        (100_000_000, "100gbase-x-qsfp28"),
+         (40_000_000, "40gbase-x-qsfpp"),
+         (25_000_000, "25gbase-x-sfp28"),
+         (10_000_000, "10gbase-x-sfpp"),
+          (1_000_000, "1000base-x-sfp"),   # refined to copper below if no transceiver
+            (100_000, "100base-tx"),
+    ],
+    key=lambda x: x[0],
+    reverse=True,
+)
+
+
+def _infer_ethernet_type(
+    speed_kbps: Optional[int],
+    has_transceiver: Optional[bool],
+) -> str:
+    """
+    Guess the NetBox type for a NX-OS ``Ethernet`` port whose speed cannot be
+    determined from the interface name alone.
+
+    At 1 G:
+    - transceiver present  → ``"1000base-x-sfp"`` (fibre/optical SFP)
+    - transceiver absent   → ``"1000base-t"``      (copper RJ-45)
+    - transceiver unknown  → ``"1000base-x-sfp"``  (NX-OS ports are almost
+                             always SFP-based; conservative guess)
+
+    At all other speeds the transceiver is implied by the speed tier.
+    Returns ``"other"`` when speed is unavailable or zero.
+    """
+    if not speed_kbps:
+        return "other"
+    for threshold, nb_type in _ETHERNET_SPEED_KBPS:
+        if speed_kbps >= threshold:
+            # Refine 1G: copper if we *know* no transceiver is present
+            if nb_type == "1000base-x-sfp" and has_transceiver is False:
+                return "1000base-t"
+            return nb_type
+    return "other"
+
+
+def infer_netbox_interface_type(
+    iface_name: str,
+    speed_kbps: Optional[int] = None,
+    has_transceiver: Optional[bool] = None,
+) -> str:
+    """
+    Return the NetBox ``type`` identifier for *iface_name*.
+
+    The name is expected to already be expanded (``expand_interface_name()``
+    output), but the function re-runs the expansion as a safety net.
+
+    For NX-OS ``Ethernet`` ports (speed not encoded in the name), the optional
+    *speed_kbps* and *has_transceiver* hints are used to make a best-effort
+    guess.  Pass them from the interface inventory and transceiver map.
+
+    Returns ``"other"`` when no mapping rule matches and no speed hint is
+    available.
+    """
+    expanded = expand_interface_name(iface_name)
+    for prefix, nb_type in _NETBOX_TYPE_MAP:
+        if expanded.startswith(prefix):
+            return nb_type
+    # NX-OS bare "Ethernet" — speed + transceiver determine the type
+    if expanded.startswith("Ethernet"):
+        return _infer_ethernet_type(speed_kbps, has_transceiver)
+    return "other"
+
+
 def get_vc_member_slot(name: str) -> Optional[int]:
     """
     Return the VC member / chassis slot number embedded in *name*.
@@ -707,6 +808,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--dry-run", action="store_true",
                      help="Print changes without writing to NetBox")
+    run.add_argument(
+        "--force-type", action="store_true",
+        help=(
+            "Write the inferred interface type to NetBox. "
+            "Without this flag the 'type' field is never included in the "
+            "payload, so existing NetBox values are preserved and newly "
+            "created interfaces default to NetBox's own default. "
+            "With this flag the inferred type is written for every interface "
+            "— new and existing — and any mismatched value is overwritten."
+        ),
+    )
     run.add_argument("--max-workers", type=int, default=5, metavar="N",
                      help=(
                          "Concurrent device threads (default: 5). "
@@ -2834,6 +2946,7 @@ def sync_device(
         "interfaces_relocated":            0,
         "errors":                          [],
         "attempts":                        [],
+        "unknown_interface_types":         [],
     }
 
     # ── Hard gate: device MUST have a primary IP in NetBox ────────────────
@@ -3001,6 +3114,25 @@ def sync_device(
     # as each VRF is encountered and (if absent) created in NetBox.
     vrf_cache: Dict[str, int] = {}
 
+    # ── Transceiver map (NX-OS only) — improves type inference for Ethernet ─
+    # Non-fatal: if the command fails we fall back to speed-only heuristics.
+    transceiver_map: Dict[str, dict] = {}
+    if os_type == "nxos":
+        try:
+            transceiver_map = cisco.get_interface_transceiver_map()
+            log.debug(
+                "%-30s  transceiver map: %d interface(s) queried",
+                device_name, len(transceiver_map),
+            )
+        except Exception as exc:
+            log.warning(
+                "%-30s  transceiver map failed: %s "
+                "— NX-OS Ethernet type inference will use speed only",
+                device_name, exc,
+            )
+
+    _unknown_types: List[dict] = []
+
     for iface in interfaces:
         raw_name = iface.get("name", "")
         if not raw_name:
@@ -3037,6 +3169,18 @@ def sync_device(
             nb_payload["duplex"] = iface["duplex"]
         if target_module_id is not None:
             nb_payload["module"] = target_module_id
+
+        # ── Interface type inference ──────────────────────────────────────
+        _xcvr = transceiver_map.get(iface_name) or transceiver_map.get(raw_name)
+        _iface_type = infer_netbox_interface_type(
+            iface_name,
+            speed_kbps=iface.get("speed_kbps"),
+            has_transceiver=_xcvr.get("has_transceiver") if _xcvr else None,
+        )
+        if _iface_type == "other":
+            _unknown_types.append({"name": iface_name, "reason": "no mapping rule matched"})
+        if args.force_type:
+            nb_payload["type"] = _iface_type
 
         # ── Log VRF detection (Stage 1 is inventory only; VRF is set on IPs) ─
         _stage1_vrf = iface_vrf_map.get(iface_name) or iface_vrf_map.get(raw_name)
@@ -3136,6 +3280,15 @@ def sync_device(
     # With 100 concurrent threads each holding ~50 interface dicts, this saves
     # tens of MB of peak RSS before the remaining 8 stages run.
     del interfaces, _n_ifaces
+
+    # Record any interfaces whose type fell back to "other".
+    summary["unknown_interface_types"] = _unknown_types
+    if _unknown_types:
+        log.info(
+            "%-30s  %d interface(s) with unknown type (set to 'other'): %s",
+            device_name, len(_unknown_types),
+            [e["name"] for e in _unknown_types],
+        )
 
     # ── Stage 2: VLAN sync ─────────────────────────────────────────────────
     vlan_id_map: Dict[int, int] = {}
