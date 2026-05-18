@@ -713,6 +713,57 @@ def _is_logical_interface(name: str) -> bool:
     return any(name.startswith(p) for p in _LOGICAL_PREFIXES)
 
 
+def _clear_connected_if_needed(
+    nb: NetBoxClient,
+    interface_id: int,
+    interface_rec: dict,
+    iface_label: str,
+    device_name: str,
+) -> bool:
+    """
+    Clear ``mark_connected`` on *interface_id* if it is currently ``True``.
+
+    NetBox rejects cable creation on any interface that has
+    ``mark_connected=True`` — the two states are mutually exclusive.  This
+    function clears the flag so cable creation can proceed.
+
+    Uses the already-fetched *interface_rec* to decide whether a write is
+    needed, avoiding an extra API round-trip when the flag is already ``False``.
+
+    Parameters
+    ----------
+    interface_rec : dict
+        Full interface dict from ``_get_or_create_interface`` (contains
+        ``mark_connected``).
+    iface_label : str
+        Short human-readable name used in log messages.
+
+    Returns
+    -------
+    bool
+        ``True`` when the flag was already clear or was successfully cleared.
+        ``False`` when the PATCH failed (cable creation will likely also fail;
+        the caller logs the cable failure separately).
+    """
+    if not interface_rec.get("mark_connected"):
+        return True   # already False — nothing to do
+
+    try:
+        nb.update_interface(interface_id, {"mark_connected": False})
+        log.info(
+            "%-30s  Cleared connected flag on interface %s before cable creation",
+            device_name, iface_label,
+        )
+        return True
+    except NetBoxClientError as exc:
+        log.warning(
+            "%-30s  Failed to clear connected flag on %s: %s "
+            "— cable creation may fail",
+            device_name, iface_label, exc,
+        )
+        return False   # non-fatal: let _create_cable_safe surface the real error
+
+
 def _get_or_create_interface(
     nb: NetBoxClient,
     device_id: int,
@@ -906,6 +957,17 @@ def process_device_cables(
             summary["skipped_existing_cable"] += 1
             seen_local_iface_ids.add(local_id)
             continue
+
+        # ── Clear mark_connected on both sides before cable creation ──────
+        # NetBox rejects cable creation if either endpoint has
+        # mark_connected=True.  Use the already-fetched interface records
+        # to decide — no extra API call unless the flag is actually set.
+        _clear_connected_if_needed(
+            nb, local_id, local_iface_rec, local_iface_name, device_name
+        )
+        _clear_connected_if_needed(
+            nb, remote_id, remote_iface_rec, neighbor_iface_name, device_name
+        )
 
         # ── Classify transceiver → cable type ────────────────────────────
         try:

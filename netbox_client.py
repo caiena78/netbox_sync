@@ -2082,6 +2082,25 @@ class NetBoxClient:
             cur_type = cur_type.get("value", "")
         is_lag = str(cur_type).lower() == "lag"
 
+        # NetBox also rejects mark_connected=True on any interface that already
+        # has a cable attached — cable and connected are mutually exclusive.
+        # The `cable` field is non-None when a cable is present, so this
+        # decision is made from the record already in hand (no extra API call).
+        has_cable = rec_dict.get("cable") is not None
+        if has_cable and mark_connected:
+            self.log.info(
+                "update_interface_admin_oper: skipping connected=True — "
+                "cable exists on %r (device_id=%s)",
+                interface_name, device_id,
+            )
+            mark_connected = False
+        elif not has_cable and mark_connected:
+            self.log.debug(
+                "update_interface_admin_oper: setting connected=True on %r "
+                "(no cable present, device_id=%s)",
+                interface_name, device_id,
+            )
+
         if (
             not is_lag
             and "mark_connected" in rec_dict
