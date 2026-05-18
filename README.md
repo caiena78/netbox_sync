@@ -193,6 +193,76 @@ present.
 
 ---
 
+### Interface type inference
+
+Every interface is assigned a NetBox `type` based on its canonical name and,
+for NX-OS `Ethernet` ports, the live speed and transceiver data collected
+from the device.
+
+| Canonical name prefix | NetBox type written |
+|---|---|
+| `GigabitEthernet`, `AppGigabitEthernet`, `Management`, `mgmt` | `1000base-t` |
+| `TenGigabitEthernet` | `10gbase-x-sfpp` |
+| `TwentyFiveGigE` | `25gbase-x-sfp28` |
+| `FiftyGigE` | `50gbase-x-sfp28` |
+| `FortyGigabitEthernet` | `40gbase-x-qsfpp` |
+| `HundredGigE`, `HundredGigabitEthernet` | `100gbase-x-qsfp28` |
+| `FastEthernet` | `100base-tx` |
+| `Port-channel` | `lag` |
+| `Loopback`, `Vlan`, `Tunnel`, `BDI`, `nve` | `virtual` |
+| NX-OS `Ethernet` (speed/transceiver from device) | see table below |
+| Anything else (`Serial`, `Dialer`, …) | `other` |
+
+**NX-OS `Ethernet` ports** — the script runs `show interface transceiver`
+and uses the negotiated speed from the interface inventory to resolve the type:
+
+| Speed | Transceiver present | NetBox type |
+|---|---|---|
+| 100 G | — | `100gbase-x-qsfp28` |
+| 40 G | — | `40gbase-x-qsfpp` |
+| 25 G | — | `25gbase-x-sfp28` |
+| 10 G | — | `10gbase-x-sfpp` |
+| 1 G | Yes | `1000base-x-sfp` |
+| 1 G | No | `1000base-t` |
+| 1 G | Unknown | `1000base-x-sfp` (NX-OS ports are almost always SFP) |
+| Unknown speed | — | `other` |
+
+**`--force-type` controls whether type is written to NetBox:**
+
+```bash
+# Preview which interfaces would be typed (type never written without --force-type)
+python sync_netbox_interfaces.py --device core-rtr-01 --dry-run
+
+# Write type for the first time (creates with correct type, updates mismatches)
+python sync_netbox_interfaces.py --device core-rtr-01 --force-type
+
+# Correct existing wrong types on all active NX-OS switches
+python sync_netbox_interfaces.py \
+    --device-filter '{"platform": "nxos", "status": "active"}' \
+    --force-type
+```
+
+Without `--force-type` the `type` field is **never included in the payload**,
+so existing NetBox values are always preserved and newly created interfaces
+get NetBox's own default (`other`).  The `unknown_interface_types` list in
+the JSON summary is populated regardless of this flag so you can audit which
+interfaces fell through to `"other"` without touching anything.
+
+**`unknown_interface_types` in the JSON output:**
+
+```json
+{
+  "device": "nxos-core-01",
+  "unknown_interface_types": [
+    {"name": "Ethernet1/5", "reason": "no mapping rule matched"}
+  ]
+}
+```
+
+An empty list means every interface on the device resolved to a known type.
+
+---
+
 ### Virtual chassis
 
 When you pass a name via `--device`, `--devices`, or `--device-file`, the
@@ -804,6 +874,38 @@ INFO  netbox_cables: DRY-RUN  acc-sw-01  cable GigabitEthernet1/0/2 ↔ GigabitE
 INFO  netbox_cables: DONE  devices=1  cables_created=2  skipped_existing=0
 ```
 
+### Replace wrong cables with `--force`
+
+By default the script **never touches an existing cable**.  Use `--force`
+when you know a cable was recorded incorrectly (wrong neighbor, wrong
+interface) and want it replaced with what CDP currently reports.
+
+With `--force`:
+1. If the local interface already has a cable, the script inspects it.
+2. If the existing cable connects to the **same** remote interface, it is
+   left in place (no change, no log noise).
+3. If the existing cable connects to a **different** remote interface, the
+   old cable is **deleted** and a new one is created.  The pair is counted
+   in `cables_replaced` in the JSON summary.
+
+```bash
+# Re-cable a single switch, replacing any incorrect entries
+python netbox_cables.py \
+    --device acc-sw-01 \
+    --force
+
+# Dry-run first to see what would be replaced without touching anything
+python netbox_cables.py \
+    --device acc-sw-01 \
+    --force \
+    --dry-run
+```
+
+> **Warning** — `--force` deletes existing cable records.  Always do a
+> dry-run first so you can confirm which cables would be affected.
+
+---
+
 ### Explicit credentials on the command line
 
 ```bash
@@ -855,6 +957,7 @@ One JSON object per device is written to stdout:
     "status":                 "success",
     "neighbors_seen":         4,
     "cables_created":         2,
+    "cables_replaced":        1,
     "skipped_existing_cable": 1,
     "skipped_missing_device": 0,
     "skipped_logical_iface":  1,
@@ -865,6 +968,7 @@ One JSON object per device is written to stdout:
     "status":                 "success",
     "neighbors_seen":         8,
     "cables_created":         0,
+    "cables_replaced":        0,
     "skipped_existing_cable": 8,
     "skipped_missing_device": 0,
     "skipped_logical_iface":  0,
@@ -877,7 +981,8 @@ One JSON object per device is written to stdout:
 |---|---|
 | `neighbors_seen` | Total CDP entries returned by the device |
 | `cables_created` | New cables written to NetBox |
-| `skipped_existing_cable` | Pairs where at least one interface already had a cable |
+| `cables_replaced` | Existing cables deleted and re-created because they pointed to the wrong neighbor (`--force` only; always 0 without `--force`) |
+| `skipped_existing_cable` | Pairs where the correct cable already exists (no change needed) |
 | `skipped_missing_device` | Neighbors not found in NetBox |
 | `skipped_logical_iface` | SVIs, LAGs, Loopbacks, Tunnels — never cabled |
 
@@ -908,7 +1013,8 @@ python netbox_cables.py ... | jq '[.[] | select(.errors | length > 0)]'
 
 ### What is never touched
 
-- Existing cables are **never modified or deleted**.
+- Existing cables are **never modified or deleted** — unless `--force` is
+  passed, in which case cables that point to the wrong neighbor are replaced.
 - Logical interfaces are **never given cables**: `Vlan*`, `Loopback*`,
   `Port-channel*`, `Tunnel*`, `BDI*`, `nve*`, `Null*`.
 - Neighbors that cannot be resolved in NetBox by name or primary IP are skipped.
@@ -967,6 +1073,13 @@ usage: netbox_cables.py [-h]
   Runtime options:
     --transport {auto,cli,netconf,restconf}   (default: auto)
     --dry-run                 Discover only; no NetBox writes
+    --force                   Replace cables that point to the wrong neighbor.
+                             Without this flag existing cables are never touched.
+                             With this flag, if a cable exists on the local
+                             interface but connects to a different remote than
+                             CDP reports, the old cable is deleted and a new
+                             one is created. Correct cables are left in place.
+                             Always combine with --dry-run first to preview.
     --max-workers N           Concurrent threads (default: 5)
     --timeout SEC             Device timeout seconds (default: 30)
     --log-level {DEBUG,INFO,WARNING,ERROR}    (default: INFO)
@@ -1022,6 +1135,14 @@ usage: sync_netbox_interfaces.py [-h]
   Runtime options:
     --transport {auto,cli,restconf,netconf}   (default: auto)
     --dry-run                 No NetBox writes
+    --force-type              Write the inferred interface type to NetBox.
+                             Without this flag the 'type' field is never
+                             included in the payload — existing values are
+                             preserved and new interfaces get NetBox's default.
+                             With this flag the inferred type is written for
+                             every interface and mismatches are overwritten.
+                             NX-OS Ethernet ports use speed + transceiver
+                             data for the best-effort guess.
     --max-workers N           Concurrent threads (default: 5)
     --timeout SEC             Device timeout in seconds (default: 30)
     --fail-fast               Abort device on first critical error
