@@ -1271,33 +1271,38 @@ def _sync_prefixes(
     dry_run: bool,
     iface_vrf_map: Optional[Dict[str, Optional[str]]] = None,
     vrf_cache: Optional[Dict[str, int]] = None,
+    device_id: int = 0,
+    vc_member_map: Optional[Dict[int, int]] = None,
 ) -> tuple:
     """
     Collect interface IPs, compute their network prefixes, and ensure each
     prefix exists in NetBox with the correct site, VLAN, and VRF assignment.
+    Also assign the **host IP address** to the corresponding NetBox interface
+    record for all non-SVI interfaces (Port-channels, routed physical ports,
+    sub-interfaces, etc.).
 
-    SVI interfaces (``Vlan<N>``) are linked to their VLAN via
-    :func:`_resolve_prefix_vlan`, which first checks *vlan_id_map* then
-    falls back to a direct NetBox query.  All other interface types are
-    written without a VLAN (no guessing).
+    SVI interfaces (``Vlan<N>``) are handled by :func:`_sync_svi_bindings`
+    which reads IPs directly from running-config.  They are skipped here to
+    avoid double-assignment.
 
     When *iface_vrf_map* is provided the VRF assignment for each interface
     (collected from running-config) is resolved to a NetBox VRF ID and
     included in the prefix create/update payload.  This ensures prefixes
     under the same CIDR in different VRFs are written as distinct records.
 
-    Returns ``(created, updated, moved_site, errors)``.
+    Returns ``(created, updated, moved_site, ips_assigned, errors)``.
     """
-    created = updated = moved = 0
+    created = updated = moved = ips_assigned = 0
     errors: List[str] = []
-    _vrf_map   = iface_vrf_map or {}
-    _vrf_cache = vrf_cache if vrf_cache is not None else {}
+    _vrf_map      = iface_vrf_map or {}
+    _vrf_cache    = vrf_cache if vrf_cache is not None else {}
+    _vc_member_map = vc_member_map or {}
 
     try:
         ip_inventory = cisco.get_interface_ip_inventory()
     except Exception as exc:
         errors.append(f"IP collection failed: {exc}")
-        return created, updated, moved, errors
+        return created, updated, moved, ips_assigned, errors
 
     log.info(
         "%-30s  prefix: %d interface IP(s) collected", device_name, len(ip_inventory)
@@ -1339,6 +1344,19 @@ def _sync_prefixes(
             prefix_net=prefix_net,
         )
 
+        # SVIs are handled by _sync_svi_bindings (running-config parse).
+        # Expand here so the name matches what is stored in NetBox (Stage 1
+        # always writes expanded names, e.g. "Port-channel24" not "Po24").
+        expanded_name = expand_interface_name(iface_name)
+        is_svi        = bool(_SVI_RE.match(expanded_name))
+
+        # Target device for the IP assignment — logical interfaces (LAGs,
+        # Port-channels, SVIs) stay on the master; physical interfaces are
+        # routed to the correct VC member via the slot number.
+        target_device_id = resolve_target_device_id(
+            expanded_name, device_id, _vc_member_map
+        )
+
         if dry_run:
             log.info(
                 "DRY-RUN  %-30s  prefix %-22s  vlan_id=%-6s  "
@@ -1346,6 +1364,11 @@ def _sync_prefixes(
                 device_name, prefix_net, nb_vlan_id,
                 raw_vrf or "global", iface_name,
             )
+            if not is_svi and "/" in ip_cidr and device_id:
+                log.info(
+                    "DRY-RUN  %-30s  would assign IP %-22s → %s",
+                    device_name, ip_cidr, expanded_name,
+                )
             created += 1
             continue
 
@@ -1380,7 +1403,44 @@ def _sync_prefixes(
             log.warning("%-30s  %s", device_name, err)
             errors.append(err)
 
-    return created, updated, moved, errors
+        # ── Assign the host IP to the interface in NetBox ─────────────────
+        # SVIs skip this block — they are handled (including IP assignment)
+        # by _sync_svi_bindings which reads the exact host address from
+        # running-config.  All other routed interfaces (Port-channels,
+        # physical routed ports, sub-interfaces) are covered here.
+        #
+        # Guard: ip_cidr must include a prefix length so NetBox gets the
+        # full address object (e.g. "172.18.5.164/31", not just "172.18.5.164").
+        # device_id=0 means we were called without a device context — skip.
+        if not is_svi and "/" in ip_cidr and device_id:
+            try:
+                ip_result = nb.ensure_ip_on_interface(
+                    ip_cidr=ip_cidr,
+                    device_id=target_device_id,
+                    interface_name=expanded_name,
+                    vrf_id=nb_vrf_id,
+                )
+                ip_action = ip_result.get("_action", "skipped")
+                if ip_action in ("created", "updated"):
+                    ips_assigned += 1
+                    log.info(
+                        "%-30s  IP %-22s → %s (%s)",
+                        device_name, ip_cidr, expanded_name, ip_action,
+                    )
+                else:
+                    log.debug(
+                        "%-30s  IP %-22s already on %s — no change",
+                        device_name, ip_cidr, expanded_name,
+                    )
+            except NetBoxClientError as exc:
+                # Non-fatal: log and continue — prefix was already created.
+                log.warning(
+                    "%-30s  IP %r → %r: %s",
+                    device_name, ip_cidr, expanded_name, exc,
+                )
+                errors.append(f"IP {ip_cidr!r} → {expanded_name!r}: {exc}")
+
+    return created, updated, moved, ips_assigned, errors
 
 
 def _sync_svi_bindings(
@@ -2766,6 +2826,7 @@ def sync_device(
         "prefixes_created_count":          0,
         "prefixes_updated_count":          0,
         "prefixes_moved_site_count":       0,
+        "routed_ips_assigned":             0,
         "nxos_pc_ips_assigned":            0,
         "fhrp_groups_synced":              0,
         "platform_updated":                0,
@@ -3135,7 +3196,7 @@ def sync_device(
 
     # ── Stage 4: IP + prefix sync ──────────────────────────────────────────
     if args.sync_prefixes:
-        p_created, p_updated, p_moved, p_errors = _sync_prefixes(
+        p_created, p_updated, p_moved, p_ips, p_errors = _sync_prefixes(
             cisco=cisco,
             nb=nb,
             device_name=device_name,
@@ -3144,10 +3205,13 @@ def sync_device(
             dry_run=args.dry_run,
             iface_vrf_map=iface_vrf_map,
             vrf_cache=vrf_cache,
+            device_id=device_id,
+            vc_member_map=vc_member_map,
         )
         summary["prefixes_created_count"]    = p_created
         summary["prefixes_updated_count"]    = p_updated
         summary["prefixes_moved_site_count"] = p_moved
+        summary["routed_ips_assigned"]       = p_ips
         summary["errors"].extend(p_errors)
 
     # ── Stage 4.5: NX-OS Port-Channel HSRP virtual IPs ───────────────────

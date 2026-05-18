@@ -629,13 +629,26 @@ def _resolve_neighbor(
        includes a unit number that is not part of the VC name in NetBox.
     5. **Primary-IP fallback** — IPAM lookup by management IP.
     """
+    # ── Strip serial-number suffix (parenthetical) ───────────────────────
+    # Some Cisco platforms (NX-OS in particular) append a hardware serial
+    # number to the CDP device-id:
+    #   "UMC-ACB-MER-COR-01(JAF1730AKBT)"  →  "UMC-ACB-MER-COR-01"
+    # Strip everything from the first "(" to the end of the string so the
+    # resulting name matches what is stored in NetBox.
+    clean_name = re.sub(r"\s*\([^)]*\).*$", "", neighbor_name).strip()
+    if clean_name != neighbor_name:
+        log.debug(
+            "Neighbor %r: stripped serial suffix → %r",
+            neighbor_name, clean_name,
+        )
+
     # Build candidates with lowercase names so NetBox searches are
     # case-insensitive regardless of how the CDP neighbor is reported.
-    candidates: List[str] = [neighbor_name.lower()]
+    candidates: List[str] = [clean_name.lower()]
 
     # FQDN domain strip (e.g. "sw.corp.example.com" → "sw")
-    short = neighbor_name.split(".")[0].lower()
-    if short and short != neighbor_name.lower():
+    short = clean_name.split(".")[0].lower()
+    if short and short != clean_name.lower():
         candidates.append(short)
 
     # ── Steps 1 + 2: VC then device, for each candidate name ─────────────
