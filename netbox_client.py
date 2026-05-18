@@ -4342,18 +4342,53 @@ class NetBoxClient:
 
     def get_device_type_by_model(self, model: str) -> Optional[dict]:
         """
-        Return the NetBox DeviceType whose ``model`` field matches *model*
-        (case-insensitive exact match), or ``None`` if not found.
+        Return the NetBox DeviceType that matches *model*, or ``None``.
+
+        Search order (first hit wins):
+
+        1. ``model`` field exact match  (``filter(model=model)``)
+        2. ``model`` field case-insensitive match via full-text ``q=`` search
+        3. ``part_number`` field exact match  (``filter(part_number=model)``)
+        4. ``part_number`` field case-insensitive match via ``q=`` search
+
+        Cisco AP model strings from CDP (e.g. ``"C9120AXI-B"``) are sometimes
+        stored in NetBox as the ``part_number`` rather than the ``model``, so
+        searching both fields is required.
         """
+        model_lower = model.lower()
         try:
+            # ── Pass 1: model field exact match ───────────────────────────
             recs = list(self.nb.dcim.device_types.filter(model=model))
             if recs:
                 return self._to_dict(recs[0])
-            # Fallback: case-insensitive search via q=
-            recs = list(self.nb.dcim.device_types.filter(q=model))
-            for rec in recs:
-                if rec.model.lower() == model.lower():
+
+            # ── Pass 2: model field case-insensitive via full-text search ─
+            # Save q_recs for reuse in pass 4 (part_number check).
+            q_recs = list(self.nb.dcim.device_types.filter(q=model))
+            for rec in q_recs:
+                if rec.model.lower() == model_lower:
                     return self._to_dict(rec)
+
+            # ── Pass 3: part_number field exact match ─────────────────────
+            pn_recs = list(self.nb.dcim.device_types.filter(part_number=model))
+            if pn_recs:
+                self.log.debug(
+                    "get_device_type_by_model: %r matched via part_number", model
+                )
+                return self._to_dict(pn_recs[0])
+
+            # ── Pass 4: part_number case-insensitive in the q= result set ─
+            # The full-text search in pass 2 covers part_number; check those
+            # records before giving up.
+            for rec in q_recs:
+                pn = getattr(rec, "part_number", "") or ""
+                if pn.lower() == model_lower:
+                    self.log.debug(
+                        "get_device_type_by_model: %r matched via part_number (q=)",
+                        model,
+                    )
+                    return self._to_dict(rec)
+
             return None
         except pynetbox.RequestError as exc:
             raise NetBoxClientError(
