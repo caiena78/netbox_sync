@@ -628,13 +628,14 @@ def _resolve_neighbor(
 
     Resolution order
     ----------------
-    1. **Virtual Chassis lookup** — exact ``neighbor_name``.
-       When the neighbor is modeled as a VC (e.g. ``"3850-E-4"``), returns
-       the first member device (e.g. ``"3850-E-4(1)"``).  Cables are always
-       terminated on the *member* device, never on the VC object itself.
-    2. **Regular device lookup** — exact ``neighbor_name``.
-    3. **FQDN strip** — strip domain suffix (``"sw.example.com"`` → ``"sw"``)
-       and retry steps 1 + 2.
+    1. **Virtual Chassis lookup** — full cleaned name (lowercase).
+    2. **Regular device lookup** — full cleaned name (lowercase).
+       When the CDP-reported name is an FQDN (contains ``"."``), the full
+       FQDN is tried first so that any device stored with that exact name
+       in NetBox is found without unnecessary stripping.
+    3. **FQDN hostname strip** — when the name is an FQDN, strip the
+       domain suffix (e.g. ``"umc-acb-mer-cucm-8300-r1.lcmchealth.org"``
+       → ``"umc-acb-mer-cucm-8300-r1"``) and retry steps 1 + 2.
     4. **Numeric-suffix strip** — strip trailing ``-<digits>``
        (e.g. ``"3850-E-4"`` → ``"3850-E"``) and try VC lookup only.
        This is a last resort for environments where the CDP-reported name
@@ -654,17 +655,43 @@ def _resolve_neighbor(
             neighbor_name, clean_name,
         )
 
-    # Build candidates with lowercase names so NetBox searches are
-    # case-insensitive regardless of how the CDP neighbor is reported.
-    candidates: List[str] = [clean_name.lower()]
+    # All lookups are performed with the name lowercased so that
+    # case differences between the CDP report and NetBox are ignored.
+    clean_lower = clean_name.lower()
 
-    # FQDN domain strip (e.g. "sw.corp.example.com" → "sw")
-    short = clean_name.split(".")[0].lower()
-    if short and short != clean_name.lower():
-        candidates.append(short)
+    # ── FQDN detection ────────────────────────────────────────────────────
+    # When the CDP device-id is a fully-qualified domain name (contains a
+    # dot), try the full FQDN first so that devices stored with their FQDN
+    # in NetBox are found.  If the FQDN lookup fails, fall back to the
+    # hostname-only portion (everything before the first dot).
+    #
+    # Example: "umc-acb-mer-cucm-8300-r1.lcmchealth.org"
+    #   candidate 1 → "umc-acb-mer-cucm-8300-r1.lcmchealth.org"  (full FQDN)
+    #   candidate 2 → "umc-acb-mer-cucm-8300-r1"                 (hostname only)
+    is_fqdn    = "." in clean_lower
+    candidates: List[str] = [clean_lower]
+
+    if is_fqdn:
+        hostname_only = clean_lower.split(".")[0]
+        if hostname_only and hostname_only != clean_lower:
+            candidates.append(hostname_only)
+            log.debug(
+                "Neighbor %r: FQDN detected — will also search by "
+                "hostname-only %r if full FQDN is not found in NetBox",
+                neighbor_name, hostname_only,
+            )
 
     # ── Steps 1 + 2: VC then device, for each candidate name ─────────────
     for candidate in candidates:
+
+        # Emit an INFO line when falling back from FQDN to hostname-only so
+        # operators can see the resolution path without enabling DEBUG.
+        if is_fqdn and candidate != clean_lower:
+            log.info(
+                "Neighbor %r: FQDN %r not found in NetBox — "
+                "retrying with hostname-only %r",
+                neighbor_name, clean_lower, candidate,
+            )
 
         # Step 1 — Virtual Chassis lookup (always first)
         d = _resolve_vc(candidate, nb)
