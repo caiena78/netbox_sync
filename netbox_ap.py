@@ -564,38 +564,55 @@ def get_switch_mac_table(client) -> dict:
 
 def update_ap_interface_mac(
     nb: NetBoxClient,
-    ap_device_id: int,
-    ap_iface_name: str,
+    interface_id: int,
     mac: str,
+    current_iface: Optional[dict] = None,
 ) -> None:
-    """PATCH the ``mac_address`` field on the named AP interface in NetBox."""
-    try:
-        all_ifaces = nb.get_interfaces(device_id=ap_device_id)
-    except NetBoxClientError as exc:
-        log.warning(
-            "MAC update: failed to fetch interfaces for device_id=%s: %s",
-            ap_device_id, exc,
-        )
-        return
+    """
+    PATCH ``mac_address`` and ``primary_mac_address`` on a NetBox interface.
 
-    match = next((i for i in all_ifaces if i.get("name") == ap_iface_name), None)
-    if match is None:
-        log.warning(
-            "MAC update: interface %r not found on device_id=%s",
-            ap_iface_name, ap_device_id,
-        )
-        return
+    Idempotent — skips the PATCH when both fields already carry *mac*.
+
+    Parameters
+    ----------
+    nb : NetBoxClient
+    interface_id : int
+        Primary key of the interface to update.
+    mac : str
+        Lowercase Cisco dotted MAC, e.g. ``"1cd1.e0d2.c774"``.
+    current_iface : dict, optional
+        The interface record dict returned by the most recent upsert/fetch.
+        When supplied, used to skip the PATCH if both MAC fields already match.
+    """
+    def _extract_mac_str(val) -> str:
+        # primary_mac_address may be a nested object {"id": ..., "mac_address": "..."}
+        if isinstance(val, dict):
+            return (val.get("mac_address") or "").lower()
+        return (val or "").lower()
+
+    if current_iface is not None:
+        cur_mac     = _extract_mac_str(current_iface.get("mac_address"))
+        cur_pri_mac = _extract_mac_str(current_iface.get("primary_mac_address"))
+        if cur_mac == mac and cur_pri_mac == mac:
+            log.debug(
+                "Interface id=%s MAC already %s — skipping update",
+                interface_id, mac,
+            )
+            return
 
     try:
-        nb.update_interface(match["id"], {"mac_address": mac})
+        nb.update_interface(interface_id, {
+            "mac_address":         mac,
+            "primary_mac_address": mac,
+        })
         log.info(
-            "Interface %r (id=%s) mac_address set to %s",
-            ap_iface_name, match["id"], mac,
+            "Interface id=%s  mac_address + primary_mac_address set to %s",
+            interface_id, mac,
         )
     except NetBoxClientError as exc:
         log.warning(
-            "MAC update failed for interface %r (id=%s): %s",
-            ap_iface_name, match["id"], exc,
+            "MAC update failed for interface id=%s: %s",
+            interface_id, exc,
         )
 
 
@@ -852,10 +869,10 @@ def _build_ap_in_netbox(
         if short_key and short_key in mac_table:
             found_mac = mac_table[short_key]
             log.info(
-                "%-30s  MAC found (%s) for switch port %r — updating AP iface %r",
-                ap_name, found_mac, short_key, ap_port,
+                "%-30s  MAC found (%s) for switch port %r — updating AP iface %r (id=%s)",
+                ap_name, found_mac, short_key, ap_port, iface_id,
             )
-            update_ap_interface_mac(nb, ap_device_id, ap_port, found_mac)
+            update_ap_interface_mac(nb, iface_id, found_mac, current_iface=iface_result)
         else:
             log.warning(
                 "%-30s  MAC not found in table for switch port %r (CDP local=%r)",
