@@ -118,10 +118,13 @@ def _fetch_export(
     params: dict,
 ) -> list | dict:
     """
-    Call the NetBox UI export endpoint and return parsed JSON.
+    Call the NetBox REST API export endpoint and return parsed JSON.
 
-    The endpoint is ``/dcim/devices/`` with ``export=devices_with_connection_stream``
-    plus whatever additional query params are supplied.
+    Uses ``/api/dcim/devices/`` (not the UI path ``/dcim/devices/``).
+    The UI path uses Django session-cookie authentication and redirects
+    token-authenticated requests to /login/.  The REST API path respects
+    ``Authorization: Token …`` and also honours the ``export=<template>``
+    query parameter, invoking the same custom export template.
 
     Raises
     ------
@@ -130,7 +133,7 @@ def _fetch_export(
     requests.HTTPError
         On 4xx / 5xx status codes.
     """
-    url = f"{base_url}/dcim/devices/"
+    url = f"{base_url}/api/dcim/devices/"
 
     print(f"[INFO] Export URL : {url}", file=sys.stderr)
     print(f"[INFO] Params     : {params}", file=sys.stderr)
@@ -140,7 +143,7 @@ def _fetch_export(
             url,
             params=params,
             timeout=30,
-            allow_redirects=False,   # catch login-page redirects explicitly
+            allow_redirects=False,
         )
     except requests.exceptions.RequestException as exc:
         raise RuntimeError(f"Request failed: {exc}") from exc
@@ -148,7 +151,7 @@ def _fetch_export(
     print(f"[INFO] Status     : {resp.status_code}", file=sys.stderr)
     print(f"[INFO] Content-Type: {resp.headers.get('Content-Type', '(none)')}", file=sys.stderr)
 
-    # A 3xx response means NetBox redirected us — almost always to /login/
+    # A 3xx at the API path is unexpected — flag it clearly
     if resp.is_redirect or resp.status_code in (301, 302, 303, 307, 308):
         location = resp.headers.get("Location", "(unknown)")
         raise RuntimeError(
