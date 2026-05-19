@@ -5,15 +5,30 @@ netbox_device_connections.py
 Export device connection data from NetBox using the custom export template
 ``devices_with_connection_stream``.
 
-Resolution order
-----------------
-1. Query ``/api/dcim/virtual-chassis/?name=<name>``
-   - Found  → ``/dcim/devices/?virtual_chassis_id=<id>&export=devices_with_connection_stream``
-   - Missing → ``/dcim/devices/?q=<name>&export=devices_with_connection_stream``
+Authentication modes
+--------------------
+NetBox has two distinct authentication surfaces:
 
-The export endpoint is a *UI* endpoint (not the REST API), so it requires
-both a valid ``Authorization: Token …`` header **and** ``Accept: application/json``.
-Without the Accept header NetBox renders an HTML page instead of JSON.
+  REST API  ``/api/…``       → ``Authorization: Token <token>``   (--netbox-token)
+  UI pages  ``/dcim/…``      → Django session cookie              (--username + --password)
+
+The export template endpoint is a **UI page**.  Passing the token header
+there is silently ignored and NetBox redirects to /login/.
+
+  - If ``--username`` and ``--password`` are supplied:
+    The script POSTs to ``/login/`` to obtain a session cookie, then calls
+    the UI export endpoint — exactly what a browser does.
+
+  - If only ``--netbox-token`` is supplied:
+    The script tries the REST API path (``/api/dcim/devices/?export=…``).
+    This works when the token has export-template permission; if it returns
+    403 a clear message explains how to fix it.
+
+Resolution order (VC vs device)
+--------------------------------
+1. Query ``/api/dcim/virtual-chassis/?name=<name>`` (token auth)
+   - Found  → ``?virtual_chassis_id=<id>&export=devices_with_connection_stream``
+   - Missing → ``?q=<name>&export=devices_with_connection_stream``
 """
 
 from __future__ import annotations
@@ -27,76 +42,120 @@ import requests
 
 
 # --------------------------------------------------------------------------- #
-# Helpers                                                                      #
+# Session factories                                                            #
 # --------------------------------------------------------------------------- #
 
-def _make_session(token: str) -> requests.Session:
-    """
-    Return a requests Session pre-configured for NetBox token auth.
-
-    Sets both ``Authorization`` and ``Accept: application/json`` on every
-    request so the UI export endpoint returns JSON instead of an HTML page.
-    Redirects are NOT followed — a redirect almost always means NetBox sent
-    the client to the login page, which is a sign of an auth failure.
-    """
-    session = requests.Session()
-    session.headers.update({
+def _make_api_session(token: str) -> requests.Session:
+    """Return a session configured for NetBox REST API token auth."""
+    s = requests.Session()
+    s.headers.update({
         "Authorization": f"Token {token}",
         "Accept":        "application/json",
         "Content-Type":  "application/json",
     })
-    # Do NOT set session.max_redirects here — it fires TooManyRedirects even
-    # when a specific request passes allow_redirects=False.  Redirect detection
-    # is handled per-call via allow_redirects=False + status-code inspection.
-    return session
+    return s
 
 
-def _assert_json_response(response: requests.Response, url: str) -> None:
+def _make_ui_session(base_url: str, username: str, password: str) -> requests.Session:
     """
-    Raise a descriptive RuntimeError when the response is HTML rather than
-    JSON.  This catches two failure modes:
-    - NetBox redirected to the login page (missing / wrong token).
-    - NetBox returned an HTML error page (template misconfiguration).
-    """
-    content_type = response.headers.get("Content-Type", "")
-    body_start   = response.text[:200].lower()
+    Authenticate via username/password and return a session carrying the
+    resulting Django session cookie.
 
-    if "text/html" in content_type or "<html" in body_start:
+    Mimics exactly what a browser does:
+      GET  /login/  →  obtain csrftoken cookie
+      POST /login/  →  submit credentials  →  receive sessionid cookie
+
+    Raises RuntimeError if login fails.
+    """
+    s = requests.Session()
+    s.headers.update({"Accept": "text/html,application/json"})
+
+    login_url = f"{base_url}/login/"
+
+    # ── Step 1: GET login page to harvest CSRF cookie ─────────────────────
+    try:
+        resp = s.get(login_url, timeout=15)
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(f"Could not reach login page {login_url!r}: {exc}") from exc
+
+    csrf = s.cookies.get("csrftoken")
+    if not csrf:
+        raise RuntimeError(
+            f"No csrftoken cookie from {login_url!r} — check --netbox-url."
+        )
+
+    # ── Step 2: POST credentials ──────────────────────────────────────────
+    try:
+        resp = s.post(
+            login_url,
+            data={
+                "username":            username,
+                "password":            password,
+                "csrfmiddlewaretoken": csrf,
+            },
+            headers={"Referer": login_url},
+            timeout=15,
+            allow_redirects=True,
+        )
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(f"Login POST failed: {exc}") from exc
+
+    # A successful login redirects away from /login/
+    if "/login" in resp.url:
+        raise RuntimeError(
+            "Login failed — NetBox stayed on the login page. "
+            "Check --username and --password."
+        )
+
+    print(f"[INFO] Session auth: logged in as {username!r}", file=sys.stderr)
+    return s
+
+
+# --------------------------------------------------------------------------- #
+# Shared response guard                                                        #
+# --------------------------------------------------------------------------- #
+
+def _assert_json_response(resp: requests.Response, url: str) -> None:
+    """
+    Raise RuntimeError when the response body is HTML rather than JSON.
+
+    Catches two silent failure modes:
+      - NetBox rendered an HTML error page instead of the export.
+      - An intermediate proxy returned an HTML page.
+    """
+    ct         = resp.headers.get("Content-Type", "")
+    body_start = resp.text[:300].lower()
+
+    if "text/html" in ct or "<html" in body_start:
         raise RuntimeError(
             f"Received HTML instead of JSON from {url!r}\n"
-            f"  Content-Type : {content_type!r}\n"
-            f"  Response URL : {response.url!r}\n"
-            f"  Hint         : check that --netbox-token is correct and that\n"
-            f"                 the export template 'devices_with_connection_stream' exists."
+            f"  Content-Type : {ct!r}\n"
+            f"  Response URL : {resp.url!r}\n"
+            f"  Hint         : authentication failed or the export template "
+            f"'devices_with_connection_stream' does not exist."
         )
 
 
 # --------------------------------------------------------------------------- #
-# API calls                                                                    #
+# Virtual chassis lookup (always token / REST API)                             #
 # --------------------------------------------------------------------------- #
 
 def _find_virtual_chassis_id(
-    session: requests.Session,
+    api_session: requests.Session,
     base_url: str,
     name: str,
 ) -> int | None:
-    """
-    Return the NetBox Virtual Chassis ID whose name matches *name*, or None.
-
-    Uses the JSON REST API (``/api/dcim/virtual-chassis/``).
-
-    A 403 response means the token lacks permission to list virtual chassis —
-    this is treated as "no VC found" so the caller falls back to a device
-    search.  Any other HTTP error is logged as a warning and also returns None.
-    """
+    """Return the VC ID for *name*, or None (including on 403)."""
     url = f"{base_url}/api/dcim/virtual-chassis/"
     try:
-        resp = session.get(url, params={"name": name}, timeout=15)
+        resp = api_session.get(url, params={"name": name}, timeout=15)
 
         if resp.status_code == 403:
             print(
                 "[INFO] Virtual chassis API returned 403 — token lacks "
-                "permission for that endpoint; skipping VC lookup.",
+                "list-VC permission; skipping VC lookup.",
                 file=sys.stderr,
             )
             return None
@@ -112,34 +171,27 @@ def _find_virtual_chassis_id(
     return None
 
 
-def _fetch_export(
-    session: requests.Session,
+# --------------------------------------------------------------------------- #
+# Export fetch — two paths                                                     #
+# --------------------------------------------------------------------------- #
+
+def _fetch_export_ui(
+    ui_session: requests.Session,
     base_url: str,
     params: dict,
-) -> list | dict:
+) -> object:
     """
-    Call the NetBox REST API export endpoint and return parsed JSON.
+    Fetch the export via the **UI** endpoint ``/dcim/devices/``.
 
-    Uses ``/api/dcim/devices/`` (not the UI path ``/dcim/devices/``).
-    The UI path uses Django session-cookie authentication and redirects
-    token-authenticated requests to /login/.  The REST API path respects
-    ``Authorization: Token …`` and also honours the ``export=<template>``
-    query parameter, invoking the same custom export template.
-
-    Raises
-    ------
-    RuntimeError
-        When the response is HTML (auth failure, redirect, template missing).
-    requests.HTTPError
-        On 4xx / 5xx status codes.
+    Requires a session cookie obtained from :func:`_make_ui_session`.
+    This is the path that works in a browser.
     """
-    url = f"{base_url}/api/dcim/devices/"
-
-    print(f"[INFO] Export URL : {url}", file=sys.stderr)
-    print(f"[INFO] Params     : {params}", file=sys.stderr)
+    url = f"{base_url}/dcim/devices/"
+    print(f"[INFO] Export path: UI  ({url})", file=sys.stderr)
+    print(f"[INFO] Params     : {params}",    file=sys.stderr)
 
     try:
-        resp = session.get(
+        resp = ui_session.get(
             url,
             params=params,
             timeout=30,
@@ -151,18 +203,69 @@ def _fetch_export(
     print(f"[INFO] Status     : {resp.status_code}", file=sys.stderr)
     print(f"[INFO] Content-Type: {resp.headers.get('Content-Type', '(none)')}", file=sys.stderr)
 
-    # A 3xx at the API path is unexpected — flag it clearly
     if resp.is_redirect or resp.status_code in (301, 302, 303, 307, 308):
         location = resp.headers.get("Location", "(unknown)")
         raise RuntimeError(
-            f"NetBox redirected to {location!r} — "
-            "token auth failed or the export URL is wrong."
+            f"NetBox redirected to {location!r} — session auth failed. "
+            "Check --username and --password."
         )
 
     resp.raise_for_status()
-
     _assert_json_response(resp, url)
+    return resp.json()
 
+
+def _fetch_export_api(
+    api_session: requests.Session,
+    base_url: str,
+    params: dict,
+) -> object:
+    """
+    Fetch the export via the **REST API** endpoint ``/api/dcim/devices/``.
+
+    Works when the token has both ``view_device`` and export-template
+    permissions.  Returns a 403 when the token lacks export permission;
+    the caller should instruct the user to add ``--username``/``--password``
+    or fix the token's permissions.
+    """
+    url = f"{base_url}/api/dcim/devices/"
+    print(f"[INFO] Export path: REST API  ({url})", file=sys.stderr)
+    print(f"[INFO] Params     : {params}",           file=sys.stderr)
+
+    try:
+        resp = api_session.get(
+            url,
+            params=params,
+            timeout=30,
+            allow_redirects=False,
+        )
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(f"Request failed: {exc}") from exc
+
+    print(f"[INFO] Status     : {resp.status_code}", file=sys.stderr)
+    print(f"[INFO] Content-Type: {resp.headers.get('Content-Type', '(none)')}", file=sys.stderr)
+
+    if resp.is_redirect or resp.status_code in (301, 302, 303, 307, 308):
+        location = resp.headers.get("Location", "(unknown)")
+        raise RuntimeError(f"Unexpected redirect to {location!r}")
+
+    if resp.status_code == 403:
+        raise RuntimeError(
+            "403 Forbidden on the REST API export endpoint.\n"
+            "\n"
+            "The API token is valid but lacks the required permission.\n"
+            "Fix one of the following:\n"
+            "\n"
+            "  Option A — grant the token export-template permission in NetBox\n"
+            "             (Extras → Export Templates → permissions, or via\n"
+            "             token object-permissions in the admin panel).\n"
+            "\n"
+            "  Option B — pass --username and --password to authenticate via\n"
+            "             the UI login page (same as a browser session).\n"
+        )
+
+    resp.raise_for_status()
+    _assert_json_response(resp, url)
     return resp.json()
 
 
@@ -170,11 +273,17 @@ def _fetch_export(
 # Main logic                                                                   #
 # --------------------------------------------------------------------------- #
 
-def get_export_data(base_url: str, token: str, name: str) -> None:
-    session = _make_session(token)
+def get_export_data(
+    base_url: str,
+    token: str,
+    name: str,
+    username: str | None = None,
+    password: str | None = None,
+) -> None:
+    api_session = _make_api_session(token)
 
-    # ── Step 1: Virtual chassis lookup ────────────────────────────────────
-    vc_id = _find_virtual_chassis_id(session, base_url, name)
+    # ── Step 1: resolve VC or fall back to device search ─────────────────
+    vc_id = _find_virtual_chassis_id(api_session, base_url, name)
 
     if vc_id is not None:
         print(
@@ -197,8 +306,15 @@ def get_export_data(base_url: str, token: str, name: str) -> None:
             "export": "devices_with_connection_stream",
         }
 
-    # ── Step 2: Export request ────────────────────────────────────────────
-    data = _fetch_export(session, base_url, params)
+    # ── Step 2: fetch export via the appropriate auth path ────────────────
+    if username and password:
+        print("[INFO] Auth mode  : session (username/password)", file=sys.stderr)
+        ui_session = _make_ui_session(base_url, username, password)
+        data = _fetch_export_ui(ui_session, base_url, params)
+    else:
+        print("[INFO] Auth mode  : token (REST API)", file=sys.stderr)
+        data = _fetch_export_api(api_session, base_url, params)
+
     print(json.dumps(data, indent=2))
 
 
@@ -210,9 +326,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Export NetBox device connection data via the "
-            "'devices_with_connection_stream' export template."
-        )
+            "'devices_with_connection_stream' export template.\n\n"
+            "Authentication:\n"
+            "  Token only (--netbox-token):       uses REST API — requires export permission on token.\n"
+            "  Credentials (--username/--password): uses UI session — same as browser login."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+
     parser.add_argument(
         "--netbox-url",
         default=os.environ.get("NETBOX_URL", ""),
@@ -221,7 +342,23 @@ def main() -> None:
     parser.add_argument(
         "--netbox-token",
         default=os.environ.get("NETBOX_API", ""),
-        help="NetBox API token  (env: NETBOX_API)",
+        help="NetBox API token — used for VC lookup and (optionally) export  (env: NETBOX_API)",
+    )
+    parser.add_argument(
+        "--username",
+        default=os.environ.get("NETBOX_USERNAME", ""),
+        help=(
+            "NetBox username for session-based login (env: NETBOX_USERNAME). "
+            "Required when the token lacks export-template permission."
+        ),
+    )
+    parser.add_argument(
+        "--password",
+        default=os.environ.get("NETBOX_PASSWORD", ""),
+        help=(
+            "NetBox password for session-based login (env: NETBOX_PASSWORD). "
+            "Required together with --username."
+        ),
     )
     parser.add_argument(
         "--name",
@@ -241,6 +378,8 @@ def main() -> None:
             base_url=args.netbox_url.rstrip("/"),
             token=args.netbox_token,
             name=args.name,
+            username=args.username or None,
+            password=args.password or None,
         )
     except RuntimeError as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
