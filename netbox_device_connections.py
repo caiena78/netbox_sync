@@ -159,6 +159,81 @@ def _primary_ip(device: dict) -> Optional[str]:
     return None
 
 
+def _pick_vc_master(members: List[dict]) -> Optional[dict]:
+    """
+    Return the 'first' member of a VC from a list of device dicts.
+
+    Priority:
+      1. member whose virtual_chassis_position == 1
+      2. member with the lowest virtual_chassis_position (None positions sorted last)
+      3. first item returned by the API
+    """
+    if not members:
+        return None
+
+    def _pos(m: dict) -> tuple:
+        pos = m.get("vc_position") or m.get("virtual_chassis_position")
+        if pos is None:
+            return (1, float("inf"))
+        return (0, pos)
+
+    return sorted(members, key=_pos)[0]
+
+
+def resolve_device_primary_ip(
+    device: dict,
+    session: requests.Session,
+    base: str,
+    vc_cache: Dict[int, Optional[str]],
+) -> Optional[str]:
+    """
+    Return the primary IP for *device*, falling back to the VC master's IP
+    when the device itself has no primary IP configured.
+
+    *vc_cache* maps vc_id → resolved IP string (or None) so each VC is only
+    queried once across all interfaces in a run.
+
+    Resolution order
+    ----------------
+    1. device.primary_ip4 or primary_ip6  → return immediately
+    2. device.virtual_chassis is not null  → look up all VC members
+       a. Pick the member with vc_position == 1 (or lowest position)
+       b. Return that member's primary IP (or None if it also has none)
+    3. No VC                              → return None
+    """
+    ip = _primary_ip(device)
+    if ip:
+        return ip
+
+    vc_field = device.get("virtual_chassis")
+    if not vc_field:
+        return None
+
+    vc_id = _id_of(vc_field)
+    if vc_id is None:
+        return None
+
+    # Return cached result if we have already resolved this VC
+    if vc_id in vc_cache:
+        return vc_cache[vc_id]
+
+    members = _get_all(
+        session,
+        f"{base}/api/dcim/devices/",
+        {"virtual_chassis_id": vc_id},
+    )
+    master = _pick_vc_master(members)
+    result = _primary_ip(master) if master else None
+    vc_cache[vc_id] = result
+    log.debug(
+        "VC id=%s — master=%r  fallback_ip=%s",
+        vc_id,
+        master.get("name") if master else None,
+        result,
+    )
+    return result
+
+
 def _id_of(obj: Any) -> Optional[int]:
     """Extract the integer id from a nested object or bare int."""
     if isinstance(obj, dict):
@@ -339,14 +414,18 @@ def _connections_for_device(
     session: requests.Session,
     base: str,
     device: dict,
+    vc_cache: Dict[int, Optional[str]],
 ) -> Iterator[dict]:
     """
     Yield one connection record dict for every cabled interface on *device*.
     Logs warnings and continues on per-interface errors.
+
+    *vc_cache* is a shared dict (vc_id → ip) so the VC master lookup is only
+    performed once per VC across all devices processed in a single run.
     """
     device_id   = device.get("id")
     device_name = device.get("name") or f"device-{device_id}"
-    device_ip   = _primary_ip(device)
+    device_ip   = resolve_device_primary_ip(device, session, base, vc_cache)
 
     ifaces = _get_all(
         session,
@@ -391,8 +470,12 @@ def _connections_for_device(
                     if fetched:
                         remote_dev = fetched
 
-            remote_name   = _name_of(remote_dev)   if isinstance(remote_dev, dict) else None
-            remote_ip     = _primary_ip(remote_dev) if isinstance(remote_dev, dict) else None
+            remote_name = _name_of(remote_dev) if isinstance(remote_dev, dict) else None
+            remote_ip   = (
+                resolve_device_primary_ip(remote_dev, session, base, vc_cache)
+                if isinstance(remote_dev, dict)
+                else None
+            )
             remote_iface_name = remote_iface.get("name") if isinstance(remote_iface, dict) else None
 
             yield {
@@ -426,9 +509,12 @@ def run(
 
     log.info("Processing %d device(s)", len(devices))
 
+    # Shared cache so the same VC master is only fetched once across all devices
+    vc_cache: Dict[int, Optional[str]] = {}
+
     connections: List[dict] = []
     for device in devices:
-        for record in _connections_for_device(session, base, device):
+        for record in _connections_for_device(session, base, device, vc_cache):
             connections.append(record)
 
     print(json.dumps(connections, indent=2))

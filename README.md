@@ -15,6 +15,8 @@ classes (`CiscoDeviceClient`, `NetBoxClient`) and two runnable programs.
 | `sync_netbox_interfaces.py` | Interface, VLAN, prefix, LAG, and state sync program |
 | `netbox_update_State.py` | Dedicated interface-state poller — updates `STATE` and `state_change` custom fields |
 | `netbox_cables.py` | CDP-based physical cable discovery and creation |
+| `netbox_ap.py` | CDP-based Cisco Access Point discovery — creates/updates AP devices, interfaces, IPs, and `software_version` in NetBox |
+| `netbox_shoretel.py` | LLDP-based ShoreTel and Mitel IP phone discovery — creates/updates phone devices, interfaces, IPs, cables, and `software_version` / `last_seen` in NetBox |
 | `example_usage.py` | Short usage examples for both classes |
 | `requirements.txt` | Python package dependencies |
 
@@ -1160,4 +1162,539 @@ usage: sync_netbox_interfaces.py [-h]
     --deny-vlan-group-name-substring STR
                              Exclude VLAN groups whose name contains STR
                              (default: internet)
+```
+
+---
+
+## Running `netbox_ap.py`
+
+`netbox_ap.py` discovers Cisco Access Points via **CDP** (`show cdp neighbors
+detail`) on every selected parent Cisco switch and creates or updates the AP
+device records in NetBox.
+
+For each AP found:
+- Creates / updates the **device** (model looked up from NetBox DeviceType)
+- Ensures a single **uplink interface** exists (default `GigabitEthernet0`)
+- Assigns the **management IP** to that interface (longest-matching prefix)
+- Sets `primary_ip4` if not already set
+- Updates the **`software_version`** custom field
+- Updates the **`last_seen`** custom field to the current UTC timestamp
+- Looks up the **MAC address** from the switch MAC-address table and sets
+  `mac_address` + `primary_mac_address` on the uplink interface
+
+**NetBox pre-requisites:**
+- A `DeviceType` must exist in NetBox for every AP model reported by CDP
+  (matched on the `model` or `part_number` field).
+- If any model is missing the script exits non-zero and writes
+  `missing_ap_models.txt` listing every missing model.
+- A device role named **`Access Point`** is created automatically if absent.
+
+Logs go to **stderr**; the JSON result array goes to **stdout**.
+
+---
+
+### Quickstart — credentials from environment variables
+
+**Linux / macOS:**
+```bash
+python netbox_ap.py \
+    --device-filter '{"platform": "iosxe", "status": "active"}'
+```
+
+**Windows PowerShell:**
+```powershell
+$f = '{"platform": "iosxe", "status": "active"}'
+python netbox_ap.py --device-filter $f
+```
+
+### Single parent switch
+
+```bash
+python netbox_ap.py \
+    --device acc-sw-01
+```
+
+### All switches in a site
+
+```bash
+python netbox_ap.py \
+    --site-slug lakeview
+```
+
+### Comma-separated list of switches
+
+```bash
+python netbox_ap.py \
+    --devices "acc-sw-01,acc-sw-02,acc-sw-03"
+```
+
+### Switch list from a file
+
+```bash
+python netbox_ap.py \
+    --device-file /etc/netauto/switches.txt
+```
+
+### Dry-run — discover APs without writing to NetBox
+
+```bash
+python netbox_ap.py \
+    --device acc-sw-01 \
+    --dry-run
+```
+
+Sample dry-run log:
+```
+INFO  netbox_ap: acc-sw-01   Collected CDP neighbors from acc-sw-01
+INFO  netbox_ap: acc-sw-01   12 AP neighbor(s) identified
+INFO  netbox_ap: DRY-RUN  AP ap-floor3-01          model=C9130AXI-B  ip=10.10.3.50  site_id=4  sw_ver=17.9.4
+INFO  netbox_ap: DRY-RUN  AP ap-floor3-02          model=C9120AXI-B  ip=10.10.3.51  site_id=4  sw_ver=17.9.4
+```
+
+### Explicit credentials on the command line
+
+```bash
+python netbox_ap.py \
+    --netbox-url https://netbox.example.org \
+    --netbox-token your-api-token \
+    --username svc-netauto \
+    --password s3cr3t \
+    --enable-secret en4bl3s3cr3t \
+    --device acc-sw-01
+```
+
+### Increase concurrency and verbosity
+
+```bash
+python netbox_ap.py \
+    --device-filter '{"status": "active"}' \
+    --max-workers 10 \
+    --timeout 60 \
+    --log-level DEBUG
+```
+
+### Redirect JSON output to a file
+
+```bash
+python netbox_ap.py \
+    --device-filter '{"status": "active"}' \
+    > ap_report.json
+```
+
+---
+
+### AP output format
+
+One JSON object per **parent switch** is written to stdout:
+
+```json
+[
+  {
+    "device":               "acc-sw-01",
+    "status":               "success",
+    "neighbors_parsed":     24,
+    "aps_discovered":       12,
+    "aps_created":          2,
+    "aps_updated":          9,
+    "aps_skipped":          1,
+    "missing_device_types": [],
+    "aps": [
+      {
+        "name":    "ap-floor3-01",
+        "model":   "C9130AXI-B",
+        "ip":      "10.10.3.50",
+        "action":  "updated",
+        "error":   null,
+        "missing_device_type": false
+      }
+    ],
+    "errors": []
+  }
+]
+```
+
+| Field | Meaning |
+|---|---|
+| `aps_discovered` | AP CDP entries found on this switch |
+| `aps_created` | New AP device records created in NetBox |
+| `aps_updated` | Existing AP records that had at least one field change |
+| `aps_skipped` | AP records that were already up-to-date |
+| `missing_device_types` | Model strings that have no matching NetBox DeviceType |
+
+Useful `jq` filters:
+
+```bash
+# APs that were newly created
+python netbox_ap.py ... | jq '[.[].aps[] | select(.action == "created")]'
+
+# Total APs discovered across all switches
+python netbox_ap.py ... | jq '[.[].aps_discovered] | add'
+
+# Missing DeviceType models (needs pre-creation in NetBox)
+python netbox_ap.py ... | jq '[.[].missing_device_types[]] | unique'
+```
+
+---
+
+### Missing DeviceType models
+
+When CDP reports a model that has no matching `DeviceType` in NetBox the
+script:
+
+1. Logs an ERROR per missing model.
+2. Continues processing all other APs.
+3. Writes `missing_ap_models.txt` in the current directory listing every
+   missing model.
+4. Exits with a non-zero status code.
+
+```
+# missing_ap_models.txt example
+# Missing AP DeviceType models — generated 2026-05-19T14:00:00Z
+C9130AXI-B
+AIR-AP3802I-B-K9
+```
+
+Create a `DeviceType` in NetBox for each listed model (or set its
+`part_number` to match) then re-run.
+
+---
+
+### Virtual chassis support
+
+Pass the **virtual chassis name** and `netbox_ap.py` selects the master
+member automatically for the SSH connection, exactly as
+`sync_netbox_interfaces.py` does.
+
+```bash
+python netbox_ap.py \
+    --device acc-stack-01
+# Log: Virtual chassis 'acc-stack-01' → using member 'acc-stack-01-m1'  ip=10.0.1.5
+```
+
+---
+
+### All `netbox_ap.py` CLI flags
+
+`netbox_ap.py` shares the same parser as `sync_netbox_interfaces.py`.
+All device-selection, credential, and runtime flags are identical:
+
+```
+usage: netbox_ap [-h]
+
+  NetBox connection:
+    --netbox-url URL          NetBox base URL (env: NETBOX_URL)
+    --netbox-token TOKEN      NetBox API token (env: NETBOX_API)
+    --netbox-verify-ssl / --no-netbox-verify-ssl
+
+  Device selection (pick one, or omit for all):
+    --device NAME             Single parent switch name (or VC name)
+    --devices NAME,...        Comma-separated switch names
+    --device-file PATH        File with one switch name per line
+    --device-filter JSON      NetBox DCIM device filter as JSON (default: {})
+    --all                     Explicit "process all" flag
+    --site-slug SLUG          Limit to devices in this site (slug, optional)
+
+  Cisco credentials:
+    --username USER           SSH username (env: CISCO_SRV_ACCOUNT)
+    --password PASS           SSH password (env: CISCO_SRV_PWD)
+    --enable-secret SECRET    Enable secret (env: CISCO_ENABLE_PWD)
+
+  Runtime options:
+    --transport {auto,cli,restconf,netconf}   (default: auto)
+    --dry-run                 Discover only; no NetBox writes
+    --max-workers N           Concurrent threads (default: 5)
+    --timeout SEC             Device timeout seconds (default: 30)
+    --log-level {DEBUG,INFO,WARNING,ERROR}    (default: INFO)
+    --log-file PATH           Also write logs to this file (appended, UTF-8)
+```
+
+---
+
+## Running `netbox_shoretel.py`
+
+`netbox_shoretel.py` discovers **ShoreTel** and **Mitel** IP phones via
+**LLDP** (`show lldp neighbors detail`) on every selected parent Cisco switch
+and creates or updates the phone device records in NetBox.
+
+For each phone found:
+- Creates / updates the **device** with a vendor-specific name and DeviceType
+- Ensures the **`eth0`** interface exists on the phone device
+- Assigns the **management IP** (chassis ID from LLDP) to `eth0`
+- Sets `primary_ip4` if not already set
+- Optionally sets **`mac_address`** and **`primary_mac_address`** on `eth0`
+  from the LLDP port ID field
+- Updates the **`software_version`** custom field
+- Updates the **`last_seen`** custom field to the current UTC timestamp (on
+  every run, both for new and existing devices)
+- Creates a **cable** between the switch port (Local Intf from LLDP) and the
+  phone's `eth0` (never modifies or deletes an existing cable)
+
+**Vendor identification:**
+
+| Vendor | Detection rule | Device name | DeviceType |
+|---|---|---|---|
+| ShoreTel | System Description contains `ShoreTel IP` | `shoretel-<serial_lower>` | `IP480g` (slug `ip480g`) |
+| Mitel | System Name / Description contains `Mitel IP Phone` or MED `Manufacturer: Mitel` | `mitel-<serial_normalized>` | `mitel` (part_number `mitel001`) |
+
+**NetBox pre-requisites:**
+- `DeviceType` with model `IP480g` (slug `ip480g`) for ShoreTel phones.
+- `DeviceType` with model `mitel` and `part_number` `mitel001` for Mitel phones.
+- Missing either DeviceType causes the script to exit non-zero immediately.
+- A device role named **`IP Phone`** is created automatically if absent.
+- Custom fields **`software_version`** and **`last_seen`** must exist on
+  the `dcim.device` object.
+
+Logs go to **stderr**; the JSON result array goes to **stdout**.
+
+---
+
+### Quickstart — credentials from environment variables
+
+**Linux / macOS:**
+```bash
+python netbox_shoretel.py \
+    --device-filter '{"platform": "iosxe", "status": "active"}'
+```
+
+**Windows PowerShell:**
+```powershell
+$f = '{"platform": "iosxe", "status": "active"}'
+python netbox_shoretel.py --device-filter $f
+```
+
+### Single parent switch
+
+```bash
+python netbox_shoretel.py \
+    --device acc-sw-01
+```
+
+### All switches in a site
+
+```bash
+python netbox_shoretel.py \
+    --site-slug lakeview
+```
+
+### Comma-separated list of switches
+
+```bash
+python netbox_shoretel.py \
+    --devices "acc-sw-01,acc-sw-02,acc-sw-03"
+```
+
+### Switch list from a file
+
+```bash
+python netbox_shoretel.py \
+    --device-file /etc/netauto/switches.txt
+```
+
+### Dry-run — discover phones without writing to NetBox
+
+```bash
+python netbox_shoretel.py \
+    --device acc-sw-01 \
+    --dry-run
+```
+
+Sample dry-run log:
+```
+INFO  netbox_shoretel: acc-sw-01  Collected LLDP neighbors from acc-sw-01
+INFO  netbox_shoretel: acc-sw-01  14 phone(s) identified (10 ShoreTel, 4 Mitel)
+INFO  netbox_shoretel: DRY-RUN  [shoretel] shoretel-001049413d4b  serial=001049413D4B  ip=10.173.141.147  sw_ver=804.2002.1100.0
+INFO  netbox_shoretel: DRY-RUN  [mitel]    mitel-08000fd6b36b     serial=08-00-0F-D6-B3-6B  ip=10.173.124.144  sw_ver=5.2.1.1071
+```
+
+### Explicit credentials on the command line
+
+```bash
+python netbox_shoretel.py \
+    --netbox-url https://netbox.example.org \
+    --netbox-token your-api-token \
+    --username svc-netauto \
+    --password s3cr3t \
+    --enable-secret en4bl3s3cr3t \
+    --device acc-sw-01
+```
+
+### Increase concurrency and verbosity
+
+```bash
+python netbox_shoretel.py \
+    --device-filter '{"status": "active"}' \
+    --max-workers 10 \
+    --timeout 60 \
+    --log-level DEBUG
+```
+
+### Redirect JSON output to a file
+
+```bash
+python netbox_shoretel.py \
+    --device-filter '{"status": "active"}' \
+    > phones_report.json
+```
+
+---
+
+### Phone output format
+
+One JSON object per **parent switch** is written to stdout:
+
+```json
+[
+  {
+    "device":            "acc-sw-01",
+    "status":            "success",
+    "neighbors_parsed":  48,
+    "phones_discovered": 14,
+    "phones_created":    3,
+    "phones_updated":    10,
+    "phones_skipped":    1,
+    "cables_created":    3,
+    "phones": [
+      {
+        "vendor":            "shoretel",
+        "name":              "shoretel-001049413d4b",
+        "serial":            "001049413D4B",
+        "ip":                "10.173.141.147",
+        "software_version":  "804.2002.1100.0",
+        "switch_port":       "GigabitEthernet3/0/20",
+        "action":            "updated",
+        "last_seen_updated": true,
+        "cabled":            "skipped",
+        "error":             null
+      },
+      {
+        "vendor":            "mitel",
+        "name":              "mitel-08000fd6b36b",
+        "serial":            "08-00-0F-D6-B3-6B",
+        "ip":                "10.173.124.144",
+        "software_version":  "5.2.1.1071",
+        "switch_port":       "GigabitEthernet2/0/27",
+        "action":            "created",
+        "last_seen_updated": true,
+        "cabled":            "created",
+        "error":             null
+      }
+    ],
+    "errors": []
+  }
+]
+```
+
+| Field | Meaning |
+|---|---|
+| `phones_discovered` | Phone LLDP entries found on this switch |
+| `phones_created` | New phone device records created in NetBox |
+| `phones_updated` | Existing phone records that had at least one field change |
+| `phones_skipped` | Phone records already up-to-date (no changes needed) |
+| `cables_created` | New cables created between switch ports and phone `eth0` interfaces |
+| `cabled` | Per-phone cable result: `"created"`, `"skipped"` (cable already exists), or `"error"` |
+
+Useful `jq` filters:
+
+```bash
+# Phones newly created this run
+python netbox_shoretel.py ... | jq '[.[].phones[] | select(.action == "created")]'
+
+# Total phones discovered across all switches
+python netbox_shoretel.py ... | jq '[.[].phones_discovered] | add'
+
+# All Mitel phones
+python netbox_shoretel.py ... | jq '[.[].phones[] | select(.vendor == "mitel")]'
+
+# Phones where cable creation failed
+python netbox_shoretel.py ... | jq '[.[].phones[] | select(.cabled == "error")]'
+
+# Switches with errors
+python netbox_shoretel.py ... | jq '[.[] | select(.errors | length > 0)]'
+```
+
+---
+
+### Device naming
+
+| Vendor | Source | Example input | Device name in NetBox |
+|---|---|---|---|
+| ShoreTel | `System Name: Serial Number: <serial>` | `001049413D4B` | `shoretel-001049413d4b` |
+| Mitel | MED `Serial number: <value>` | `08-00-0F-D6-B3-6B` | `mitel-08000fd6b36b` |
+| Mitel (no serial) | LLDP Port ID (MAC) | `0800.0fd6.b36b` | `mitel-08000fd6b36b` |
+
+Names are deterministic and idempotent — re-running never creates duplicates.
+
+---
+
+### Software version extraction
+
+| Vendor | Source field | Example |
+|---|---|---|
+| ShoreTel | `Software Version:` in System Description | `804.2002.1100.0` |
+| Mitel | MED `S/W revision:` (preferred) | `5.2.1.1071` |
+| Mitel | MED `F/W revision:` (fallback when S/W absent) | `5.2.1.1071` |
+
+---
+
+### Cable safety
+
+The cable creation follows the same safety guarantees as `netbox_cables.py`:
+
+- If the **switch port** already has a cable → skip, log, continue.
+- If the **phone `eth0`** already has a cable → skip, log, continue.
+- Existing cables are **never modified or deleted**.
+- A `cat6` cable type is used (phones are always copper); if the NetBox
+  instance rejects that slug the creation is retried without a type.
+
+---
+
+### Virtual chassis switch support
+
+When the parent switch is a Virtual Chassis, LLDP reports the local interface
+in expanded form (e.g. `GigabitEthernet3/0/43`).  The script extracts the
+member number from the interface name and looks up the correct VC member
+before creating the cable, so the cable is always terminated on the right
+physical device.
+
+```
+GigabitEthernet1/0/24  →  VC member with vc_position = 1
+GigabitEthernet3/0/43  →  VC member with vc_position = 3
+GigabitEthernet4/0/12  →  VC member with vc_position = 4
+```
+
+---
+
+### All `netbox_shoretel.py` CLI flags
+
+`netbox_shoretel.py` shares the same parser as `sync_netbox_interfaces.py`.
+All device-selection, credential, and runtime flags are identical:
+
+```
+usage: netbox_shoretel [-h]
+
+  NetBox connection:
+    --netbox-url URL          NetBox base URL (env: NETBOX_URL)
+    --netbox-token TOKEN      NetBox API token (env: NETBOX_API)
+    --netbox-verify-ssl / --no-netbox-verify-ssl
+
+  Device selection (pick one, or omit for all):
+    --device NAME             Single parent switch name (or VC name)
+    --devices NAME,...        Comma-separated switch names
+    --device-file PATH        File with one switch name per line
+    --device-filter JSON      NetBox DCIM device filter as JSON (default: {})
+    --all                     Explicit "process all" flag
+    --site-slug SLUG          Limit to devices in this site (slug, optional)
+
+  Cisco credentials:
+    --username USER           SSH username (env: CISCO_SRV_ACCOUNT)
+    --password PASS           SSH password (env: CISCO_SRV_PWD)
+    --enable-secret SECRET    Enable secret (env: CISCO_ENABLE_PWD)
+
+  Runtime options:
+    --transport {auto,cli,restconf,netconf}   (default: auto)
+    --dry-run                 Discover only; no NetBox writes
+    --max-workers N           Concurrent threads (default: 5)
+    --timeout SEC             Device timeout seconds (default: 30)
+    --log-level {DEBUG,INFO,WARNING,ERROR}    (default: INFO)
+    --log-file PATH           Also write logs to this file (appended, UTF-8)
 ```
