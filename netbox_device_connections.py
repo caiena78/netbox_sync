@@ -2,51 +2,45 @@
 """
 netbox_device_connections.py
 ============================
-Export device connection data from NetBox using the custom export template
-``devices_with_connection_stream``.
+For a given Virtual Chassis name or device name, enumerate every cabled
+interface across all matching devices and print one JSON record per
+connection to stdout (NDJSON — one object per line).
 
-Authentication modes
---------------------
-NetBox has two distinct authentication surfaces:
+Output fields per connection
+----------------------------
+  device_name            local device hostname
+  device_primary_ip      local device management IP (no prefix length)
+  interface              local interface name
+  remote_device          remote device hostname
+  remote_device_primary_ip  remote device management IP (no prefix length)
+  remote_interface       remote interface name
 
-  REST API  ``/api/…``       → ``Authorization: Token <token>``   (--netbox-token)
-  UI pages  ``/dcim/…``      → Django session cookie              (--username + --password)
-
-The export template endpoint is a **UI page**.  Passing the token header
-there is silently ignored and NetBox redirects to /login/.
-
-  - If ``--username`` and ``--password`` are supplied:
-    The script POSTs to ``/login/`` to obtain a session cookie, then calls
-    the UI export endpoint — exactly what a browser does.
-
-  - If only ``--netbox-token`` is supplied:
-    The script tries the REST API path (``/api/dcim/devices/?export=…``).
-    This works when the token has export-template permission; if it returns
-    403 a clear message explains how to fix it.
-
-Resolution order (VC vs device)
---------------------------------
-1. Query ``/api/dcim/virtual-chassis/?name=<name>`` (token auth)
-   - Found  → ``?virtual_chassis_id=<id>&export=devices_with_connection_stream``
-   - Missing → ``?q=<name>&export=devices_with_connection_stream``
+Authentication
+--------------
+Token auth only — ``Authorization: Token <token>`` on every request.
+The --username / --password flags are kept for CLI backward-compatibility
+but are not used.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
+from typing import Any, Dict, Iterator, List, Optional
 
 import requests
 
+log = logging.getLogger("netbox_connections")
+
 
 # --------------------------------------------------------------------------- #
-# Session factories                                                            #
+# Session / low-level HTTP                                                     #
 # --------------------------------------------------------------------------- #
 
-def _make_api_session(token: str) -> requests.Session:
-    """Return a session configured for NetBox REST API token auth."""
+def _make_session(token: str) -> requests.Session:
     s = requests.Session()
     s.headers.update({
         "Authorization": f"Token {token}",
@@ -56,266 +50,339 @@ def _make_api_session(token: str) -> requests.Session:
     return s
 
 
-def _make_ui_session(base_url: str, username: str, password: str) -> requests.Session:
+def _get_all(session: requests.Session, url: str, params: Optional[Dict] = None) -> List[dict]:
     """
-    Authenticate via username/password and return a session carrying the
-    resulting Django session cookie.
+    Paginate through a NetBox list endpoint and return every result.
 
-    Mimics exactly what a browser does:
-      GET  /login/  →  obtain csrftoken cookie
-      POST /login/  →  submit credentials  →  receive sessionid cookie
-
-    Raises RuntimeError if login fails.
+    Follows the ``next`` link in the response envelope until it is null.
+    Passes ``limit=0`` by default so NetBox returns the maximum page size;
+    if the server still paginates we handle it transparently.
     """
-    s = requests.Session()
-    s.headers.update({"Accept": "text/html,application/json"})
+    collected: List[dict] = []
+    p = dict(params or {})
+    p.setdefault("limit", 0)
+    next_url: Optional[str] = url
 
-    login_url = f"{base_url}/login/"
+    while next_url:
+        try:
+            resp = session.get(next_url, params=p, timeout=30)
+            resp.raise_for_status()
+        except requests.exceptions.RequestException as exc:
+            log.error("API call failed %s: %s", next_url, exc)
+            break
 
-    # ── Step 1: GET login page to harvest CSRF cookie ─────────────────────
-    try:
-        resp = s.get(login_url, timeout=15)
-        resp.raise_for_status()
-    except requests.exceptions.RequestException as exc:
-        raise RuntimeError(f"Could not reach login page {login_url!r}: {exc}") from exc
-
-    csrf = s.cookies.get("csrftoken")
-    if not csrf:
-        raise RuntimeError(
-            f"No csrftoken cookie from {login_url!r} — check --netbox-url."
-        )
-
-    # ── Step 2: POST credentials ──────────────────────────────────────────
-    try:
-        resp = s.post(
-            login_url,
-            data={
-                "username":            username,
-                "password":            password,
-                "csrfmiddlewaretoken": csrf,
-            },
-            headers={"Referer": login_url},
-            timeout=15,
-            allow_redirects=True,
-        )
-        resp.raise_for_status()
-    except requests.exceptions.RequestException as exc:
-        raise RuntimeError(f"Login POST failed: {exc}") from exc
-
-    # A successful login redirects away from /login/
-    if "/login" in resp.url:
-        raise RuntimeError(
-            "Login failed — NetBox stayed on the login page. "
-            "Check --username and --password."
-        )
-
-    print(f"[INFO] Session auth: logged in as {username!r}", file=sys.stderr)
-    return s
-
-
-# --------------------------------------------------------------------------- #
-# Shared response guard                                                        #
-# --------------------------------------------------------------------------- #
-
-def _assert_json_response(resp: requests.Response, url: str) -> None:
-    """
-    Raise RuntimeError when the response body is HTML rather than JSON.
-
-    Catches two silent failure modes:
-      - NetBox rendered an HTML error page instead of the export.
-      - An intermediate proxy returned an HTML page.
-    """
-    ct         = resp.headers.get("Content-Type", "")
-    body_start = resp.text[:300].lower()
-
-    if "text/html" in ct or "<html" in body_start:
-        raise RuntimeError(
-            f"Received HTML instead of JSON from {url!r}\n"
-            f"  Content-Type : {ct!r}\n"
-            f"  Response URL : {resp.url!r}\n"
-            f"  Hint         : authentication failed or the export template "
-            f"'devices_with_connection_stream' does not exist."
-        )
-
-
-# --------------------------------------------------------------------------- #
-# Virtual chassis lookup (always token / REST API)                             #
-# --------------------------------------------------------------------------- #
-
-def _find_virtual_chassis_id(
-    api_session: requests.Session,
-    base_url: str,
-    name: str,
-) -> int | None:
-    """Return the VC ID for *name*, or None (including on 403)."""
-    url = f"{base_url}/api/dcim/virtual-chassis/"
-    try:
-        resp = api_session.get(url, params={"name": name}, timeout=15)
-
-        if resp.status_code == 403:
-            print(
-                "[INFO] Virtual chassis API returned 403 — token lacks "
-                "list-VC permission; skipping VC lookup.",
-                file=sys.stderr,
-            )
-            return None
-
-        resp.raise_for_status()
         data = resp.json()
-        if data.get("count", 0) > 0:
-            return data["results"][0]["id"]
 
+        # After the first request the pagination links are in the response;
+        # clear params so they are not double-appended on the next URL.
+        p = {}
+
+        if isinstance(data, list):
+            # Some older endpoints return a bare list
+            collected.extend(data)
+            break
+
+        results = data.get("results", [])
+        collected.extend(results)
+        next_url = data.get("next")   # None when we have reached the last page
+
+    return collected
+
+
+def _get_one(session: requests.Session, url: str) -> Optional[dict]:
+    """Fetch a single object by its detail URL; return None on any error."""
+    try:
+        resp = session.get(url, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
     except requests.exceptions.RequestException as exc:
-        print(f"[WARN] Virtual chassis lookup failed: {exc}", file=sys.stderr)
+        log.warning("Could not fetch %s: %s", url, exc)
+        return None
 
+
+# --------------------------------------------------------------------------- #
+# Helpers                                                                      #
+# --------------------------------------------------------------------------- #
+
+def _primary_ip(device: dict) -> Optional[str]:
+    """Return the primary IP address string (without /prefix-length), or None."""
+    for field in ("primary_ip4", "primary_ip6"):
+        ip_obj = device.get(field)
+        if not ip_obj:
+            continue
+        addr = ip_obj.get("address") if isinstance(ip_obj, dict) else str(ip_obj)
+        if addr:
+            return addr.split("/")[0]
+    return None
+
+
+def _id_of(obj: Any) -> Optional[int]:
+    """Extract the integer id from a nested object or bare int."""
+    if isinstance(obj, dict):
+        return obj.get("id")
+    if isinstance(obj, int):
+        return obj
+    return None
+
+
+def _name_of(obj: Any) -> Optional[str]:
+    """Extract the name string from a nested object."""
+    if isinstance(obj, dict):
+        return obj.get("name")
     return None
 
 
 # --------------------------------------------------------------------------- #
-# Export fetch — two paths                                                     #
+# Device resolution                                                            #
 # --------------------------------------------------------------------------- #
 
-def _fetch_export_ui(
-    ui_session: requests.Session,
-    base_url: str,
-    params: dict,
-) -> object:
+def _resolve_devices(
+    session: requests.Session,
+    base: str,
+    name: str,
+) -> List[dict]:
     """
-    Fetch the export via the **UI** endpoint ``/dcim/devices/``.
+    Return the list of NetBox device dicts to process.
 
-    Requires a session cookie obtained from :func:`_make_ui_session`.
-    This is the path that works in a browser.
+    Resolution order
+    ----------------
+    1. GET /api/dcim/virtual-chassis/?name=<name>
+       If found → return all member devices of that VC.
+    2. Else GET /api/dcim/devices/?q=<name>
+       Return all matching device dicts.
     """
-    url = f"{base_url}/dcim/devices/"
-    print(f"[INFO] Export path: UI  ({url})", file=sys.stderr)
-    print(f"[INFO] Params     : {params}",    file=sys.stderr)
-
-    try:
-        resp = ui_session.get(
-            url,
-            params=params,
-            timeout=30,
-            allow_redirects=False,
+    # ── 1. Virtual chassis lookup ─────────────────────────────────────────
+    vc_results = _get_all(session, f"{base}/api/dcim/virtual-chassis/", {"name": name})
+    if vc_results:
+        vc_id = vc_results[0]["id"]
+        vc_name = vc_results[0].get("name", name)
+        log.info("Virtual chassis %r found (id=%s) — loading member devices", vc_name, vc_id)
+        devices = _get_all(
+            session,
+            f"{base}/api/dcim/devices/",
+            {"virtual_chassis_id": vc_id},
         )
-    except requests.exceptions.RequestException as exc:
-        raise RuntimeError(f"Request failed: {exc}") from exc
+        if not devices:
+            log.warning("Virtual chassis id=%s has no member devices", vc_id)
+        return devices
 
-    print(f"[INFO] Status     : {resp.status_code}", file=sys.stderr)
-    print(f"[INFO] Content-Type: {resp.headers.get('Content-Type', '(none)')}", file=sys.stderr)
-
-    if resp.is_redirect or resp.status_code in (301, 302, 303, 307, 308):
-        location = resp.headers.get("Location", "(unknown)")
-        raise RuntimeError(
-            f"NetBox redirected to {location!r} — session auth failed. "
-            "Check --username and --password."
-        )
-
-    resp.raise_for_status()
-    _assert_json_response(resp, url)
-    return resp.json()
+    # ── 2. Device search fallback ─────────────────────────────────────────
+    log.info("No virtual chassis named %r — searching devices (q=%r)", name, name)
+    devices = _get_all(session, f"{base}/api/dcim/devices/", {"q": name})
+    if not devices:
+        log.warning("No devices found matching %r", name)
+    return devices
 
 
-def _fetch_export_api(
-    api_session: requests.Session,
-    base_url: str,
-    params: dict,
-) -> object:
+# --------------------------------------------------------------------------- #
+# Remote endpoint resolution                                                   #
+# --------------------------------------------------------------------------- #
+
+def _resolve_remote_endpoints(
+    session: requests.Session,
+    base: str,
+    iface: dict,
+) -> List[Dict[str, Any]]:
     """
-    Fetch the export via the **REST API** endpoint ``/api/dcim/devices/``.
+    Return a list of ``{device, interface}`` dicts for the remote side(s) of
+    the cable attached to *iface*.
 
-    Works when the token has both ``view_device`` and export-template
-    permissions.  Returns a 403 when the token lacks export permission;
-    the caller should instruct the user to add ``--username``/``--password``
-    or fix the token's permissions.
+    Strategy (in order):
+    1. ``link_peers``          — populated by NetBox 3.3+ on detailed reads
+    2. ``connected_endpoints`` — populated on detailed reads (older field)
+    3. ``connected_endpoint``  — single-object legacy field
+    4. Fetch cable via /api/dcim/cables/<cable_id>/ and walk terminations
+
+    Each returned dict has:
+      ``device``    → NetBox device dict (or None)
+      ``interface`` → NetBox interface dict
     """
-    url = f"{base_url}/api/dcim/devices/"
-    print(f"[INFO] Export path: REST API  ({url})", file=sys.stderr)
-    print(f"[INFO] Params     : {params}",           file=sys.stderr)
+    results: List[Dict[str, Any]] = []
 
-    try:
-        resp = api_session.get(
-            url,
-            params=params,
-            timeout=30,
-            allow_redirects=False,
-        )
-    except requests.exceptions.RequestException as exc:
-        raise RuntimeError(f"Request failed: {exc}") from exc
+    # ── Try link_peers first (most complete, no extra round-trip) ─────────
+    link_peers = iface.get("link_peers") or []
+    if link_peers:
+        for peer in link_peers:
+            if not isinstance(peer, dict):
+                continue
+            obj_type = peer.get("object_type", "") or peer.get("_occupied_url", "")
+            # link_peers entries have a "device" sub-key for interface peers
+            dev = peer.get("device")
+            if dev is not None:
+                results.append({"device": dev, "interface": peer})
+        if results:
+            return results
 
-    print(f"[INFO] Status     : {resp.status_code}", file=sys.stderr)
-    print(f"[INFO] Content-Type: {resp.headers.get('Content-Type', '(none)')}", file=sys.stderr)
+    # ── Try connected_endpoints ───────────────────────────────────────────
+    connected_endpoints = iface.get("connected_endpoints") or []
+    if connected_endpoints:
+        for ep in connected_endpoints:
+            if not isinstance(ep, dict):
+                continue
+            dev = ep.get("device")
+            if dev is not None:
+                results.append({"device": dev, "interface": ep})
+        if results:
+            return results
 
-    if resp.is_redirect or resp.status_code in (301, 302, 303, 307, 308):
-        location = resp.headers.get("Location", "(unknown)")
-        raise RuntimeError(f"Unexpected redirect to {location!r}")
+    # ── Try single connected_endpoint ─────────────────────────────────────
+    ep = iface.get("connected_endpoint")
+    if ep and isinstance(ep, dict) and ep.get("device") is not None:
+        results.append({"device": ep["device"], "interface": ep})
+        return results
 
-    if resp.status_code == 403:
-        raise RuntimeError(
-            "403 Forbidden on the REST API export endpoint.\n"
-            "\n"
-            "The API token is valid but lacks the required permission.\n"
-            "Fix one of the following:\n"
-            "\n"
-            "  Option A — grant the token export-template permission in NetBox\n"
-            "             (Extras → Export Templates → permissions, or via\n"
-            "             token object-permissions in the admin panel).\n"
-            "\n"
-            "  Option B — pass --username and --password to authenticate via\n"
-            "             the UI login page (same as a browser session).\n"
-        )
+    # ── Fall back: walk the cable object ──────────────────────────────────
+    cable_obj = iface.get("cable")
+    if not cable_obj:
+        return results
 
-    resp.raise_for_status()
-    _assert_json_response(resp, url)
-    return resp.json()
+    cable_id = _id_of(cable_obj)
+    if cable_id is None:
+        return results
+
+    cable = _get_one(session, f"{base}/api/dcim/cables/{cable_id}/")
+    if not cable:
+        return results
+
+    local_iface_id = iface.get("id")
+
+    for side in ("a_terminations", "b_terminations"):
+        terminations = cable.get(side) or []
+        for term in terminations:
+            if not isinstance(term, dict):
+                continue
+            obj_type = (term.get("object_type") or "").lower()
+            if "interface" not in obj_type:
+                continue
+            obj_id = _id_of(term.get("object_id") or term.get("object"))
+            if obj_id is None:
+                # object may be inlined
+                obj_id = _id_of(term.get("object"))
+            if obj_id == local_iface_id:
+                continue   # this is the local side
+
+            # Fetch the remote interface to get device info
+            remote_iface = _get_one(session, f"{base}/api/dcim/interfaces/{obj_id}/")
+            if remote_iface:
+                results.append({
+                    "device":    remote_iface.get("device"),
+                    "interface": remote_iface,
+                })
+
+    # Also check if the object itself is embedded in the termination
+    if not results:
+        for side in ("a_terminations", "b_terminations"):
+            terminations = cable.get(side) or []
+            for term in terminations:
+                if not isinstance(term, dict):
+                    continue
+                obj = term.get("object")
+                if not isinstance(obj, dict):
+                    continue
+                if obj.get("id") == local_iface_id:
+                    continue
+                dev = obj.get("device")
+                if dev is not None:
+                    results.append({"device": dev, "interface": obj})
+
+    return results
+
+
+# --------------------------------------------------------------------------- #
+# Per-device connection enumeration                                            #
+# --------------------------------------------------------------------------- #
+
+def _connections_for_device(
+    session: requests.Session,
+    base: str,
+    device: dict,
+) -> Iterator[dict]:
+    """
+    Yield one connection record dict for every cabled interface on *device*.
+    Logs warnings and continues on per-interface errors.
+    """
+    device_id   = device.get("id")
+    device_name = device.get("name") or f"device-{device_id}"
+    device_ip   = _primary_ip(device)
+
+    ifaces = _get_all(
+        session,
+        f"{base}/api/dcim/interfaces/",
+        {"device_id": device_id},
+    )
+    log.info("  %s — %d interface(s)", device_name, len(ifaces))
+
+    for iface in ifaces:
+        # Skip interfaces without a cable
+        if not iface.get("cable"):
+            continue
+
+        iface_name = iface.get("name") or f"iface-{iface.get('id')}"
+
+        try:
+            remotes = _resolve_remote_endpoints(session, base, iface)
+        except Exception as exc:
+            log.warning(
+                "%s / %s — error resolving remote endpoint: %s",
+                device_name, iface_name, exc,
+            )
+            continue
+
+        if not remotes:
+            log.debug("%s / %s — cable present but no remote endpoint resolved", device_name, iface_name)
+            continue
+
+        for remote in remotes:
+            remote_iface  = remote.get("interface") or {}
+            remote_dev    = remote.get("device")
+
+            # remote_dev may be a nested dict on the interface object
+            if remote_dev is None:
+                remote_dev = remote_iface.get("device")
+
+            # If remote_dev is just an ID/URL reference, fetch the full record
+            if isinstance(remote_dev, dict) and "name" not in remote_dev:
+                rd_id = _id_of(remote_dev)
+                if rd_id:
+                    fetched = _get_one(session, f"{base}/api/dcim/devices/{rd_id}/")
+                    if fetched:
+                        remote_dev = fetched
+
+            remote_name   = _name_of(remote_dev)   if isinstance(remote_dev, dict) else None
+            remote_ip     = _primary_ip(remote_dev) if isinstance(remote_dev, dict) else None
+            remote_iface_name = remote_iface.get("name") if isinstance(remote_iface, dict) else None
+
+            yield {
+                "device_name":             device_name,
+                "device_primary_ip":       device_ip,
+                "interface":               iface_name,
+                "remote_device":           remote_name,
+                "remote_device_primary_ip": remote_ip,
+                "remote_interface":        remote_iface_name,
+            }
 
 
 # --------------------------------------------------------------------------- #
 # Main logic                                                                   #
 # --------------------------------------------------------------------------- #
 
-def get_export_data(
-    base_url: str,
-    token: str,
-    name: str,
-    username: str | None = None,
-    password: str | None = None,
-) -> None:
-    api_session = _make_api_session(token)
+def run(base_url: str, token: str, name: str) -> None:
+    session = _make_session(token)
+    base    = base_url.rstrip("/")
 
-    # ── Step 1: resolve VC or fall back to device search ─────────────────
-    vc_id = _find_virtual_chassis_id(api_session, base_url, name)
+    devices = _resolve_devices(session, base, name)
+    if not devices:
+        log.error("No devices resolved for %r — nothing to output.", name)
+        sys.exit(1)
 
-    if vc_id is not None:
-        print(
-            f"[INFO] Virtual chassis {name!r} found (id={vc_id}) — "
-            "querying by virtual_chassis_id",
-            file=sys.stderr,
-        )
-        params = {
-            "virtual_chassis_id": vc_id,
-            "export":             "devices_with_connection_stream",
-        }
-    else:
-        print(
-            f"[INFO] No virtual chassis found for {name!r} — "
-            "falling back to device search (q=)",
-            file=sys.stderr,
-        )
-        params = {
-            "q":      name,
-            "export": "devices_with_connection_stream",
-        }
+    log.info("Processing %d device(s)", len(devices))
 
-    # ── Step 2: fetch export via the appropriate auth path ────────────────
-    if username and password:
-        print("[INFO] Auth mode  : session (username/password)", file=sys.stderr)
-        ui_session = _make_ui_session(base_url, username, password)
-        data = _fetch_export_ui(ui_session, base_url, params)
-    else:
-        print("[INFO] Auth mode  : token (REST API)", file=sys.stderr)
-        data = _fetch_export_api(api_session, base_url, params)
+    connections: List[dict] = []
+    for device in devices:
+        for record in _connections_for_device(session, base, device):
+            connections.append(record)
 
-    print(json.dumps(data, indent=2))
+    print(json.dumps(connections, indent=2))
 
 
 # --------------------------------------------------------------------------- #
@@ -323,13 +390,16 @@ def get_export_data(
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
+    logging.basicConfig(
+        stream=sys.stderr,
+        level=logging.INFO,
+        format="%(levelname)-8s %(message)s",
+    )
+
     parser = argparse.ArgumentParser(
         description=(
-            "Export NetBox device connection data via the "
-            "'devices_with_connection_stream' export template.\n\n"
-            "Authentication:\n"
-            "  Token only (--netbox-token):       uses REST API — requires export permission on token.\n"
-            "  Credentials (--username/--password): uses UI session — same as browser login."
+            "List all cabled interface connections for a NetBox Virtual Chassis "
+            "or device.  Output is a JSON array to stdout."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -342,23 +412,18 @@ def main() -> None:
     parser.add_argument(
         "--netbox-token",
         default=os.environ.get("NETBOX_API", ""),
-        help="NetBox API token — used for VC lookup and (optionally) export  (env: NETBOX_API)",
+        help="NetBox API token  (env: NETBOX_API)",
     )
+    # Kept for CLI backward-compatibility; not used in the REST-API-only flow.
     parser.add_argument(
         "--username",
         default=os.environ.get("NETBOX_USERNAME", ""),
-        help=(
-            "NetBox username for session-based login (env: NETBOX_USERNAME). "
-            "Required when the token lacks export-template permission."
-        ),
+        help="(Unused) NetBox username — kept for backward-compatibility  (env: NETBOX_USERNAME)",
     )
     parser.add_argument(
         "--password",
         default=os.environ.get("NETBOX_PASSWORD", ""),
-        help=(
-            "NetBox password for session-based login (env: NETBOX_PASSWORD). "
-            "Required together with --username."
-        ),
+        help="(Unused) NetBox password — kept for backward-compatibility  (env: NETBOX_PASSWORD)",
     )
     parser.add_argument(
         "--name",
@@ -373,17 +438,11 @@ def main() -> None:
     if not args.netbox_token:
         parser.error("--netbox-token is required (or set NETBOX_API)")
 
-    try:
-        get_export_data(
-            base_url=args.netbox_url.rstrip("/"),
-            token=args.netbox_token,
-            name=args.name,
-            username=args.username or None,
-            password=args.password or None,
-        )
-    except RuntimeError as exc:
-        print(f"[ERROR] {exc}", file=sys.stderr)
-        sys.exit(1)
+    run(
+        base_url=args.netbox_url.rstrip("/"),
+        token=args.netbox_token,
+        name=args.name,
+    )
 
 
 if __name__ == "__main__":
