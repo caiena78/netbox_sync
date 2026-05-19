@@ -1698,3 +1698,191 @@ usage: netbox_shoretel [-h]
     --log-level {DEBUG,INFO,WARNING,ERROR}    (default: INFO)
     --log-file PATH           Also write logs to this file (appended, UTF-8)
 ```
+
+---
+
+## Running `netbox_device_connections.py`
+
+`netbox_device_connections.py` queries NetBox for every cabled interface on a
+device (or all members of a Virtual Chassis) and prints the connection list as
+a JSON array to **stdout**.  No SSH connection is made — all data comes from
+the NetBox REST API.
+
+For each interface that has a cable the output record includes:
+
+| Field | Description |
+|---|---|
+| `device_name` | Local device hostname |
+| `device_primary_ip` | Local device management IP (no prefix length) |
+| `interface` | Local interface name |
+| `remote_device` | Remote device hostname |
+| `remote_device_primary_ip` | Remote device management IP (no prefix length) |
+| `remote_interface` | Remote interface name |
+
+**Authentication** — two modes, tried in this order:
+
+1. **Basic Auth** (`--username` + `--password`) — authenticates as the full
+   user account.  Use this when the API token has restricted object permissions
+   (returns 403 on list endpoints).
+2. **Token Auth** (`--netbox-token` only) — uses `Authorization: Token`.
+   Works when the token's user has unrestricted view permission on devices and
+   interfaces.
+
+Logs go to **stderr** (default level `WARNING` — silent unless something goes
+wrong); the JSON array goes to **stdout**.
+
+---
+
+### Quickstart — credentials from environment variables
+
+```bash
+python netbox_device_connections.py \
+    --name apc4d6.662f.2c60
+```
+
+### Query a Virtual Chassis by name
+
+The script checks for a matching Virtual Chassis first.  If found, all member
+devices are included and their interfaces are enumerated.
+
+```bash
+python netbox_device_connections.py \
+    --name ej-3h3-9300s-6
+```
+
+### Query a single device by name
+
+If no Virtual Chassis matches, the script falls back to a device search.
+
+```bash
+python netbox_device_connections.py \
+    --name acc-sw-01
+```
+
+### Explicit credentials on the command line
+
+```bash
+python netbox_device_connections.py \
+    --netbox-url   https://netbox.example.org \
+    --netbox-token your-api-token \
+    --name         acc-sw-01
+```
+
+### Basic Auth when the token lacks list permissions
+
+```bash
+python netbox_device_connections.py \
+    --netbox-url   https://netbox.example.org \
+    --netbox-token your-api-token \
+    --username     your-netbox-username \
+    --password     your-netbox-password \
+    --name         acc-sw-01
+```
+
+Or via environment variables:
+
+```bash
+export NETBOX_URL=https://netbox.example.org
+export NETBOX_API=your-api-token
+export NETBOX_USERNAME=your-netbox-username
+export NETBOX_PASSWORD=your-netbox-password
+
+python netbox_device_connections.py --name acc-sw-01
+```
+
+### Control log verbosity
+
+By default the script is **silent** (log level `WARNING`) — only errors and
+warnings appear on stderr, keeping stdout clean for JSON piping.  Raise the
+level when you need to see what is happening.
+
+```bash
+# Show device / interface progress (recommended for interactive use)
+python netbox_device_connections.py \
+    --name acc-sw-01 \
+    --log-level INFO
+
+# Show every API call and stub-resolution step (verbose)
+python netbox_device_connections.py \
+    --name acc-sw-01 \
+    --log-level DEBUG
+
+# Completely silent — only JSON on stdout, nothing on stderr
+python netbox_device_connections.py \
+    --name acc-sw-01 \
+    --log-level ERROR
+```
+
+### Redirect JSON output to a file
+
+```bash
+python netbox_device_connections.py \
+    --name ej-3h3-9300s-6 \
+    > connections.json
+```
+
+---
+
+### Output format
+
+```json
+[
+  {
+    "device_name":              "apc4d6.662f.2c60",
+    "device_primary_ip":        "10.254.213.165",
+    "interface":                "GigabitEthernet0",
+    "remote_device":            "ej-3h3-9300s-6(1)",
+    "remote_device_primary_ip": "10.254.213.5",
+    "remote_interface":         "GigabitEthernet1/0/7"
+  },
+  {
+    "device_name":              "acc-sw-01",
+    "device_primary_ip":        "10.10.1.5",
+    "interface":                "GigabitEthernet1/0/1",
+    "remote_device":            "core-rtr-01",
+    "remote_device_primary_ip": "10.10.0.1",
+    "remote_interface":         "GigabitEthernet0/0"
+  }
+]
+```
+
+If a device has no primary IP configured but belongs to a Virtual Chassis,
+the script falls back to the VC master member's primary IP automatically.
+
+Useful `jq` filters:
+
+```bash
+# Connections to a specific remote device
+python netbox_device_connections.py --name acc-sw-01 | \
+    jq '[.[] | select(.remote_device == "core-rtr-01")]'
+
+# All unique remote devices
+python netbox_device_connections.py --name acc-sw-01 | \
+    jq '[.[].remote_device] | unique'
+
+# Total connection count
+python netbox_device_connections.py --name ej-3h3-9300s-6 | jq length
+```
+
+---
+
+### All `netbox_device_connections.py` CLI flags
+
+```
+usage: netbox_device_connections.py [-h]
+
+  NetBox connection:
+    --netbox-url URL          NetBox base URL (env: NETBOX_URL)
+    --netbox-token TOKEN      NetBox API token (env: NETBOX_API)
+
+  Authentication (use when token has restricted permissions):
+    --username USER           NetBox username for Basic Auth (env: NETBOX_USERNAME)
+    --password PASS           NetBox password for Basic Auth (env: NETBOX_PASSWORD)
+
+  Target:
+    --name NAME               Virtual chassis name or device name / search term
+
+  Runtime options:
+    --log-level {DEBUG,INFO,WARNING,ERROR}
+                             Log verbosity on stderr (default: WARNING — silent)
+```

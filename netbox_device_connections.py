@@ -529,12 +529,6 @@ def run(
 # --------------------------------------------------------------------------- #
 
 def main() -> None:
-    logging.basicConfig(
-        stream=sys.stderr,
-        level=logging.INFO,
-        format="%(levelname)-8s %(message)s",
-    )
-
     parser = argparse.ArgumentParser(
         description=(
             "List all cabled interface connections for a NetBox Virtual Chassis "
@@ -574,8 +568,20 @@ def main() -> None:
         required=True,
         help="Virtual chassis name or device name / search term",
     )
+    parser.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        default="WARNING",
+        help="Log verbosity written to stderr (default: WARNING)",
+    )
 
     args = parser.parse_args()
+
+    logging.basicConfig(
+        stream=sys.stderr,
+        level=getattr(logging, args.log_level),
+        format="%(levelname)-8s %(message)s",
+    )
 
     if not args.netbox_url:
         parser.error("--netbox-url is required (or set NETBOX_URL)")
