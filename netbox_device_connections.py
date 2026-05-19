@@ -45,9 +45,9 @@ def _make_session(token: str) -> requests.Session:
         "Accept":        "application/json",
         "Content-Type":  "application/json",
     })
-    # Disable automatic redirect following so we can detect login-page
-    # redirects explicitly rather than silently consuming an HTML response.
-    session.max_redirects = 0
+    # Do NOT set session.max_redirects here — it fires TooManyRedirects even
+    # when a specific request passes allow_redirects=False.  Redirect detection
+    # is handled per-call via allow_redirects=False + status-code inspection.
     return session
 
 
@@ -83,18 +83,32 @@ def _find_virtual_chassis_id(
     """
     Return the NetBox Virtual Chassis ID whose name matches *name*, or None.
 
-    Uses the JSON REST API (``/api/dcim/virtual-chassis/``) where token auth
-    works unconditionally.
+    Uses the JSON REST API (``/api/dcim/virtual-chassis/``).
+
+    A 403 response means the token lacks permission to list virtual chassis —
+    this is treated as "no VC found" so the caller falls back to a device
+    search.  Any other HTTP error is logged as a warning and also returns None.
     """
     url = f"{base_url}/api/dcim/virtual-chassis/"
     try:
         resp = session.get(url, params={"name": name}, timeout=15)
+
+        if resp.status_code == 403:
+            print(
+                "[INFO] Virtual chassis API returned 403 — token lacks "
+                "permission for that endpoint; skipping VC lookup.",
+                file=sys.stderr,
+            )
+            return None
+
         resp.raise_for_status()
         data = resp.json()
         if data.get("count", 0) > 0:
             return data["results"][0]["id"]
+
     except requests.exceptions.RequestException as exc:
         print(f"[WARN] Virtual chassis lookup failed: {exc}", file=sys.stderr)
+
     return None
 
 
