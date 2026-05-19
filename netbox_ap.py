@@ -569,9 +569,12 @@ def update_ap_interface_mac(
     current_iface: Optional[dict] = None,
 ) -> None:
     """
-    PATCH ``mac_address`` and ``primary_mac_address`` on a NetBox interface.
+    Ensure a MAC address object exists in NetBox for *interface_id*, then
+    update both ``mac_address`` (legacy string) and ``primary_mac_address``
+    (FK → dcim.mac_addresses, requires integer ID) on the interface.
 
-    Idempotent — skips the PATCH when both fields already carry *mac*.
+    Uses the same ``ensure_mac_address`` path as ``client_mac_address.py``
+    so that MAC objects are created / reassigned idempotently.
 
     Parameters
     ----------
@@ -581,33 +584,65 @@ def update_ap_interface_mac(
     mac : str
         Lowercase Cisco dotted MAC, e.g. ``"1cd1.e0d2.c774"``.
     current_iface : dict, optional
-        The interface record dict returned by the most recent upsert/fetch.
-        When supplied, used to skip the PATCH if both MAC fields already match.
+        Interface record dict from the most recent upsert/fetch.  When
+        supplied, used to skip both API calls if both MAC fields already
+        carry the correct value (avoids redundant writes on re-runs).
     """
-    def _extract_mac_str(val) -> str:
-        # primary_mac_address may be a nested object {"id": ..., "mac_address": "..."}
+    def _cur_mac_str(val) -> str:
+        # primary_mac_address is a nested object in the API response:
+        # {"id": 123, "mac_address": "AAAA.BBBB.CCCC", ...}
         if isinstance(val, dict):
             return (val.get("mac_address") or "").lower()
         return (val or "").lower()
 
+    mac_lower = mac.lower()
+
+    # Idempotency: skip when both fields already carry the correct MAC.
     if current_iface is not None:
-        cur_mac     = _extract_mac_str(current_iface.get("mac_address"))
-        cur_pri_mac = _extract_mac_str(current_iface.get("primary_mac_address"))
-        if cur_mac == mac and cur_pri_mac == mac:
+        cur_mac     = _cur_mac_str(current_iface.get("mac_address"))
+        cur_pri_mac = _cur_mac_str(current_iface.get("primary_mac_address"))
+        if cur_mac == mac_lower and cur_pri_mac == mac_lower:
             log.debug(
                 "Interface id=%s MAC already %s — skipping update",
                 interface_id, mac,
             )
             return
 
+    # Step 1 — ensure the dcim.mac_addresses object exists and is assigned
+    # to this interface (mirrors the client_mac_address.py workflow).
+    # Returns the MAC record dict which includes its integer "id".
+    try:
+        mac_result = nb.ensure_mac_address(
+            mac=mac,
+            interface_id=interface_id,
+            now_iso=get_current_datetime_iso(),
+            description="Added via netbox_ap.py",
+        )
+    except NetBoxClientError as exc:
+        log.warning(
+            "MAC object ensure failed for interface id=%s (%s): %s",
+            interface_id, mac, exc,
+        )
+        return
+
+    mac_obj_id = mac_result["id"]
+    log.debug(
+        "Interface id=%s  MAC object id=%s  action=%s",
+        interface_id, mac_obj_id, mac_result.get("_action"),
+    )
+
+    # Step 2 — PATCH the interface:
+    #   mac_address         → plain MAC string  (legacy field, accepts string)
+    #   primary_mac_address → integer ID of the dcim.mac_addresses object
+    #                         (FK field; passing a string causes 400 Bad Request)
     try:
         nb.update_interface(interface_id, {
             "mac_address":         mac,
-            "primary_mac_address": mac,
+            "primary_mac_address": mac_obj_id,
         })
         log.info(
-            "Interface id=%s  mac_address + primary_mac_address set to %s",
-            interface_id, mac,
+            "Interface id=%s  mac_address=%s  primary_mac_address id=%s",
+            interface_id, mac, mac_obj_id,
         )
     except NetBoxClientError as exc:
         log.warning(
