@@ -443,6 +443,107 @@ def _resolve_mitel_device_type_id(nb: NetBoxClient) -> Optional[int]:
 # --------------------------------------------------------------------------- #
 
 
+def _iface_member_number(iface_name: str) -> Optional[int]:
+    """
+    Extract the VC stack/member number from a 3-part Cisco interface name.
+
+    Cisco Virtual Chassis interfaces follow the pattern
+    ``<type><member>/<slot>/<port>`` (e.g. ``GigabitEthernet3/0/43``).
+    The leading digit(s) before the first ``/`` are the VC member number.
+
+    2-part interfaces (``GigabitEthernet0/1``) belong to a standalone
+    chassis — they carry no member number and return ``None``.
+
+    Examples
+    --------
+    ``GigabitEthernet3/0/43`` → ``3``
+    ``GigabitEthernet1/0/1``  → ``1``
+    ``GigabitEthernet0/1``    → ``None``
+    """
+    m = re.match(r"^[A-Za-z\-]+(\d+)((?:/\d+)+)$", iface_name)
+    if not m:
+        return None
+    trailing_parts = m.group(2).count("/")   # number of "/" after the first number
+    if trailing_parts < 2:
+        # Only one "/" → 2-part interface (slot/port); no member number
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
+def _resolve_switch_device_for_iface(
+    nb: NetBoxClient,
+    parent_device: dict,
+    iface_name: str,
+) -> int:
+    """
+    Return the NetBox device ID that physically owns *iface_name*.
+
+    Standalone switch
+    -----------------
+    Returns ``parent_device["id"]`` directly — the interface lives on the
+    one device we SSH'd into.
+
+    Virtual Chassis
+    ---------------
+    Cisco VC interfaces encode the member number in the name:
+    ``GigabitEthernet3/0/43`` lives on the member whose ``vc_position`` is 3.
+    We resolve the VC, find that member, and return its device ID.
+
+    Falls back to ``parent_device["id"]`` with a warning when:
+    - The interface name has no extractable member number (2-part names).
+    - The VC member list has no entry matching the member number.
+    - Any API call fails.
+    """
+    parent_id = parent_device.get("id")
+
+    # Only act when the parent device is a VC member
+    vc_field = parent_device.get("virtual_chassis")
+    if not vc_field:
+        return parent_id
+
+    vc_id = vc_field.get("id") if isinstance(vc_field, dict) else int(vc_field)
+    if not vc_id:
+        return parent_id
+
+    member_num = _iface_member_number(iface_name)
+    if member_num is None:
+        log.debug(
+            "Interface %r has no VC member number — using parent device id=%s",
+            iface_name, parent_id,
+        )
+        return parent_id
+
+    try:
+        members = nb.get_virtual_chassis_members(vc_id)
+    except NetBoxClientError as exc:
+        log.warning(
+            "VC member lookup for vc_id=%s failed: %s — using parent device id=%s",
+            vc_id, exc, parent_id,
+        )
+        return parent_id
+
+    target = next(
+        (m for m in members if m.get("vc_position") == member_num),
+        None,
+    )
+    if target:
+        log.debug(
+            "Interface %r → VC member %r (vc_position=%s, device_id=%s)",
+            iface_name, target.get("name"), member_num, target.get("id"),
+        )
+        return target["id"]
+
+    log.warning(
+        "VC vc_id=%s has no member with vc_position=%s for interface %r "
+        "— using parent device id=%s",
+        vc_id, member_num, iface_name, parent_id,
+    )
+    return parent_id
+
+
 def _iface_id_on_device(
     nb: NetBoxClient,
     device_id: int,
@@ -477,7 +578,7 @@ def _iface_id_on_device(
 
 def _ensure_cable(
     nb: NetBoxClient,
-    switch_device_id: int,
+    parent_device: dict,
     switch_iface_name: str,
     phone_iface_id: int,
     phone_name: str,
@@ -485,16 +586,26 @@ def _ensure_cable(
     """
     Create a cable between the switch port and the phone's ``eth0``.
 
+    Handles Virtual Chassis correctly: the interface ``GigabitEthernet3/0/43``
+    belongs to VC member 3, not necessarily to the device we SSH'd into.
+    ``_resolve_switch_device_for_iface`` is called first to find the right
+    member device ID before looking up the interface.
+
     Safety rules (mirrors netbox_cables.py):
     - Never modify or delete an existing cable.
     - Skip if either side already has a cable; log and return "skipped".
     - Returns "created", "skipped", or "error".
     """
+    # Resolve the correct device (VC member or standalone) that owns this port
+    switch_device_id = _resolve_switch_device_for_iface(
+        nb, parent_device, switch_iface_name
+    )
+
     sw_iface_id = _iface_id_on_device(nb, switch_device_id, switch_iface_name)
     if sw_iface_id is None:
         log.warning(
-            "%-30s  cable skip — switch interface %r not found in NetBox",
-            phone_name, switch_iface_name,
+            "%-30s  cable skip — switch interface %r not found on device_id=%s",
+            phone_name, switch_iface_name, switch_device_id,
         )
         return "skipped"
 
@@ -853,17 +964,13 @@ def build_phone_in_netbox(
     # Safety guarantee from netbox_cables.py: never modify or delete an
     # existing cable; skip if either side already has one.
     if local_intf:
-        parent_device_id = parent_device.get("id")
-        if parent_device_id:
-            result["cabled"] = _ensure_cable(
-                nb=nb,
-                switch_device_id=parent_device_id,
-                switch_iface_name=local_intf,
-                phone_iface_id=iface_id,
-                phone_name=phone_name,
-            )
-        else:
-            log.warning("%-30s  no parent device ID — cable skipped", phone_name)
+        result["cabled"] = _ensure_cable(
+            nb=nb,
+            parent_device=parent_device,
+            switch_iface_name=local_intf,
+            phone_iface_id=iface_id,
+            phone_name=phone_name,
+        )
     else:
         log.warning("%-30s  no local_intf in LLDP block — cable skipped", phone_name)
 
