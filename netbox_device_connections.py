@@ -462,13 +462,17 @@ def _connections_for_device(
             if remote_dev is None:
                 remote_dev = remote_iface.get("device")
 
-            # If remote_dev is just an ID/URL reference, fetch the full record
-            if isinstance(remote_dev, dict) and "name" not in remote_dev:
+            # NetBox returns a stub device object on nested fields — it has
+            # id/url/display/name but NOT primary_ip4, virtual_chassis, etc.
+            # Detect stubs by the absence of primary_ip4 and fetch the full
+            # record so IP resolution and VC fallback work correctly.
+            if isinstance(remote_dev, dict) and "primary_ip4" not in remote_dev:
                 rd_id = _id_of(remote_dev)
                 if rd_id:
                     fetched = _get_one(session, f"{base}/api/dcim/devices/{rd_id}/")
                     if fetched:
                         remote_dev = fetched
+                        log.debug("Fetched full device record for %r (id=%s)", remote_dev.get("name"), rd_id)
 
             remote_name = _name_of(remote_dev) if isinstance(remote_dev, dict) else None
             remote_ip   = (
