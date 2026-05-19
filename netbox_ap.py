@@ -410,6 +410,196 @@ def resolve_ip_cidr_from_netbox(
 
 
 # --------------------------------------------------------------------------- #
+# PART 1 — last_seen helpers                                                  #
+# --------------------------------------------------------------------------- #
+
+
+def get_current_datetime_iso() -> str:
+    """Return the current UTC datetime as ISO 8601 with 'Z' suffix."""
+    return datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def update_device_last_seen(nb: NetBoxClient, device_id: int, device_name: str) -> None:
+    """PATCH the device's last_seen custom field to the current UTC datetime."""
+    ts = get_current_datetime_iso()
+    try:
+        nb.update_device_custom_fields(device_id, {"last_seen": ts})
+        log.info("%-30s  last_seen updated to %s", device_name, ts)
+    except NetBoxClientError as exc:
+        log.warning("%-30s  last_seen update failed: %s", device_name, exc)
+
+
+# --------------------------------------------------------------------------- #
+# PART 2 — MAC address table helpers                                           #
+# --------------------------------------------------------------------------- #
+
+_IFACE_PREFIX_MAP: List[tuple] = [
+    (re.compile(r"^GigabitEthernet",     re.IGNORECASE), "Gi"),
+    (re.compile(r"^FastEthernet",        re.IGNORECASE), "Fa"),
+    (re.compile(r"^TenGigabitEthernet",  re.IGNORECASE), "Te"),
+    (re.compile(r"^TwentyFiveGigE",      re.IGNORECASE), "Twe"),
+    (re.compile(r"^FortyGigabitEthernet",re.IGNORECASE), "Fo"),
+    (re.compile(r"^HundredGigE",         re.IGNORECASE), "Hu"),
+    (re.compile(r"^Port-channel",        re.IGNORECASE), "Po"),
+    (re.compile(r"^Ethernet",            re.IGNORECASE), "Et"),
+]
+
+_MAC_DOTTED_RE = re.compile(r"^[0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4}$", re.IGNORECASE)
+_MAC_COLON_RE  = re.compile(
+    r"^([0-9a-f]{2}):([0-9a-f]{2}):([0-9a-f]{2})"
+    r":([0-9a-f]{2}):([0-9a-f]{2}):([0-9a-f]{2})$",
+    re.IGNORECASE,
+)
+_MAC_HYPHEN_RE = re.compile(
+    r"^([0-9a-f]{2})-([0-9a-f]{2})-([0-9a-f]{2})"
+    r"-([0-9a-f]{2})-([0-9a-f]{2})-([0-9a-f]{2})$",
+    re.IGNORECASE,
+)
+
+
+def normalize_to_short_interface(expanded_iface: str) -> str:
+    """
+    Convert an expanded Cisco interface name to short lowercase form.
+
+    Examples:
+        "GigabitEthernet4/0/28" -> "gi4/0/28"
+        "Gi4/0/28"              -> "gi4/0/28"
+    """
+    iface = expanded_iface.strip()
+    for pattern, short in _IFACE_PREFIX_MAP:
+        m = pattern.match(iface)
+        if m:
+            return (short + iface[m.end():]).lower()
+    return iface.lower()
+
+
+def _normalize_mac(mac: str) -> Optional[str]:
+    """
+    Normalise *mac* to lowercase Cisco dotted format (aaaa.bbbb.cccc).
+    Returns None if the string is not a recognisable MAC address.
+    """
+    mac = mac.strip().lower()
+    if _MAC_DOTTED_RE.match(mac):
+        return mac
+    m = _MAC_COLON_RE.match(mac)
+    if m:
+        o = [m.group(i) for i in range(1, 7)]
+        return f"{o[0]}{o[1]}.{o[2]}{o[3]}.{o[4]}{o[5]}"
+    m = _MAC_HYPHEN_RE.match(mac)
+    if m:
+        o = [m.group(i) for i in range(1, 7)]
+        return f"{o[0]}{o[1]}.{o[2]}{o[3]}.{o[4]}{o[5]}"
+    return None
+
+
+def get_switch_mac_table(client) -> dict:
+    """
+    Runs ``show mac address-table dynamic`` and returns a dict mapping
+    short_interface_lower -> mac_lower (one MAC per port, deterministic).
+
+    For ports with multiple MACs the lexicographically lowest is chosen.
+    Returns an empty dict on any collection error (non-fatal).
+    """
+    try:
+        raw = client._cli_connection.send_command("show mac address-table dynamic")
+    except Exception as exc:
+        log.warning("MAC table collection failed: %s", exc)
+        return {}
+
+    port_macs: Dict[str, List[str]] = {}
+    entry_count = 0
+
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if re.match(r"^[-*=\s]+$", stripped):
+            continue
+        if re.search(r"Mac Address Table|Mac Address\s+Type|Protocols", stripped, re.IGNORECASE):
+            continue
+
+        parts = stripped.split()
+        if len(parts) < 3:
+            continue
+
+        # Locate the MAC field (any supported format).
+        mac_idx: Optional[int] = None
+        for i, part in enumerate(parts):
+            if (_MAC_DOTTED_RE.match(part)
+                    or _MAC_COLON_RE.match(part)
+                    or _MAC_HYPHEN_RE.match(part)):
+                mac_idx = i
+                break
+
+        if mac_idx is None:
+            continue
+
+        # Port is always the last field in all common IOS / IOS-XE formats.
+        port_str = parts[-1]
+
+        # Skip CPU and VLAN (SVI) pseudo-ports.
+        if port_str.upper() in ("CPU", "SWITCH", "VLAN"):
+            continue
+        if re.match(r"^(Vl|Vlan)\d+", port_str, re.IGNORECASE):
+            continue
+
+        mac_norm = _normalize_mac(parts[mac_idx])
+        if not mac_norm:
+            continue
+
+        port_key = normalize_to_short_interface(port_str)
+        port_macs.setdefault(port_key, []).append(mac_norm)
+        entry_count += 1
+
+    log.info("MAC table: parsed %d entries across %d port(s)", entry_count, len(port_macs))
+
+    # One deterministic MAC per port: lexicographically lowest.
+    return {port: sorted(macs)[0] for port, macs in port_macs.items()}
+
+
+# --------------------------------------------------------------------------- #
+# PART 3 — AP interface MAC update                                             #
+# --------------------------------------------------------------------------- #
+
+
+def update_ap_interface_mac(
+    nb: NetBoxClient,
+    ap_device_id: int,
+    ap_iface_name: str,
+    mac: str,
+) -> None:
+    """PATCH the ``mac_address`` field on the named AP interface in NetBox."""
+    try:
+        all_ifaces = nb.get_interfaces(device_id=ap_device_id)
+    except NetBoxClientError as exc:
+        log.warning(
+            "MAC update: failed to fetch interfaces for device_id=%s: %s",
+            ap_device_id, exc,
+        )
+        return
+
+    match = next((i for i in all_ifaces if i.get("name") == ap_iface_name), None)
+    if match is None:
+        log.warning(
+            "MAC update: interface %r not found on device_id=%s",
+            ap_iface_name, ap_device_id,
+        )
+        return
+
+    try:
+        nb.update_interface(match["id"], {"mac_address": mac})
+        log.info(
+            "Interface %r (id=%s) mac_address set to %s",
+            ap_iface_name, match["id"], mac,
+        )
+    except NetBoxClientError as exc:
+        log.warning(
+            "MAC update failed for interface %r (id=%s): %s",
+            ap_iface_name, match["id"], exc,
+        )
+
+
+# --------------------------------------------------------------------------- #
 # NetBox pre-flight helpers                                                    #
 # --------------------------------------------------------------------------- #
 
@@ -479,6 +669,7 @@ def _build_ap_in_netbox(
     role_id: int,
     dry_run: bool,
     prefix_cache: Optional[Dict[str, str]] = None,
+    mac_table: Optional[Dict[str, str]] = None,
 ) -> dict:
     """
     Create or update one AP's NetBox representation.
@@ -602,6 +793,9 @@ def _build_ap_in_netbox(
         log.error("%-30s  device upsert failed: %s", ap_name, exc)
         return result
 
+    # ── PART 1: always refresh last_seen custom field ─────────────────────
+    update_device_last_seen(nb, ap_device_id, ap_name)
+
     # ── REQ 1: update software_version custom field (idempotent) ─────────
     if software_version is not None:
         old_sw_ver = (dev_result.get("custom_fields") or {}).get("software_version")
@@ -646,6 +840,27 @@ def _build_ap_in_netbox(
         log.warning("%-30s  interface upsert failed: %s", ap_name, exc)
         result["error"] = f"interface: {exc}"
         return result
+
+    # ── PART 3: lookup MAC via switch port and update AP interface ────────
+    if mac_table:
+        cdp_local_iface = neighbor.get("local_interface") or ""
+        short_key       = normalize_to_short_interface(cdp_local_iface) if cdp_local_iface else ""
+        log.debug(
+            "%-30s  MAC lookup — CDP local iface=%r  short_key=%r",
+            ap_name, cdp_local_iface, short_key,
+        )
+        if short_key and short_key in mac_table:
+            found_mac = mac_table[short_key]
+            log.info(
+                "%-30s  MAC found (%s) for switch port %r — updating AP iface %r",
+                ap_name, found_mac, short_key, ap_port,
+            )
+            update_ap_interface_mac(nb, ap_device_id, ap_port, found_mac)
+        else:
+            log.warning(
+                "%-30s  MAC not found in table for switch port %r (CDP local=%r)",
+                ap_name, short_key, cdp_local_iface,
+            )
 
     # ── REQ 2: assign management IP using longest-match prefix ────────────
     if ip_str:
@@ -770,10 +985,14 @@ def process_device(
     )
     cisco.transport = args.transport
 
-    # ── Run CDP ───────────────────────────────────────────────────────────
+    # ── Run CDP + collect MAC table (single SSH session) ─────────────────
+    mac_table: Dict[str, str] = {}
     try:
         cisco._cli_connect()
         raw_cdp: str = cisco._cli_connection.send_command("show cdp n d")
+        # PART 2: build MAC hash while still connected
+        mac_table = get_switch_mac_table(cisco)
+        log.info("%-30s  MAC table: %d port(s) indexed", device_name, len(mac_table))
     except Exception as exc:
         summary["errors"].append(f"CDP collection failed: {exc}")
         log.error("%-30s  CDP collection failed: %s", device_name, exc)
@@ -847,6 +1066,7 @@ def process_device(
                 role_id=role_id,
                 dry_run=args.dry_run,
                 prefix_cache=prefix_cache,
+                mac_table=mac_table,
             )
         except Exception as exc:
             ap_result = {
