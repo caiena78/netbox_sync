@@ -76,8 +76,8 @@ def main():
         description="Fetch NetBox device export by virtual chassis or device name"
     )
 
-    parser.add_argument("--netbox-url", required=True, default=os.environ.get("NETBOX_URL", "") , help="NetBox base URL (no trailing slash)")
-    parser.add_argument("--netbox-token", required=True,  default=os.environ.get("NETBOX_API", ""), help="NetBox API token")
+    parser.add_argument("--netbox-url", required=False, default=os.environ.get("NETBOX_URL", "") , help="NetBox base URL (no trailing slash)")
+    parser.add_argument("--netbox-token", required=False,  default=os.environ.get("NETBOX_API", ""), help="NetBox API token")
     parser.add_argument("--name", required=True, help="Virtual chassis name OR device name")
 
     args = parser.parse_args()
