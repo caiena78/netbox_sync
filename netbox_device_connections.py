@@ -3,23 +3,32 @@
 netbox_device_connections.py
 ============================
 For a given Virtual Chassis name or device name, enumerate every cabled
-interface across all matching devices and print one JSON record per
-connection to stdout (NDJSON — one object per line).
+interface across all matching devices and print one JSON array to stdout.
 
 Output fields per connection
 ----------------------------
-  device_name            local device hostname
-  device_primary_ip      local device management IP (no prefix length)
-  interface              local interface name
-  remote_device          remote device hostname
+  device_name               local device hostname
+  device_primary_ip         local device management IP (no prefix length)
+  interface                 local interface name
+  remote_device             remote device hostname
   remote_device_primary_ip  remote device management IP (no prefix length)
-  remote_interface       remote interface name
+  remote_interface          remote interface name
 
 Authentication
 --------------
-Token auth only — ``Authorization: Token <token>`` on every request.
-The --username / --password flags are kept for CLI backward-compatibility
-but are not used.
+Two modes, tried in this order:
+
+  1. Basic Auth (--username + --password)
+     Authenticates as the interactive user account — carries the same full
+     permissions the browser session uses.  Preferred when the API token has
+     restricted object permissions (returns 403 on list endpoints).
+
+  2. Token Auth (--netbox-token only)
+     Uses ``Authorization: Token <token>``.  Works when the token's user has
+     unrestricted view permissions on dcim.device and dcim.virtualchassis.
+
+If only the token is supplied and API calls return 403, re-run with
+--username / --password to use the account's full permissions.
 """
 
 from __future__ import annotations
@@ -40,13 +49,36 @@ log = logging.getLogger("netbox_connections")
 # Session / low-level HTTP                                                     #
 # --------------------------------------------------------------------------- #
 
-def _make_session(token: str) -> requests.Session:
+def _make_session(
+    token: str,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+) -> requests.Session:
+    """
+    Build a requests Session for NetBox REST API calls.
+
+    Authentication priority
+    -----------------------
+    1. If *username* AND *password* are supplied → HTTP Basic Auth.
+       This runs under the user account's full object permissions, which
+       matches what a browser session sees.  Use this when the API token
+       has restricted permissions (403 on list endpoints).
+
+    2. Token only → ``Authorization: Token <token>``.
+    """
     s = requests.Session()
     s.headers.update({
-        "Authorization": f"Token {token}",
-        "Accept":        "application/json",
-        "Content-Type":  "application/json",
+        "Accept":       "application/json",
+        "Content-Type": "application/json",
     })
+
+    if username and password:
+        s.auth = (username, password)
+        log.info("Auth mode: Basic Auth (username=%r)", username)
+    else:
+        s.headers["Authorization"] = f"Token {token}"
+        log.info("Auth mode: Token")
+
     return s
 
 
@@ -66,6 +98,17 @@ def _get_all(session: requests.Session, url: str, params: Optional[Dict] = None)
     while next_url:
         try:
             resp = session.get(next_url, params=p, timeout=30)
+
+            if resp.status_code == 403:
+                log.error(
+                    "403 Forbidden: %s\n"
+                    "  The current credentials lack permission for this endpoint.\n"
+                    "  If you are using --netbox-token only, re-run with\n"
+                    "  --username and --password to authenticate as the full user account.",
+                    next_url,
+                )
+                break
+
             resp.raise_for_status()
         except requests.exceptions.RequestException as exc:
             log.error("API call failed %s: %s", next_url, exc)
@@ -366,8 +409,14 @@ def _connections_for_device(
 # Main logic                                                                   #
 # --------------------------------------------------------------------------- #
 
-def run(base_url: str, token: str, name: str) -> None:
-    session = _make_session(token)
+def run(
+    base_url: str,
+    token: str,
+    name: str,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+) -> None:
+    session = _make_session(token, username=username, password=password)
     base    = base_url.rstrip("/")
 
     devices = _resolve_devices(session, base, name)
@@ -414,16 +463,21 @@ def main() -> None:
         default=os.environ.get("NETBOX_API", ""),
         help="NetBox API token  (env: NETBOX_API)",
     )
-    # Kept for CLI backward-compatibility; not used in the REST-API-only flow.
     parser.add_argument(
         "--username",
         default=os.environ.get("NETBOX_USERNAME", ""),
-        help="(Unused) NetBox username — kept for backward-compatibility  (env: NETBOX_USERNAME)",
+        help=(
+            "NetBox username for Basic Auth on the REST API  (env: NETBOX_USERNAME). "
+            "Use when the API token has restricted permissions (403 on list endpoints)."
+        ),
     )
     parser.add_argument(
         "--password",
         default=os.environ.get("NETBOX_PASSWORD", ""),
-        help="(Unused) NetBox password — kept for backward-compatibility  (env: NETBOX_PASSWORD)",
+        help=(
+            "NetBox password for Basic Auth on the REST API  (env: NETBOX_PASSWORD). "
+            "Required together with --username."
+        ),
     )
     parser.add_argument(
         "--name",
@@ -442,6 +496,8 @@ def main() -> None:
         base_url=args.netbox_url.rstrip("/"),
         token=args.netbox_token,
         name=args.name,
+        username=args.username or None,
+        password=args.password or None,
     )
 
 
