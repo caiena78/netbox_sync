@@ -448,12 +448,26 @@ def _iface_id_on_device(
     device_id: int,
     iface_name: str,
 ) -> Optional[int]:
-    """Return the NetBox interface ID for *iface_name* on *device_id*, or None."""
+    """
+    Return the NetBox interface ID for *iface_name* on *device_id*, or None.
+
+    Uses a direct server-side filter (device_id + name) so the result is
+    exact and does not depend on fetching every interface on the device then
+    doing a Python-side string comparison — which silently misses when the
+    full interface list is large or when _to_dict() serialises the name field
+    in an unexpected way.  This mirrors the pattern used in
+    client_mac_address.py.
+    """
     try:
-        ifaces = nb.get_interfaces(device_id=device_id)
-        match = next((i for i in ifaces if i.get("name") == iface_name), None)
-        return match["id"] if match else None
-    except NetBoxClientError as exc:
+        recs = list(nb.nb.dcim.interfaces.filter(device_id=device_id, name=iface_name))
+        if recs:
+            return recs[0].id
+        log.warning(
+            "Interface %r not found on device_id=%s in NetBox",
+            iface_name, device_id,
+        )
+        return None
+    except Exception as exc:
         log.warning(
             "Interface lookup failed device_id=%s iface=%r: %s",
             device_id, iface_name, exc,
