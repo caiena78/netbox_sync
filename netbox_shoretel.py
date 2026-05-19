@@ -2,26 +2,34 @@
 """
 netbox_shoretel.py
 ==================
-Discover ShoreTel IP phones via LLDP on Cisco switches and model them in NetBox.
+Discover ShoreTel and Mitel IP phones via LLDP on Cisco switches and model
+them in NetBox.
 
 For each selected parent Cisco switch the script:
 
 1. Connects via SSH and runs ``show lldp neighbors detail``.
 2. Parses every LLDP block and extracts: local interface, chassis ID (IP),
    port ID (MAC), serial number, and software version.
-3. Filters to ShoreTel phones only (System Description contains "ShoreTel IP").
+3. Filters to ShoreTel phones (System Description contains "ShoreTel IP") AND
+   Mitel phones (System Name / Description contains "Mitel IP Phone" or
+   MED Manufacturer: Mitel).
 4. For each phone:
-   a. Normalises the device name to "shoretel-<serial_lower>".
-   b. Verifies the required DeviceType (IP480g) exists in NetBox (fatal if missing).
+   a. Normalises the device name deterministically:
+      - ShoreTel: ``"shoretel-<serial_lower>"``
+      - Mitel:    ``"mitel-<normalized_serial>"`` (hyphens/colons stripped)
+   b. Verifies the required DeviceType exists in NetBox (fatal if missing):
+      - ShoreTel → model ``"IP480g"`` (slug ``ip480g``)
+      - Mitel    → model ``"mitel"``  (part_number ``mitel001``)
    c. Idempotently creates or updates the phone device record.
-   d. Updates the ``software_version`` custom field.
-   e. Ensures the ``eth0`` interface exists on the phone device.
-   f. Resolves the chassis-ID IP to the longest-matching NetBox prefix and
+   d. Updates ``custom_fields.software_version``.
+   e. Updates ``custom_fields.last_seen`` to current UTC datetime (always).
+   f. Ensures the ``eth0`` interface exists on the phone device.
+   g. Resolves the chassis-ID IP to the longest-matching NetBox prefix and
       assigns the CIDR to ``eth0``.
-   g. Sets ``primary_ip4`` if not already set.
-   h. Creates a cable between the switch port and ``eth0`` when neither side
+   h. Sets ``primary_ip4`` if not already set.
+   i. Creates a cable between the switch port and ``eth0`` when neither side
       already has a cable (never modifies or deletes an existing cable).
-   i. Optionally sets ``mac_address`` / ``primary_mac_address`` on ``eth0``
+   j. Optionally sets ``mac_address`` / ``primary_mac_address`` on ``eth0``
       when a port-id MAC is found in the LLDP block.
 
 All CLI flags are shared with ``sync_netbox_interfaces.py`` via the same
@@ -32,11 +40,11 @@ Output
 ------
 JSON array to **stdout** (one element per parent switch); all logs to **stderr**.
 
-DeviceType pre-requisite
-------------------------
-A DeviceType with model ``"IP480g"`` (slug ``"ip480g"``) **must** exist in
-NetBox before running this script.  If it is missing the script exits non-zero
-and prints the missing model.
+DeviceType pre-requisites
+-------------------------
+ShoreTel: DeviceType with model ``"IP480g"`` (slug ``ip480g``) must exist.
+Mitel:    DeviceType with model ``"mitel"`` (part_number ``mitel001``) must exist.
+Both are validated at startup; a missing DeviceType exits non-zero.
 
 Phone role
 ----------
@@ -75,13 +83,20 @@ from sync_netbox_interfaces import (
 # Constants                                                                    #
 # --------------------------------------------------------------------------- #
 
-_PHONE_ROLE_NAME          = "IP Phone"
-_PHONE_ROLE_COLOR         = "9c27b0"   # purple
-_PHONE_DEVICE_TYPE_MODEL  = "IP480g"
-_PHONE_IFACE_NAME         = "eth0"
-_PHONE_IFACE_TYPE         = "1000base-t"
-_SHORETEL_MANUFACTURER    = "ShoreTel"
-_PHONE_CABLE_TYPE         = "cat6"     # phones are always copper
+_PHONE_ROLE_NAME                = "IP Phone"
+_PHONE_ROLE_COLOR               = "9c27b0"   # purple
+_PHONE_IFACE_NAME               = "eth0"
+_PHONE_IFACE_TYPE               = "1000base-t"
+_PHONE_CABLE_TYPE               = "cat6"     # phones are always copper
+
+# ShoreTel
+_SHORETEL_DEVICE_TYPE_MODEL     = "IP480g"
+_SHORETEL_MANUFACTURER          = "ShoreTel"
+
+# Mitel
+_MITEL_DEVICE_TYPE_MODEL        = "mitel"
+_MITEL_DEVICE_TYPE_PART_NUMBER  = "mitel001"
+_MITEL_MANUFACTURER             = "Mitel"
 
 log = logging.getLogger("netbox_shoretel")
 
@@ -105,8 +120,22 @@ _SYS_NAME_RE = re.compile(
 )
 # "Serial Number: 001049413D4B" may appear inside the System Name field
 _SERIAL_RE = re.compile(r"Serial\s+Number\s*:\s*(\S+)", re.IGNORECASE)
-# Software Version extracted from the System Description line
+# Software Version extracted from the System Description line (ShoreTel)
 _SW_VER_RE = re.compile(r"Software\s+Version\s*:\s*(\S+)", re.IGNORECASE)
+
+# MED section fields (Mitel phones)
+# "    S/W revision: 5.2.1.1071"
+_MED_SW_REV_RE = re.compile(r"S/W\s+revision\s*:\s*(\S+)", re.IGNORECASE)
+# "    F/W revision: 5.2.1.1071"
+_MED_FW_REV_RE = re.compile(r"F/W\s+revision\s*:\s*(\S+)", re.IGNORECASE)
+# "    Serial number: 08-00-0F-D6-B3-6B"
+_MED_SERIAL_RE = re.compile(
+    r"^\s*Serial\s+number\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE
+)
+# "    Manufacturer: Mitel"
+_MED_MANUF_RE = re.compile(
+    r"^\s*Manufacturer\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE
+)
 
 
 def _extract_sys_description(block: str) -> str:
@@ -171,9 +200,12 @@ def parse_lldp_neighbors_detail(raw: str) -> List[dict]:
                 "local_intf":       str,          # e.g. "GigabitEthernet3/0/20"
                 "chassis_id":       str | None,   # chassis IP
                 "port_id":          str | None,   # phone MAC (dotted lower)
-                "serial":           str | None,   # e.g. "001049413D4B"
-                "software_version": str | None,   # e.g. "804.2002.1100.0"
+                "serial":           str | None,   # raw serial as-is
+                "software_version": str | None,   # version string
                 "is_shoretel":      bool,
+                "is_mitel":         bool,
+                "is_phone":         bool,         # True when either vendor matched
+                "vendor":           str | None,   # "shoretel" | "mitel" | None
             }
     """
     blocks: List[str] = _LLDP_BLOCK_SEP_RE.split(raw)
@@ -207,24 +239,66 @@ def parse_lldp_neighbors_detail(raw: str) -> List[dict]:
         if m:
             port_id = m.group(1).strip().lower()
 
-        # ── Serial number (from "System Name: Serial Number: <serial>") ──
-        serial: Optional[str] = None
+        # ── System Name raw value (used for both vendors' detection) ──────
+        sys_name_val: str = ""
         m = _SYS_NAME_RE.search(block)
         if m:
             sys_name_val = m.group(1).strip()
-            sm = _SERIAL_RE.search(sys_name_val)
-            if sm:
-                serial = sm.group(1).strip()
 
         # ── System Description ────────────────────────────────────────────
         sys_desc = _extract_sys_description(block)
+
+        # ── Vendor detection (ShoreTel wins on conflict — very unlikely) ──
         is_shoretel = bool(re.search(r"ShoreTel\s+IP", sys_desc, re.IGNORECASE))
 
+        # Mitel: System Name OR System Description contains "Mitel IP Phone"
+        # OR MED section has "Manufacturer: Mitel"
+        med_manufacturer: str = ""
+        m_manuf = _MED_MANUF_RE.search(block)
+        if m_manuf:
+            med_manufacturer = m_manuf.group(1).strip()
+        is_mitel = (
+            not is_shoretel
+            and bool(
+                re.search(r"Mitel\s+IP\s+Phone", sys_name_val, re.IGNORECASE)
+                or re.search(r"Mitel\s+IP\s+Phone", sys_desc, re.IGNORECASE)
+                or re.search(r"^mitel$", med_manufacturer, re.IGNORECASE)
+            )
+        )
+
+        vendor: Optional[str] = (
+            "shoretel" if is_shoretel else ("mitel" if is_mitel else None)
+        )
+
+        # ── Serial number ─────────────────────────────────────────────────
+        # ShoreTel: "System Name: Serial Number: 001049413D4B"
+        # Mitel:    MED "Serial number: 08-00-0F-D6-B3-6B"
+        serial: Optional[str] = None
+        if is_shoretel:
+            sm = _SERIAL_RE.search(sys_name_val)
+            if sm:
+                serial = sm.group(1).strip()
+        elif is_mitel:
+            m_ser = _MED_SERIAL_RE.search(block)
+            if m_ser:
+                serial = m_ser.group(1).strip()
+
         # ── Software version ──────────────────────────────────────────────
+        # ShoreTel: "Software Version: 804.2002.1100.0" in System Description
+        # Mitel:    MED "S/W revision:" preferred over "F/W revision:"
         software_version: Optional[str] = None
-        m = _SW_VER_RE.search(sys_desc)
-        if m:
-            software_version = m.group(1).strip()
+        if is_shoretel:
+            m = _SW_VER_RE.search(sys_desc)
+            if m:
+                software_version = m.group(1).strip()
+        elif is_mitel:
+            m_sw = _MED_SW_REV_RE.search(block)
+            if m_sw:
+                software_version = m_sw.group(1).strip()
+            else:
+                m_fw = _MED_FW_REV_RE.search(block)
+                if m_fw:
+                    software_version = m_fw.group(1).strip()
 
         neighbors.append({
             "local_intf_raw":   local_intf_raw,
@@ -234,6 +308,9 @@ def parse_lldp_neighbors_detail(raw: str) -> List[dict]:
             "serial":           serial,
             "software_version": software_version,
             "is_shoretel":      is_shoretel,
+            "is_mitel":         is_mitel,
+            "is_phone":         is_shoretel or is_mitel,
+            "vendor":           vendor,
         })
 
     return neighbors
@@ -315,20 +392,49 @@ def _resolve_role_id(nb: NetBoxClient) -> int:
     return role["id"]
 
 
-def _resolve_device_type_id(nb: NetBoxClient) -> Optional[int]:
+def _normalize_mitel_serial(raw: str) -> str:
     """
-    Return the NetBox DeviceType ID for ``IP480g``, or ``None`` when missing.
+    Return a slug-safe identifier from a Mitel serial number or MAC.
 
-    Unlike ``netbox_ap.py`` which discovers models dynamically, all ShoreTel
-    phones use the same fixed DeviceType so we look it up once at startup.
+    Lowercases the string and strips hyphens, colons, and dots so that both
+    "08-00-0F-D6-B3-6B" and "0800.0fd6.b36b" normalise to "08000fd6b36b".
     """
-    dt = nb.get_device_type_by_model(_PHONE_DEVICE_TYPE_MODEL)
+    return re.sub(r"[:\-.]", "", raw).lower()
+
+
+def _resolve_device_type_id(nb: NetBoxClient) -> Optional[int]:
+    """Return the NetBox DeviceType ID for ``IP480g`` (ShoreTel), or None."""
+    dt = nb.get_device_type_by_model(_SHORETEL_DEVICE_TYPE_MODEL)
     if not dt:
         log.error(
             "ERROR: Missing NetBox DeviceType for ShoreTel model: %s",
-            _PHONE_DEVICE_TYPE_MODEL,
+            _SHORETEL_DEVICE_TYPE_MODEL,
         )
         return None
+    return dt["id"]
+
+
+def _resolve_mitel_device_type_id(nb: NetBoxClient) -> Optional[int]:
+    """
+    Return the NetBox DeviceType ID for the Mitel phone DeviceType, or None.
+
+    Looks up by model name ``"mitel"``.  If the DeviceType is found, validates
+    that its ``part_number`` equals ``"mitel001"`` and logs a warning on
+    mismatch (continues anyway — the caller decides whether to abort).
+    """
+    dt = nb.get_device_type_by_model(_MITEL_DEVICE_TYPE_MODEL)
+    if not dt:
+        log.error(
+            "ERROR: Missing NetBox DeviceType for Mitel model: %s",
+            _MITEL_DEVICE_TYPE_MODEL,
+        )
+        return None
+    pn = dt.get("part_number") or ""
+    if pn != _MITEL_DEVICE_TYPE_PART_NUMBER:
+        log.warning(
+            "Mitel DeviceType %r has part_number=%r; expected %r — proceeding anyway",
+            _MITEL_DEVICE_TYPE_MODEL, pn, _MITEL_DEVICE_TYPE_PART_NUMBER,
+        )
     return dt["id"]
 
 
@@ -449,6 +555,29 @@ def _get_current_datetime_iso() -> str:
     return datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _update_device_last_seen(
+    nb: NetBoxClient,
+    device_id: int,
+    device_name: str,
+) -> bool:
+    """
+    PATCH the device's ``last_seen`` custom field to the current UTC datetime.
+
+    Called after every device create or verify so the field is always fresh.
+    Mirrors ``update_device_last_seen`` in ``netbox_ap.py``.
+
+    Returns ``True`` on success, ``False`` on API failure (non-fatal).
+    """
+    ts = _get_current_datetime_iso()
+    try:
+        nb.update_device_custom_fields(device_id, {"last_seen": ts})
+        log.info("%-30s  last_seen updated to %s", device_name, ts)
+        return True
+    except NetBoxClientError as exc:
+        log.warning("%-30s  last_seen update failed: %s", device_name, exc)
+        return False
+
+
 def _update_phone_iface_mac(
     nb: NetBoxClient,
     interface_id: int,
@@ -519,10 +648,11 @@ def build_phone_in_netbox(
     role_id: int,
     device_type_id: int,
     dry_run: bool,
+    vendor: str = "shoretel",
     prefix_cache: Optional[Dict[str, str]] = None,
 ) -> dict:
     """
-    Create or update one ShoreTel phone's NetBox representation.
+    Create or update one phone's (ShoreTel or Mitel) NetBox representation.
 
     Parameters
     ----------
@@ -534,32 +664,45 @@ def build_phone_in_netbox(
     role_id : int
         NetBox DeviceRole ID for ``"IP Phone"``.
     device_type_id : int
-        NetBox DeviceType ID for ``IP480g``.
+        NetBox DeviceType ID (IP480g for ShoreTel, mitel for Mitel).
     dry_run : bool
+    vendor : str
+        ``"shoretel"`` or ``"mitel"``.
     prefix_cache : dict, optional
         Shared ``{ip_str: cidr}`` cache for the current parent-device pass.
 
     Returns
     -------
     dict
-        Summary with keys: name, ip, serial, action, cabled, error.
+        Summary with keys: vendor, name, serial, ip, software_version,
+        switch_port, action, last_seen_updated, cabled, error.
     """
-    serial        = neighbor.get("serial")
-    chassis_id    = neighbor.get("chassis_id")
-    local_intf    = neighbor.get("local_intf")
-    sw_ver        = neighbor.get("software_version")
-    port_id_mac   = neighbor.get("port_id")
+    serial      = neighbor.get("serial")
+    chassis_id  = neighbor.get("chassis_id")
+    local_intf  = neighbor.get("local_intf")
+    sw_ver      = neighbor.get("software_version")
+    port_id_mac = neighbor.get("port_id")
 
-    # Device name: "shoretel-<serial_lower>"
-    phone_name = f"shoretel-{serial.lower()}"
+    # ── Deterministic device name based on vendor ─────────────────────────
+    if vendor == "mitel":
+        # Prefer serial; fall back to port_id (MAC) if serial is absent
+        name_src = serial or port_id_mac or ""
+        phone_name = f"mitel-{_normalize_mitel_serial(name_src)}"
+    else:
+        # ShoreTel: serial is already validated as present by the caller
+        phone_name = f"shoretel-{serial.lower()}"
 
     result: dict = {
-        "name":    phone_name,
-        "serial":  serial,
-        "ip":      chassis_id,
-        "action":  "skipped",
-        "cabled":  "skipped",
-        "error":   None,
+        "vendor":            vendor,
+        "name":              phone_name,
+        "serial":            serial,
+        "ip":                chassis_id,
+        "software_version":  sw_ver,
+        "switch_port":       local_intf,
+        "action":            "skipped",
+        "last_seen_updated": False,
+        "cabled":            "skipped",
+        "error":             None,
     }
 
     # ── Resolve parent site ───────────────────────────────────────────────
@@ -568,7 +711,7 @@ def build_phone_in_netbox(
     if not site_id:
         result["action"] = "error"
         result["error"]  = "Parent device has no site in NetBox"
-        log.warning("%-30s  phone %r — parent has no site, skipping", phone_name, phone_name)
+        log.warning("%-30s  %s — parent has no site, skipping", phone_name, vendor)
         return result
 
     # ── Resolve parent tenant (optional, inherited) ───────────────────────
@@ -580,16 +723,20 @@ def build_phone_in_netbox(
     # ── Dry-run short-circuit ─────────────────────────────────────────────
     if dry_run:
         log.info(
-            "DRY-RUN  phone %-40s  serial=%-20s  ip=%s  sw_ver=%s",
-            phone_name, serial or "(none)", chassis_id or "(none)", sw_ver or "(none)",
+            "DRY-RUN  [%s] %-40s  serial=%-20s  ip=%s  sw_ver=%s",
+            vendor, phone_name, serial or "(none)",
+            chassis_id or "(none)", sw_ver or "(none)",
         )
         result["action"] = "dry_run"
         return result
 
     # ── Create / update device ────────────────────────────────────────────
-    log.info("%-30s  serial=%-20s  ip=%s", phone_name, serial, chassis_id or "(none)")
+    log.info(
+        "%-30s  [%s]  serial=%-20s  ip=%s",
+        phone_name, vendor, serial or "(none)", chassis_id or "(none)",
+    )
     try:
-        # ensure_ap_device is device-type-agnostic — it works for any device
+        # ensure_ap_device is device-type-agnostic — works for any device type
         dev_result = nb.ensure_ap_device(
             name=phone_name,
             device_type_id=device_type_id,
@@ -614,6 +761,11 @@ def build_phone_in_netbox(
         result["error"]  = str(exc)
         log.error("%-30s  device upsert failed: %s", phone_name, exc)
         return result
+
+    # ── Always refresh last_seen (create AND existing devices) ────────────
+    result["last_seen_updated"] = _update_device_last_seen(
+        nb, phone_device_id, phone_name
+    )
 
     # ── Update software_version custom field ──────────────────────────────
     if sw_ver:
@@ -714,12 +866,14 @@ def process_device(
     nb: NetBoxClient,
     role_id: int,
     device_type_id: int,
+    mitel_device_type_id: int,
     args,
 ) -> dict:
     """
     Connect to *device*, run LLDP, and build phone objects in NetBox.
 
-    Never raises — all errors are captured in the returned summary.
+    Handles both ShoreTel and Mitel phones.  Never raises — all errors are
+    captured in the returned summary.
 
     Returns
     -------
@@ -820,11 +974,14 @@ def process_device(
         "%-30s  %d LLDP neighbor(s) parsed", device_name, len(all_neighbors)
     )
 
-    # ── Filter to ShoreTel phones ─────────────────────────────────────────
-    phone_neighbors = [n for n in all_neighbors if n["is_shoretel"]]
+    # ── Filter to ShoreTel + Mitel phones ────────────────────────────────
+    phone_neighbors = [n for n in all_neighbors if n.get("is_phone")]
+    n_shoretel = sum(1 for n in phone_neighbors if n.get("is_shoretel"))
+    n_mitel    = sum(1 for n in phone_neighbors if n.get("is_mitel"))
     summary["phones_discovered"] = len(phone_neighbors)
     log.info(
-        "%-30s  %d ShoreTel phone(s) identified", device_name, len(phone_neighbors)
+        "%-30s  %d phone(s) identified (%d ShoreTel, %d Mitel)",
+        device_name, len(phone_neighbors), n_shoretel, n_mitel,
     )
 
     if not phone_neighbors:
@@ -834,14 +991,27 @@ def process_device(
     # ── Log discovered phones and validate required fields ────────────────
     valid_neighbors: List[dict] = []
     for n in phone_neighbors:
-        # Serial number is the primary key for device naming
-        if not n.get("serial"):
+        vendor = n.get("vendor", "unknown")
+
+        # ShoreTel: serial required (used directly in device name)
+        # Mitel:    serial OR port_id needed (port_id is fallback name source)
+        if n.get("is_shoretel") and not n.get("serial"):
             log.warning(
-                "%-30s  LLDP block local_intf=%r — no serial number; skipping",
+                "%-30s  [shoretel] LLDP block local_intf=%r — no serial; skipping",
                 device_name, n.get("local_intf_raw"),
             )
             summary["errors"].append(
-                f"LLDP block {n.get('local_intf_raw')!r}: missing serial"
+                f"[shoretel] LLDP block {n.get('local_intf_raw')!r}: missing serial"
+            )
+            continue
+
+        if n.get("is_mitel") and not n.get("serial") and not n.get("port_id"):
+            log.warning(
+                "%-30s  [mitel] LLDP block local_intf=%r — no serial or port_id; skipping",
+                device_name, n.get("local_intf_raw"),
+            )
+            summary["errors"].append(
+                f"[mitel] LLDP block {n.get('local_intf_raw')!r}: missing serial and port_id"
             )
             continue
 
@@ -851,53 +1021,68 @@ def process_device(
             ipaddress.ip_address(chassis_id)
         except ValueError:
             log.warning(
-                "%-30s  serial=%s — chassis_id %r is not an IPv4 address; skipping",
-                device_name, n["serial"], chassis_id,
+                "%-30s  [%s] chassis_id %r is not an IPv4 address; skipping",
+                device_name, vendor, chassis_id,
             )
             summary["errors"].append(
-                f"serial={n['serial']}: chassis_id {chassis_id!r} not IPv4"
+                f"[{vendor}] local_intf={n.get('local_intf_raw')!r}: "
+                f"chassis_id {chassis_id!r} not IPv4"
             )
             continue
 
         log.info(
-            "%-30s  Phone serial=%-20s  ip=%s  sw_ver=%s",
-            device_name,
-            n["serial"],
+            "%-30s  [%s] serial=%-20s  ip=%s  sw_ver=%s",
+            device_name, vendor,
+            n.get("serial") or "(none)",
             chassis_id,
             n.get("software_version") or "(none)",
         )
         valid_neighbors.append(n)
 
     # ── Per-worker prefix cache ───────────────────────────────────────────
-    # Phones on the same switch typically share a subnet → cache prefix
+    # Phones on the same switch share a site and often a subnet → cache prefix
     # lookups to avoid redundant API calls (same pattern as netbox_ap.py).
     prefix_cache: Dict[str, str] = {}
 
     # ── Build each phone in NetBox ────────────────────────────────────────
     for neighbor in valid_neighbors:
-        phone_name = f"shoretel-{neighbor['serial'].lower()}"
+        vendor = neighbor.get("vendor", "shoretel")
+        # Choose DeviceType based on vendor
+        dt_id = mitel_device_type_id if vendor == "mitel" else device_type_id
+        # Compute name here only for the except-branch error dict
+        if vendor == "mitel":
+            _ns = neighbor.get("serial") or neighbor.get("port_id") or ""
+            phone_name = f"mitel-{_normalize_mitel_serial(_ns)}"
+        else:
+            phone_name = f"shoretel-{neighbor['serial'].lower()}"
+
         try:
             phone_result = build_phone_in_netbox(
                 neighbor=neighbor,
                 parent_device=device,
                 nb=nb,
                 role_id=role_id,
-                device_type_id=device_type_id,
+                device_type_id=dt_id,
                 dry_run=args.dry_run,
+                vendor=vendor,
                 prefix_cache=prefix_cache,
             )
         except Exception as exc:
             phone_result = {
-                "name":   phone_name,
-                "serial": neighbor.get("serial"),
-                "ip":     neighbor.get("chassis_id"),
-                "action": "error",
-                "cabled": "skipped",
-                "error":  str(exc),
+                "vendor":            vendor,
+                "name":              phone_name,
+                "serial":            neighbor.get("serial"),
+                "ip":                neighbor.get("chassis_id"),
+                "software_version":  neighbor.get("software_version"),
+                "switch_port":       neighbor.get("local_intf"),
+                "action":            "error",
+                "last_seen_updated": False,
+                "cabled":            "skipped",
+                "error":             str(exc),
             }
             log.error(
-                "%-30s  phone %r unexpected error: %s",
-                device_name, phone_name, exc,
+                "%-30s  [%s] phone %r unexpected error: %s",
+                device_name, vendor, phone_name, exc,
             )
 
         summary["phones"].append(phone_result)
@@ -930,8 +1115,8 @@ def main() -> None:
     parser = build_parser()
     parser.prog        = "netbox_shoretel"
     parser.description = (
-        "Discover ShoreTel IP phones via LLDP and build them in NetBox "
-        "(device + eth0 interface + management IP + software_version + cable)."
+        "Discover ShoreTel and Mitel IP phones via LLDP and build them in NetBox "
+        "(device + eth0 interface + management IP + software_version + last_seen + cable)."
     )
     args = parser.parse_args()
 
@@ -982,8 +1167,8 @@ def main() -> None:
         len(devices), args.max_workers, args.transport,
     )
 
-    # ── Pre-flight: verify role + DeviceType + manufacturer ───────────────
-    # All three are fatal if missing — fail fast before spawning workers.
+    # ── Pre-flight: role + both DeviceTypes + manufacturers ──────────────
+    # All are validated before spawning threads — fail fast with a clear message.
     try:
         role_id = _resolve_role_id(nb)
         log.debug("Device role %r id=%s", _PHONE_ROLE_NAME, role_id)
@@ -994,23 +1179,34 @@ def main() -> None:
     device_type_id = _resolve_device_type_id(nb)
     if device_type_id is None:
         log.error(
-            "DeviceType %r not found in NetBox — create it and re-run.",
-            _PHONE_DEVICE_TYPE_MODEL,
+            "ShoreTel DeviceType %r not found in NetBox — create it and re-run.",
+            _SHORETEL_DEVICE_TYPE_MODEL,
         )
         sys.exit(1)
-    log.debug("DeviceType %r id=%s", _PHONE_DEVICE_TYPE_MODEL, device_type_id)
+    log.debug("ShoreTel DeviceType %r id=%s", _SHORETEL_DEVICE_TYPE_MODEL, device_type_id)
 
-    try:
-        nb.ensure_manufacturer(_SHORETEL_MANUFACTURER)
-    except NetBoxClientError as exc:
-        log.warning("Manufacturer %r check failed: %s", _SHORETEL_MANUFACTURER, exc)
+    mitel_device_type_id = _resolve_mitel_device_type_id(nb)
+    if mitel_device_type_id is None:
+        log.error(
+            "Mitel DeviceType %r not found in NetBox — create it and re-run.",
+            _MITEL_DEVICE_TYPE_MODEL,
+        )
+        sys.exit(1)
+    log.debug("Mitel DeviceType %r id=%s", _MITEL_DEVICE_TYPE_MODEL, mitel_device_type_id)
+
+    for mfr in (_SHORETEL_MANUFACTURER, _MITEL_MANUFACTURER):
+        try:
+            nb.ensure_manufacturer(mfr)
+        except NetBoxClientError as exc:
+            log.warning("Manufacturer %r check failed: %s", mfr, exc)
 
     # ── Concurrent per-device processing ─────────────────────────────────
     summaries: List[dict] = []
     with ThreadPoolExecutor(max_workers=args.max_workers) as pool:
         future_to_device = {
             pool.submit(
-                process_device, device, nb, role_id, device_type_id, args
+                process_device, device, nb, role_id,
+                device_type_id, mitel_device_type_id, args,
             ): device
             for device in devices
         }
