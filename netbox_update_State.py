@@ -80,12 +80,17 @@ _CF_STATE_UPDATE = "state_update"   # datetime string — UTC timestamp of last 
 # Captures everything between "Last input " and the first comma or newline.
 _LAST_INPUT_RE = re.compile(r"Last input\s+([^,\n]+)", re.IGNORECASE)
 
-# Matches the opening line of a "show interfaces" interface block, e.g.:
-#   "GigabitEthernet1/0/1 is up, line protocol is up (connected)"
+# Matches the opening line of any "show interfaces" interface block.
+# Deliberately permissive — does NOT require a specific state string so that
+# interfaces reporting unusual states (e.g. "reset", "err-disabled") are
+# still captured.
 _IFACE_HEADER_RE = re.compile(
-    r"^([A-Za-z][A-Za-z0-9/.\-]+)\s+is\s+(?:up|down|administratively down)",
+    r"^([A-Za-z][A-Za-z0-9/.\-]+)\s+is\s+",
     re.MULTILINE,
 )
+
+# Detects the "Hardware is not present" line inside an interface block.
+_NO_HW_RE = re.compile(r"Hardware is not present", re.IGNORECASE)
 
 log = logging.getLogger("netbox_update_State")
 
@@ -131,51 +136,69 @@ def parse_last_input(block: str) -> Optional[str]:
     return m.group(1).strip()
 
 
-def collect_last_input(cisco: CiscoDeviceClient) -> Dict[str, str]:
+def collect_last_input(cisco: CiscoDeviceClient):
     """
-    Run ``show interfaces`` once and return a mapping of interface name to
-    its ``Last input`` timer string.
+    Run ``show interfaces`` once and return ``(last_input_map, no_hw_set)``.
 
-    Reuses the open CLI connection established by
-    ``get_interface_state_inventory()`` — never reconnects or disconnects.
+    ``last_input_map``
+        ``{expanded_iface_name: last_input_string}`` — every interface where
+        a ``Last input`` line was found.
 
-    Returns
-    -------
-    dict
-        ``{expanded_interface_name: last_input_string}``
-        Only interfaces where the timer was successfully parsed are included.
+    ``no_hw_set``
+        ``set[expanded_iface_name]`` — interfaces whose block contains
+        ``Hardware is not present``.
+
+    Block splitting uses :func:`re.finditer` on ``_IFACE_HEADER_RE`` so every
+    interface is captured regardless of the state string that follows "is ".
+    This is more robust than the previous lookahead-split approach, which
+    silently dropped blocks when the state text was unexpected (e.g.
+    "err-disabled", "reset", or when hardware is absent).
     """
     try:
         raw = cisco._cli_connection.send_command("show interfaces")
     except Exception as exc:
         log.warning("show interfaces failed: %s", exc)
-        return {}
+        return {}, set()
 
-    result: Dict[str, str] = {}
+    last_input_map: Dict[str, str] = {}
+    no_hw_set: set = set()
 
-    # Split on each interface-header line.  re.split with a look-ahead keeps
-    # the header as the first line of each block so we can extract the name.
-    blocks = re.split(r"(?=^[A-Za-z][A-Za-z0-9/.\-]+ is (?:up|down|administratively down))",
-                      raw, flags=re.MULTILINE)
+    headers     = list(_IFACE_HEADER_RE.finditer(raw))
+    total_found = len(headers)
+    missing_li  = 0
 
-    for block in blocks:
-        if not block.strip():
-            continue
-
-        header = _IFACE_HEADER_RE.match(block)
-        if not header:
-            continue
-
-        raw_name   = header.group(1)
+    for i, hdr in enumerate(headers):
+        raw_name   = hdr.group(1)
         iface_name = expand_interface_name(raw_name)
 
+        # Slice from this header to the start of the next (or end of output)
+        block_start = hdr.start()
+        block_end   = headers[i + 1].start() if i + 1 < len(headers) else len(raw)
+        block       = raw[block_start:block_end]
+
+        # Detect "Hardware is not present"
+        if _NO_HW_RE.search(block):
+            no_hw_set.add(iface_name)
+            log.debug("%-s  NO HW detected (hardware not present)", iface_name)
+
+        # Extract Last input timer
         last_input = parse_last_input(block)
         if last_input is not None:
-            result[iface_name] = last_input
+            last_input_map[iface_name] = last_input
         else:
-            log.debug("No Last input found for interface %s", iface_name)
+            missing_li += 1
+            log.debug("No Last input line found for interface %s", iface_name)
 
-    return result
+    log.info(
+        "show interfaces: %d interface(s) found, %d with last_input, "
+        "%d missing last_input, %d NO HW",
+        total_found,
+        len(last_input_map),
+        missing_li,
+        len(no_hw_set),
+    )
+
+    return last_input_map, no_hw_set
 
 
 def convert_last_input_to_seconds(value: str) -> Optional[int]:
@@ -438,6 +461,7 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
     # NX-OS and other platforms produce different output formats; skip them.
     _LAST_INPUT_SUPPORTED = {"ios", "iosxe"}
     last_input_map: Dict[str, str] = {}
+    no_hw_set: set = set()
     if os_type not in _LAST_INPUT_SUPPORTED:
         log.info(
             "%-30s  last_input collection skipped — not supported for os_type=%r",
@@ -445,10 +469,10 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
         )
     else:
         try:
-            last_input_map = collect_last_input(cisco)
+            last_input_map, no_hw_set = collect_last_input(cisco)
             log.info(
-                "%-30s  collected last_input for %d interface(s)",
-                device_name, len(last_input_map),
+                "%-30s  collected last_input for %d interface(s), NO HW: %d",
+                device_name, len(last_input_map), len(no_hw_set),
             )
         except Exception as exc:
             log.warning(
@@ -536,6 +560,18 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
                 device_name, iface_name,
             )
 
+        # ── State priority override ───────────────────────────────────────
+        # Priority: NO HW > ADMIN DOWN > UP > DOWN
+        # "Hardware is not present" overrides whatever show interfaces status
+        # reported for this interface.
+        if iface_name in no_hw_set:
+            if iface_state != "NO HW":
+                log.debug(
+                    "%-30s  %s: state overridden %r → 'NO HW' (hardware absent)",
+                    device_name, iface_name, iface_state,
+                )
+            iface_state = "NO HW"
+
         # Route to the correct VC member device (same logic as _sync_trunks).
         target_id = resolve_target_device_id(iface_name, device_id, vc_member_map)
 
@@ -544,7 +580,8 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
         # ── Unused-ports counting ─────────────────────────────────────────
         # Runs unconditionally (dry-run and live) so the logged totals are
         # always accurate.  Writing to NetBox happens only in live mode.
-        if iface_state == "ADMIN DOWN":
+        # NO HW counts as unused — the port has no physical hardware installed.
+        if iface_state in ("ADMIN DOWN", "NO HW"):
             unused_ports   += 1
             admin_down_cnt += 1
         else:
