@@ -157,6 +157,88 @@ def collect_last_input(cisco: CiscoDeviceClient) -> Dict[str, str]:
 
     return result
 
+
+def parse_switch_uptime(show_version_output: str) -> Dict[int, str]:
+    """
+    Parse switch uptime from ``show version`` output.
+
+    Returns ``{switch_number: uptime_string}``.
+
+    Stack switches
+    --------------
+    Looks for sections headed by ``Switch <N>`` followed by a separator line
+    and a ``Switch uptime :`` field:
+
+        Switch 01
+        ---------
+        Switch uptime                 : 4 years, 40 weeks, 3 days, 1 hour, 10 minutes
+
+        Switch 02
+        ---------
+        Switch uptime                 : 2 years, 19 weeks, 5 days, 22 hours, 15 minutes
+
+    Returns ``{1: "4 years, 40 weeks...", 2: "2 years, 19 weeks..."}``.
+
+    Single switch
+    -------------
+    Falls back to the global uptime line:
+
+        hostname uptime is 4 years, 40 weeks, 3 days
+
+    Returns ``{1: "4 years, 40 weeks, 3 days"}``.
+    """
+    result: Dict[int, str] = {}
+
+    # Per-stack-member header: "Switch 01" on its own line
+    _stack_header_re = re.compile(r"^Switch\s+(\d+)\s*$", re.MULTILINE)
+    _stack_uptime_re = re.compile(r"Switch\s+uptime\s*:\s*(.+)", re.IGNORECASE)
+
+    headers = list(_stack_header_re.finditer(show_version_output))
+    if headers:
+        for i, header in enumerate(headers):
+            sw_num = int(header.group(1))
+            start  = header.end()
+            end    = headers[i + 1].start() if i + 1 < len(headers) else len(show_version_output)
+            section = show_version_output[start:end]
+            m = _stack_uptime_re.search(section)
+            if m:
+                result[sw_num] = m.group(1).strip()
+            else:
+                log.debug("No 'Switch uptime' found in Switch %s section", sw_num)
+
+    # Fallback: single-chassis global uptime line
+    # Example: "hostname uptime is 4 years, 40 weeks, 3 days"
+    if not result:
+        m = re.search(r"^\S+\s+uptime\s+is\s+(.+)$",
+                      show_version_output, re.MULTILINE | re.IGNORECASE)
+        if m:
+            result[1] = m.group(1).strip()
+
+    return result
+
+
+def get_interface_switch_number(interface_name: str) -> Optional[int]:
+    """
+    Extract the stack/member switch number from a 3-part Cisco interface name.
+
+    ``GigabitEthernet2/0/1``    → ``2``
+    ``TenGigabitEthernet3/1/1`` → ``3``
+    ``GigabitEthernet0/1``      → ``None``  (2-part — not a stacked interface)
+
+    The first numeric component is the stack member on Catalyst stacked platforms.
+    2-part interfaces (module/port) belong to standalone switches and have no
+    member number, so ``None`` is returned.
+    """
+    # Match: alpha prefix, then first_number, then at least two more /N parts
+    m = re.match(r"^[A-Za-z][A-Za-z0-9\-]+?(\d+)((?:/\d+){2,})$", interface_name)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
 # --------------------------------------------------------------------------- #
 # Per-device worker                                                            #
 # --------------------------------------------------------------------------- #
@@ -307,6 +389,54 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
                 "%-30s  last_input collection failed — continuing without it: %s",
                 device_name, exc,
             )
+
+    # ── Collect switch uptime (IOS / IOS-XE; used to replace "never") ───────
+    # Only run "show version" when last_input_map was populated — if collection
+    # was skipped (wrong OS) or failed, uptime_map stays empty and the
+    # substitution loop below is a no-op.
+    uptime_map: Dict[int, str] = {}
+    if os_type in _LAST_INPUT_SUPPORTED and last_input_map:
+        try:
+            raw_ver  = cisco._cli_connection.send_command("show version")
+            uptime_map = parse_switch_uptime(raw_ver)
+            log.info(
+                "%-30s  collected uptime for %d switch(es): %s",
+                device_name, len(uptime_map),
+                {k: v[:40] for k, v in uptime_map.items()},
+            )
+        except Exception as exc:
+            log.warning(
+                "%-30s  show version failed — 'never' values will not be "
+                "substituted with uptime: %s",
+                device_name, exc,
+            )
+
+    # ── Replace "never" last_input values with the switch's uptime ───────
+    uptime_substituted = 0
+    if uptime_map:
+        for iface_name in list(last_input_map.keys()):
+            if last_input_map[iface_name].lower() != "never":
+                continue
+            switch_num = get_interface_switch_number(iface_name)
+            uptime = uptime_map.get(switch_num) or uptime_map.get(1)
+            if uptime:
+                last_input_map[iface_name] = uptime
+                uptime_substituted += 1
+                log.debug(
+                    "%-30s  %s: last_input=never → uptime %r (switch %s)",
+                    device_name, iface_name, uptime, switch_num,
+                )
+            else:
+                log.warning(
+                    "%-30s  %s: last_input=never but no uptime found for "
+                    "switch %s — keeping 'never'",
+                    device_name, iface_name, switch_num,
+                )
+    if uptime_substituted:
+        log.info(
+            "%-30s  replaced 'never' with uptime for %d interface(s)",
+            device_name, uptime_substituted,
+        )
 
     # Compute a single timestamp for all state-change updates in this run so
     # the value is stable within a device pass.
