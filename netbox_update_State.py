@@ -633,8 +633,12 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
         # ── Unused-ports counting ─────────────────────────────────────────
         # Runs unconditionally (dry-run and live) so the logged totals are
         # always accurate.  Writing to NetBox happens only in live mode.
+        # SVI (Vlan) interfaces are logical — they are excluded from the
+        # unused_ports count because they have no physical switchport.
         # NO HW counts as unused — the port has no physical hardware installed.
-        if iface_state in ("ADMIN DOWN", "NO HW"):
+        if iface_name.lower().startswith("vlan"):
+            pass  # SVI — skip unused-ports counting entirely
+        elif iface_state in ("ADMIN DOWN", "NO HW"):
             unused_ports   += 1
             admin_down_cnt += 1
         else:
