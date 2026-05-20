@@ -601,6 +601,7 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
     unused_ports   = 0
     admin_down_cnt = 0
     threshold_cnt  = 0
+    skipped_cnt    = 0   # DOWN ports excluded due to missing/unparseable last_input
 
     # ── Build merged interface → state mapping ────────────────────────────
     # seed from show interfaces status (existing source; may have fewer entries)
@@ -631,22 +632,34 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
         summary["interfaces_checked"] += 1
 
         # ── Unused-ports counting ─────────────────────────────────────────
-        # Runs unconditionally (dry-run and live) so the logged totals are
-        # always accurate.  Writing to NetBox happens only in live mode.
-        # SVI (Vlan) interfaces are logical — they are excluded from the
-        # unused_ports count because they have no physical switchport.
-        # NO HW counts as unused — the port has no physical hardware installed.
+        # Runs unconditionally (dry-run and live) so logged totals are always
+        # accurate.  Writing to NetBox happens only in live mode.
+        #
+        # Rules (strict):
+        #   ADMIN DOWN              → always count
+        #   DOWN + last_input > threshold → count
+        #   UP / NO HW / SVI / other → never count
         if iface_name.lower().startswith("vlan"):
-            pass  # SVI — skip unused-ports counting entirely
-        elif iface_state in ("ADMIN DOWN", "NO HW"):
+            pass  # SVI — logical interface, no physical switchport to count
+
+        elif iface_state == "ADMIN DOWN":
             unused_ports   += 1
             admin_down_cnt += 1
-        else:
+
+        elif iface_state == "DOWN":
             li_val = last_input_map.get(iface_name)
-            if li_val is not None:
+            if li_val is None:
+                skipped_cnt += 1
+                log.debug(
+                    "%-30s  %s: DOWN but no last_input data — "
+                    "excluded from unused count",
+                    device_name, iface_name,
+                )
+            else:
                 li_secs = convert_last_input_to_seconds(li_val)
                 if li_secs is None:
-                    log.debug(
+                    skipped_cnt += 1
+                    log.warning(
                         "%-30s  %s: last_input %r not parseable — "
                         "excluded from unused count",
                         device_name, iface_name, li_val,
@@ -654,6 +667,7 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
                 elif li_secs > unused_time_secs:
                     unused_ports  += 1
                     threshold_cnt += 1
+        # UP, NO HW, and any other state: do NOT increment unused_ports
 
         log.debug(
             "%-30s  Interface %s state detected as %s (dev_id=%s)",
@@ -724,10 +738,12 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
     summary["unused_ports"]     = unused_ports
     summary["admin_down_ports"] = admin_down_cnt
     summary["threshold_ports"]  = threshold_cnt
+    summary["skipped_ports"]    = skipped_cnt
 
     log.info(
-        "%-30s  unused_ports=%d  (admin_down=%d  threshold=%d)",
-        device_name, unused_ports, admin_down_cnt, threshold_cnt,
+        "%-30s  unused_ports=%d  "
+        "(admin_down=%d  down_above_threshold=%d  skipped_no_data=%d)",
+        device_name, unused_ports, admin_down_cnt, threshold_cnt, skipped_cnt,
     )
 
     if not args.dry_run:
