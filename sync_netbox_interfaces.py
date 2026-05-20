@@ -76,6 +76,9 @@ PLATFORM_SLUG_MAP: Dict[str, str] = {
 
 log = logging.getLogger("sync_netbox_interfaces")
 
+# Writes WARNING+ to sync_errors.log; handler is attached in _configure_logging.
+_sync_err_log = logging.getLogger("sync_errors")
+
 # --------------------------------------------------------------------------- #
 # Interface name expansion                                                     #
 # --------------------------------------------------------------------------- #
@@ -2943,7 +2946,10 @@ def sync_device(
         "fhrp_groups_synced":              0,
         "platform_updated":                0,
         "vc_members_updated":              0,
-        "interfaces_relocated":            0,
+        "interfaces_relocated":                      0,
+        "interfaces_relocation_skipped_dest_exists": 0,
+        "interfaces_skipped_missing_vc_member":      0,
+        "interfaces_skipped_missing_module":         0,
         "errors":                          [],
         "attempts":                        [],
         "unknown_interface_types":         [],
@@ -3133,6 +3139,31 @@ def sync_device(
 
     _unknown_types: List[dict] = []
 
+    # ── Preload NetBox interfaces for every VC member (one batch per device) ──
+    # Replaces the per-interface find_interface_by_name_vc API call with a
+    # single upfront fetch so the inner loop does only dict lookups.
+    # get_interfaces() returns List[dict] (already _to_dict()-converted), which
+    # is compatible with _snapshot_interface / _relocate_interface.
+    nb_ifaces_by_device: Dict[int, Dict[str, dict]] = {}
+    for _did in all_vc_device_ids:
+        nb_ifaces_by_device[_did] = {}
+        try:
+            for _iface in nb.get_interfaces(device_id=_did):
+                _iname = _iface.get("name", "")
+                if _iname:
+                    nb_ifaces_by_device[_did][_iname] = _iface
+        except NetBoxClientError as exc:
+            log.warning(
+                "%-30s  Stage 1: could not preload interfaces for dev_id=%s: %s",
+                device_name, _did, exc,
+            )
+    log.info(
+        "%-30s  Stage 1: preloaded %d interface(s) across %d VC member(s)",
+        device_name,
+        sum(len(m) for m in nb_ifaces_by_device.values()),
+        len(all_vc_device_ids),
+    )
+
     for iface in interfaces:
         raw_name = iface.get("name", "")
         if not raw_name:
@@ -3141,6 +3172,18 @@ def sync_device(
         # ── Expand and parse the interface name ───────────────────────────
         iface_name = expand_interface_name(raw_name)
         parsed     = parse_cisco_interface(raw_name)
+
+        # ── Detect missing VC member (hard error — log + skip) ────────────
+        # Only physical interfaces carry a slot number; logical ones return
+        # None from get_vc_member_slot and are always kept on the master.
+        _vc_slot = get_vc_member_slot(iface_name) if vc_member_map else None
+        if vc_member_map and _vc_slot is not None and _vc_slot not in vc_member_map:
+            _sync_err_log.warning(
+                "missing_vc_member | device=%s vc_id=%s iface=%s vc_slot=%s",
+                device_name, vc_id, iface_name, _vc_slot,
+            )
+            summary["interfaces_skipped_missing_vc_member"] += 1
+            continue
 
         # ── Route to the correct VC member device ─────────────────────────
         target_id = resolve_target_device_id(iface_name, device_id, vc_member_map)
@@ -3153,11 +3196,17 @@ def sync_device(
         target_module_id  = resolve_target_module_id(parsed["module"], device_module_map)
 
         if parsed["module"] and not target_module_id:
-            log.debug(
-                "%-30s  iface=%-40s  slot=%s not in module map for "
-                "dev_id=%s — creating at device level",
-                device_name, iface_name, parsed["module"], target_id,
+            # module_slot is present in the interface name but the target
+            # device has no matching installed module in NetBox — do not
+            # create or relocate; operator must install the module bay first.
+            _sync_err_log.warning(
+                "missing_module | device=%s vc_id=%s iface=%s "
+                "vc_slot=%s module_slot=%s target_device_id=%s",
+                device_name, vc_id, iface_name,
+                parsed["member"], parsed["module"], target_id,
             )
+            summary["interfaces_skipped_missing_module"] += 1
+            continue
 
         # ── Build NetBox payload ──────────────────────────────────────────
         nb_payload: dict = {}
@@ -3190,28 +3239,53 @@ def sync_device(
                 device_name, _stage1_vrf, iface_name,
             )
 
-        # ── Dry-run: log intent (including any relocation that would occur) ─
+        # ── Dry-run: report intent using preloaded maps (no API calls) ───────
         if args.dry_run:
             if len(all_vc_device_ids) > 1 or target_module_id is not None:
-                existing = nb.find_interface_by_name_vc(
-                    all_vc_device_ids, iface_name
-                )
-                if existing:
-                    ex_dev_id = _nb_id(existing.get("device"))
-                    ex_mod_id = _nb_id(existing.get("module"))
+                # Mirror find_interface_by_name_vc: first match wins in order.
+                _existing_dr: Optional[dict] = None
+                for _did_dr in all_vc_device_ids:
+                    _existing_dr = nb_ifaces_by_device.get(_did_dr, {}).get(iface_name)
+                    if _existing_dr is not None:
+                        break
+                if _existing_dr is not None:
+                    ex_dev_id = _nb_id(_existing_dr.get("device"))
+                    ex_mod_id = _nb_id(_existing_dr.get("module"))
                     wrong_dev = ex_dev_id is not None and ex_dev_id != target_id
                     wrong_mod = (
                         target_module_id is not None
                         and ex_mod_id != target_module_id
                     )
                     if wrong_dev or wrong_mod:
-                        log.info(
-                            "DRY-RUN  %-30s  WOULD RELOCATE %-42s  "
-                            "dev %s→%s  module %s→%s",
-                            device_name, iface_name,
-                            ex_dev_id, target_id,
-                            ex_mod_id, target_module_id,
+                        # Duplicate guard: if moving across devices, check dest.
+                        dest_occupied = (
+                            wrong_dev
+                            and bool(
+                                nb_ifaces_by_device.get(target_id, {}).get(iface_name)
+                            )
                         )
+                        if dest_occupied:
+                            log.info(
+                                "DRY-RUN  %-30s  WOULD SKIP RELOCATION "
+                                "(dest dev_id=%s already has %r)  "
+                                "existing dev_id=%s  module %s→%s",
+                                device_name, target_id, iface_name,
+                                ex_dev_id, ex_mod_id, target_module_id,
+                            )
+                        else:
+                            log.info(
+                                "DRY-RUN  %-30s  WOULD RELOCATE %-42s  "
+                                "dev %s→%s  module %s→%s",
+                                device_name, iface_name,
+                                ex_dev_id, target_id,
+                                ex_mod_id, target_module_id,
+                            )
+                elif not nb_ifaces_by_device.get(target_id, {}).get(iface_name):
+                    log.info(
+                        "DRY-RUN  %-30s  WOULD CREATE %-42s  "
+                        "dev_id=%-6s  mod_id=%-6s",
+                        device_name, iface_name, target_id, target_module_id,
+                    )
             log.info(
                 "DRY-RUN  %-30s  iface=%-40s  dev_id=%-6s  mod_id=%-6s  %s",
                 device_name, iface_name, target_id, target_module_id, nb_payload,
@@ -3219,46 +3293,67 @@ def sync_device(
             summary["interfaces_skipped"] += 1
             continue
 
-        # ── Live: relocation check before upsert ──────────────────────────
-        # Search across ALL VC member devices for an existing record with
-        # this name.  If found on the wrong device or wrong module, delete
-        # and recreate it (preserving all properties + IPs) so every
-        # downstream stage (trunks, prefixes, LAG) operates on the correct
-        # placement.
+        # ── Live: relocation check using preloaded maps (no extra API call) ──
+        # Mirrors find_interface_by_name_vc: iterate all_vc_device_ids in order
+        # and take the first hit.  The dicts are already _to_dict()-converted so
+        # they are safe to pass directly to _relocate_interface / _snapshot_interface.
         if len(all_vc_device_ids) > 1 or target_module_id is not None:
-            try:
-                existing = nb.find_interface_by_name_vc(
-                    all_vc_device_ids, iface_name
+            _existing: Optional[dict] = None
+            for _did_search in all_vc_device_ids:
+                _existing = nb_ifaces_by_device.get(_did_search, {}).get(iface_name)
+                if _existing is not None:
+                    break
+
+            if _existing is not None:
+                ex_dev_id = _nb_id(_existing.get("device"))
+                ex_mod_id = _nb_id(_existing.get("module"))
+                wrong_dev = ex_dev_id is not None and ex_dev_id != target_id
+                wrong_mod = (
+                    target_module_id is not None
+                    and ex_mod_id != target_module_id
                 )
-                if existing:
-                    ex_dev_id = _nb_id(existing.get("device"))
-                    ex_mod_id = _nb_id(existing.get("module"))
-                    wrong_dev = ex_dev_id is not None and ex_dev_id != target_id
-                    wrong_mod = (
-                        target_module_id is not None
-                        and ex_mod_id != target_module_id
+                if wrong_dev or wrong_mod:
+                    # Duplicate guard: when moving to a different VC member,
+                    # abort if the destination already has the same name to
+                    # prevent creating a second record and orphaning the first.
+                    dest_has_iface = (
+                        wrong_dev
+                        and bool(nb_ifaces_by_device.get(target_id, {}).get(iface_name))
                     )
-                    if wrong_dev or wrong_mod:
+                    if dest_has_iface:
+                        _sync_err_log.warning(
+                            "dest_exists_skip | device=%s iface=%s "
+                            "existing_dev=%s existing_mod=%s "
+                            "target_dev=%s target_mod=%s "
+                            "reason=dest_interface_exists",
+                            device_name, iface_name,
+                            ex_dev_id, ex_mod_id,
+                            target_id, target_module_id,
+                        )
+                        log.info(
+                            "%-30s  SKIP RELOCATION — dest dev_id=%s already "
+                            "has %r; existing dev_id=%s",
+                            device_name, target_id, iface_name, ex_dev_id,
+                        )
+                        summary["interfaces_relocation_skipped_dest_exists"] += 1
+                        # Upsert below still runs against the correctly-placed
+                        # target interface to apply any field updates.
+                    else:
                         _relocate_interface(
                             nb=nb,
-                            existing=existing,
+                            existing=_existing,
                             target_device_id=target_id,
                             target_module_id=target_module_id,
                             iface_name=iface_name,
                             device_name=device_name,
                             summary=summary,
                         )
-                        # After relocation the interface now exists on the
-                        # correct device/module; upsert below will find it
-                        # and apply any remaining field updates.
-            except NetBoxClientError as exc:
-                log.warning(
-                    "%-30s  relocation check failed for %r: %s",
-                    device_name, iface_name, exc,
-                )
-                summary["errors"].append(
-                    f"Relocation check {iface_name!r}: {exc}"
-                )
+                        # Update preloaded maps so any later same-name lookup
+                        # in this sync pass sees the new placement.
+                        if wrong_dev and ex_dev_id in nb_ifaces_by_device:
+                            nb_ifaces_by_device[ex_dev_id].pop(iface_name, None)
+                        nb_ifaces_by_device.setdefault(target_id, {})[iface_name] = _existing
+                        # After relocation upsert below applies remaining field updates.
 
         try:
             result = nb.upsert_interface(
@@ -3483,6 +3578,21 @@ def _configure_logging(level: str, log_file: Optional[str] = None) -> None:
     stderr_h = logging.StreamHandler(sys.stderr)
     stderr_h.setFormatter(logging.Formatter(fmt))
     root.addHandler(stderr_h)
+
+    # Always append WARNING+ to sync_errors.log; never echo to stderr.
+    _sync_err_log.handlers.clear()
+    try:
+        _err_h = logging.FileHandler("sync_errors.log", mode="a", encoding="utf-8")
+        _err_h.setLevel(logging.WARNING)
+        _err_h.setFormatter(logging.Formatter(fmt))
+        _sync_err_log.setLevel(logging.WARNING)
+        _sync_err_log.addHandler(_err_h)
+        _sync_err_log.propagate = False   # keep out of stderr / root logger
+    except OSError as exc:
+        log.warning(
+            "Cannot open sync_errors.log: %s — VC/module errors to stderr only",
+            exc,
+        )
 
     if log_file:
         try:
