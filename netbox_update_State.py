@@ -92,6 +92,13 @@ _IFACE_HEADER_RE = re.compile(
 # Detects the "Hardware is not present" line inside an interface block.
 _NO_HW_RE = re.compile(r"Hardware is not present", re.IGNORECASE)
 
+# Extracts the OUTPUT timer from a "Last input X, output Y" line.
+# Used for SVI (Vlan) interfaces where the output timer is more meaningful.
+_LAST_OUTPUT_RE = re.compile(
+    r"Last input\s+[^,\n]+,\s*output\s+([^,\n]+)",
+    re.IGNORECASE,
+)
+
 log = logging.getLogger("netbox_update_State")
 
 # Patterns for convert_last_input_to_seconds().
@@ -113,6 +120,27 @@ _LI_UNITS: List = [
 # --------------------------------------------------------------------------- #
 # Last-input helpers                                                           #
 # --------------------------------------------------------------------------- #
+
+
+def _parse_block_state(block: str, no_hw: bool) -> str:
+    """
+    Derive the interface STATE from one ``show interfaces`` block.
+
+    Priority order (highest first):
+    1. Hardware is not present → ``"NO HW"``
+    2. administratively down   → ``"ADMIN DOWN"``
+    3. line protocol is up     → ``"UP"``
+    4. anything else           → ``"DOWN"``
+    """
+    if no_hw:
+        return "NO HW"
+    first_line = block.split("\n", 1)[0]
+    if re.search(r"\badministratively\s+down\b", first_line, re.IGNORECASE):
+        return "ADMIN DOWN"
+    # Search only the first ~400 chars to avoid false matches in description fields
+    if re.search(r"\bline protocol is up\b", block[:400], re.IGNORECASE):
+        return "UP"
+    return "DOWN"
 
 
 def parse_last_input(block: str) -> Optional[str]:
@@ -138,30 +166,36 @@ def parse_last_input(block: str) -> Optional[str]:
 
 def collect_last_input(cisco: CiscoDeviceClient):
     """
-    Run ``show interfaces`` once and return ``(last_input_map, no_hw_set)``.
+    Run ``show interfaces`` once and return
+    ``(last_input_map, no_hw_set, state_map)``.
 
     ``last_input_map``
-        ``{expanded_iface_name: last_input_string}`` — every interface where
-        a ``Last input`` line was found.
+        ``{expanded_iface_name: timer_string}``
+        For SVI (Vlan) interfaces the **output** timer is used instead of
+        the input timer, because SVIs forward traffic outward and the output
+        value is more representative of real activity.
 
     ``no_hw_set``
-        ``set[expanded_iface_name]`` — interfaces whose block contains
-        ``Hardware is not present``.
+        ``set[expanded_iface_name]`` — interfaces with "Hardware is not present".
 
-    Block splitting uses :func:`re.finditer` on ``_IFACE_HEADER_RE`` so every
-    interface is captured regardless of the state string that follows "is ".
-    This is more robust than the previous lookahead-split approach, which
-    silently dropped blocks when the state text was unexpected (e.g.
-    "err-disabled", "reset", or when hardware is absent).
+    ``state_map``
+        ``{expanded_iface_name: "UP"|"DOWN"|"ADMIN DOWN"|"NO HW"}``
+        Derived directly from the verbose ``show interfaces`` output, which
+        has richer detail than ``show interfaces status`` and covers *all*
+        interface types (SVIs, management, subinterfaces, etc.).
+
+    Block splitting uses :func:`re.finditer` so every interface block is
+    captured regardless of the state text that follows "is ".
     """
     try:
         raw = cisco._cli_connection.send_command("show interfaces")
     except Exception as exc:
         log.warning("show interfaces failed: %s", exc)
-        return {}, set()
+        return {}, set(), {}
 
     last_input_map: Dict[str, str] = {}
-    no_hw_set: set = set()
+    no_hw_set:      set            = set()
+    state_map:      Dict[str, str] = {}
 
     headers     = list(_IFACE_HEADER_RE.finditer(raw))
     total_found = len(headers)
@@ -176,29 +210,46 @@ def collect_last_input(cisco: CiscoDeviceClient):
         block_end   = headers[i + 1].start() if i + 1 < len(headers) else len(raw)
         block       = raw[block_start:block_end]
 
-        # Detect "Hardware is not present"
-        if _NO_HW_RE.search(block):
+        # ── Hardware absent? ──────────────────────────────────────────────
+        no_hw = bool(_NO_HW_RE.search(block))
+        if no_hw:
             no_hw_set.add(iface_name)
-            log.debug("%-s  NO HW detected (hardware not present)", iface_name)
 
-        # Extract Last input timer
-        last_input = parse_last_input(block)
-        if last_input is not None:
-            last_input_map[iface_name] = last_input
+        # ── State (derived from block, overrides show interfaces status) ──
+        state_map[iface_name] = _parse_block_state(block, no_hw)
+
+        # ── Last-input timer ──────────────────────────────────────────────
+        # SVI (Vlan) interfaces: use the OUTPUT timer — input is nearly always
+        # very recent because the control plane writes to the SVI itself, while
+        # the output timer reflects when real data last traversed the VLAN.
+        is_svi = raw_name.lower().startswith("vlan")
+        if is_svi:
+            m = _LAST_OUTPUT_RE.search(block)
+            if m:
+                last_input_map[iface_name] = m.group(1).strip()
+            else:
+                # Fall back to input timer when no output line is present
+                li = parse_last_input(block)
+                if li is not None:
+                    last_input_map[iface_name] = li
+                else:
+                    missing_li += 1
         else:
-            missing_li += 1
-            log.debug("No Last input line found for interface %s", iface_name)
+            li = parse_last_input(block)
+            if li is not None:
+                last_input_map[iface_name] = li
+            else:
+                missing_li += 1
+                log.debug("No Last input line found for %s", iface_name)
 
     log.info(
-        "show interfaces: %d interface(s) found, %d with last_input, "
-        "%d missing last_input, %d NO HW",
-        total_found,
-        len(last_input_map),
-        missing_li,
-        len(no_hw_set),
+        "show interfaces: %d found, %d with timer, "
+        "%d missing timer, %d NO HW, %d state entries",
+        total_found, len(last_input_map),
+        missing_li, len(no_hw_set), len(state_map),
     )
 
-    return last_input_map, no_hw_set
+    return last_input_map, no_hw_set, state_map
 
 
 def convert_last_input_to_seconds(value: str) -> Optional[int]:
@@ -460,8 +511,9 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
     # "show interfaces" Last input parsing is only reliable on IOS and IOS-XE.
     # NX-OS and other platforms produce different output formats; skip them.
     _LAST_INPUT_SUPPORTED = {"ios", "iosxe"}
-    last_input_map: Dict[str, str] = {}
-    no_hw_set: set = set()
+    last_input_map:  Dict[str, str] = {}
+    no_hw_set:       set            = set()
+    show_state_map:  Dict[str, str] = {}   # state derived from "show interfaces"
     if os_type not in _LAST_INPUT_SUPPORTED:
         log.info(
             "%-30s  last_input collection skipped — not supported for os_type=%r",
@@ -469,10 +521,12 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
         )
     else:
         try:
-            last_input_map, no_hw_set = collect_last_input(cisco)
+            last_input_map, no_hw_set, show_state_map = collect_last_input(cisco)
             log.info(
-                "%-30s  collected last_input for %d interface(s), NO HW: %d",
-                device_name, len(last_input_map), len(no_hw_set),
+                "%-30s  collected last_input for %d interface(s), "
+                "NO HW: %d, state entries: %d",
+                device_name, len(last_input_map),
+                len(no_hw_set), len(show_state_map),
             )
         except Exception as exc:
             log.warning(
@@ -548,29 +602,28 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
     admin_down_cnt = 0
     threshold_cnt  = 0
 
-    # ── Per-interface state comparison and update ────────────────────────
+    # ── Build merged interface → state mapping ────────────────────────────
+    # seed from show interfaces status (existing source; may have fewer entries)
+    all_iface_states: Dict[str, str] = {}
     for state_rec in states:
-        raw_name    = state_rec.get("name", "")
-        iface_name  = expand_interface_name(raw_name)
-        iface_state = state_rec.get("state") or "UNKNOWN"
+        name = expand_interface_name(state_rec.get("name", ""))
+        if name:
+            all_iface_states[name] = state_rec.get("state") or "DOWN"
 
-        if iface_state == "UNKNOWN":
-            log.warning(
-                "%-30s  %s: state could not be determined — using UNKNOWN",
-                device_name, iface_name,
-            )
+    # Override / extend with show interfaces data (richer; has NO HW, SVIs, etc.)
+    # This ensures every interface that appeared in show interfaces is processed
+    # even when show interfaces status omitted it.
+    all_iface_states.update(show_state_map)
 
-        # ── State priority override ───────────────────────────────────────
-        # Priority: NO HW > ADMIN DOWN > UP > DOWN
-        # "Hardware is not present" overrides whatever show interfaces status
-        # reported for this interface.
-        if iface_name in no_hw_set:
-            if iface_state != "NO HW":
-                log.debug(
-                    "%-30s  %s: state overridden %r → 'NO HW' (hardware absent)",
-                    device_name, iface_name, iface_state,
-                )
-            iface_state = "NO HW"
+    log.info(
+        "%-30s  total_interfaces_detected=%d  (show_if=%d  show_if_status=%d)  "
+        "interfaces_set_NO_HW=%d",
+        device_name, len(all_iface_states),
+        len(show_state_map), len(states), len(no_hw_set),
+    )
+
+    # ── Per-interface state comparison and update ────────────────────────
+    for iface_name, iface_state in all_iface_states.items():
 
         # Route to the correct VC member device (same logic as _sync_trunks).
         target_id = resolve_target_device_id(iface_name, device_id, vc_member_map)
