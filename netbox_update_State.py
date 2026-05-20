@@ -71,6 +71,11 @@ _CF_STATE          = "STATE"
 _CF_LAST_INPUT     = "last_input"
 _CF_IF_LAST_UPDATE = "if_last_update"
 
+# Device-level custom fields for unused-port tracking.
+_CF_UNUSED_TIME  = "unused_time"    # integer — threshold in seconds
+_CF_UNUSED_PORTS = "unused_ports"   # integer — count written back after each run
+_CF_STATE_UPDATE = "state_update"   # datetime string — UTC timestamp of last run
+
 # Matches:  "Last input 00:02:13,"  "Last input never,"  "Last input 3w2d,"
 # Captures everything between "Last input " and the first comma or newline.
 _LAST_INPUT_RE = re.compile(r"Last input\s+([^,\n]+)", re.IGNORECASE)
@@ -83,6 +88,21 @@ _IFACE_HEADER_RE = re.compile(
 )
 
 log = logging.getLogger("netbox_update_State")
+
+# Patterns for convert_last_input_to_seconds().
+# Compiled once at import time; re-used per interface.
+_LI_HHMMSS_RE = re.compile(r"^(\d+):(\d{2}):(\d{2})$")
+_LI_UNITS: List = [
+    # Each tuple: (compiled pattern, seconds-per-unit)
+    # Handles: "4 years" / "4y" / "4Y"   "40 weeks" / "40w" / "40W"  etc.
+    # Negative lookahead (?![a-zA-Z]) prevents partial-word false matches.
+    (re.compile(r"(\d+)\s*(?:year[s]?|[yY])(?![a-zA-Z])"),           365 * 24 * 3600),
+    (re.compile(r"(\d+)\s*(?:week[s]?|[wW])(?![a-zA-Z])"),             7 * 24 * 3600),
+    (re.compile(r"(\d+)\s*(?:day[s]?|[dD])(?![a-zA-Z])"),                  24 * 3600),
+    (re.compile(r"(\d+)\s*(?:hour[s]?|[hH])(?![a-zA-Z])"),                      3600),
+    (re.compile(r"(\d+)\s*(?:minute[s]?|min[s]?|m)(?![a-zA-Z])"),                 60),
+    (re.compile(r"(\d+)\s*(?:second[s]?|sec[s]?|[sS])(?![a-zA-Z])"),               1),
+]
 
 
 # --------------------------------------------------------------------------- #
@@ -156,6 +176,49 @@ def collect_last_input(cisco: CiscoDeviceClient) -> Dict[str, str]:
             log.debug("No Last input found for interface %s", iface_name)
 
     return result
+
+
+def convert_last_input_to_seconds(value: str) -> Optional[int]:
+    """
+    Convert a Cisco ``Last input`` string to total seconds.
+
+    Supported formats
+    -----------------
+    ``HH:MM:SS``
+        ``01:30:00`` → 5400
+
+    Natural language (uptime substitution output)
+        ``"4 years, 40 weeks, 3 days, 1 hour, 10 minutes"`` → seconds
+
+    Compact short (IOS default for recently-active ports)
+        ``"3w2d"``, ``"2y11w"`` → seconds
+
+    Verbose long (some IOS-XE builds)
+        ``"0Y 5W 0D 0H 0m 0S"`` → seconds
+
+    Returns ``None`` when the value cannot be parsed so the caller can skip
+    the interface rather than using a wrong count.
+    """
+    if not value or not isinstance(value, str):
+        return None
+
+    v = value.strip()
+
+    # ── HH:MM:SS ─────────────────────────────────────────────────────────
+    m = _LI_HHMMSS_RE.fullmatch(v)
+    if m:
+        return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+
+    # ── All other formats: sum every matched unit ─────────────────────────
+    total   = 0
+    matched = False
+    for pattern, multiplier in _LI_UNITS:
+        hit = pattern.search(v)
+        if hit:
+            total   += int(hit.group(1)) * multiplier
+            matched  = True
+
+    return total if matched else None
 
 
 def parse_switch_uptime(show_version_output: str) -> Dict[int, str]:
@@ -286,6 +349,9 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
         "states_unchanged":     0,
         "last_input_updated":   0,
         "last_input_unchanged": 0,
+        "unused_ports":         0,
+        "admin_down_ports":     0,
+        "threshold_ports":      0,
         "errors":               [],
     }
 
@@ -438,9 +504,25 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
             device_name, uptime_substituted,
         )
 
-    # Compute a single timestamp for all state-change updates in this run so
-    # the value is stable within a device pass.
-    now_ts = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # Compute a single timestamp for all updates in this run so the value is
+    # stable within a device pass.
+    now_ts          = datetime.now().astimezone().isoformat(timespec="seconds")
+    state_update_ts = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # ── Unused-ports threshold (from device custom field) ─────────────────
+    raw_ut = (device.get("custom_fields") or {}).get(_CF_UNUSED_TIME)
+    try:
+        unused_time_secs = int(raw_ut) if raw_ut is not None else 0
+    except (ValueError, TypeError):
+        log.warning(
+            "%-30s  unused_time CF value %r is not an integer — using 0",
+            device_name, raw_ut,
+        )
+        unused_time_secs = 0
+
+    unused_ports   = 0
+    admin_down_cnt = 0
+    threshold_cnt  = 0
 
     # ── Per-interface state comparison and update ────────────────────────
     for state_rec in states:
@@ -458,6 +540,26 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
         target_id = resolve_target_device_id(iface_name, device_id, vc_member_map)
 
         summary["interfaces_checked"] += 1
+
+        # ── Unused-ports counting ─────────────────────────────────────────
+        # Runs unconditionally (dry-run and live) so the logged totals are
+        # always accurate.  Writing to NetBox happens only in live mode.
+        if iface_state == "ADMIN DOWN":
+            unused_ports   += 1
+            admin_down_cnt += 1
+        else:
+            li_val = last_input_map.get(iface_name)
+            if li_val is not None:
+                li_secs = convert_last_input_to_seconds(li_val)
+                if li_secs is None:
+                    log.debug(
+                        "%-30s  %s: last_input %r not parseable — "
+                        "excluded from unused count",
+                        device_name, iface_name, li_val,
+                    )
+                elif li_secs > unused_time_secs:
+                    unused_ports  += 1
+                    threshold_cnt += 1
 
         log.debug(
             "%-30s  Interface %s state detected as %s (dev_id=%s)",
@@ -523,6 +625,38 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
                 "%-30s  STATE unchanged for %s (%s), skipping",
                 device_name, iface_name, iface_state,
             )
+
+    # ── Unused-ports summary + device CF update ──────────────────────────
+    summary["unused_ports"]     = unused_ports
+    summary["admin_down_ports"] = admin_down_cnt
+    summary["threshold_ports"]  = threshold_cnt
+
+    log.info(
+        "%-30s  unused_ports=%d  (admin_down=%d  threshold=%d)",
+        device_name, unused_ports, admin_down_cnt, threshold_cnt,
+    )
+
+    if not args.dry_run:
+        try:
+            nb.update_device_custom_fields(
+                device_id,
+                {
+                    _CF_UNUSED_PORTS: unused_ports,
+                    _CF_STATE_UPDATE: state_update_ts,
+                },
+            )
+            log.info(
+                "%-30s  device CF updated: unused_ports=%d  state_update=%s",
+                device_name, unused_ports, state_update_ts,
+            )
+        except NetBoxClientError as exc:
+            log.warning("%-30s  device CF update failed: %s", device_name, exc)
+            summary["errors"].append(f"device CF update: {exc}")
+    else:
+        log.info(
+            "DRY-RUN  %-30s  would update device CF: unused_ports=%d  state_update=%s",
+            device_name, unused_ports, state_update_ts,
+        )
 
     # ── Per-interface last_input update ──────────────────────────────────
     if last_input_map and not args.dry_run:
@@ -668,13 +802,14 @@ def main() -> None:
                 log.info(
                     "%-30s  status=%-8s  checked=%d  "
                     "state_upd=%d  state_unch=%d  "
-                    "last_input_upd=%d  errs=%d",
+                    "last_input_upd=%d  unused=%d  errs=%d",
                     device_name,
                     result.get("status", "?"),
                     result.get("interfaces_checked", 0),
                     result.get("states_updated", 0),
                     result.get("states_unchanged", 0),
                     result.get("last_input_updated", 0),
+                    result.get("unused_ports", 0),
                     len(result.get("errors", [])),
                 )
             except Exception as exc:
@@ -686,6 +821,9 @@ def main() -> None:
                     "interfaces_checked": 0,
                     "states_updated":     0,
                     "states_unchanged":   0,
+                    "unused_ports":       0,
+                    "admin_down_ports":   0,
+                    "threshold_ports":    0,
                     "errors":             [str(exc)],
                 })
 
