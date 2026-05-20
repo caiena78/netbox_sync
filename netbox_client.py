@@ -2286,11 +2286,14 @@ class NetBoxClient:
         device_id: int,
         interface_name: str,
         state_value: str,
-        state_change_ts: str,
+        state_change_ts: Optional[str] = None,
     ) -> dict:
         """
-        Idempotently update the ``STATE`` and ``state_change`` custom fields
-        on a NetBox interface.
+        Idempotently update the ``STATE`` custom field on a NetBox interface.
+
+        ``state_change_ts`` is accepted for backward compatibility but is no
+        longer written to NetBox — the ``state_change`` custom field has been
+        removed from the data model.  Pass ``None`` or omit the argument.
 
         Comparison
         ----------
@@ -2364,19 +2367,13 @@ class NetBoxClient:
             return {"_action": "skipped", "old_state": old_state, "new_state": state_value}
 
         try:
-            rec.update({
-                "custom_fields": {
-                    "STATE":         state_value,
-                    "state_change":  state_change_ts,
-                }
-            })
+            rec.update({"custom_fields": {"STATE": state_value}})
             return {"_action": "updated", "old_state": old_state, "new_state": state_value}
         except pynetbox.RequestError as exc:
             raise NetBoxClientError(
                 f"update_interface_state_fields: PATCH failed for "
                 f"{interface_name!r} "
-                f"payload={{'STATE': {state_value!r}, "
-                f"'state_change': {state_change_ts!r}}}: {exc}"
+                f"payload={{'STATE': {state_value!r}}}: {exc}"
             ) from exc
 
     # ----------------------------------------------------------------------- #

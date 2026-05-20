@@ -67,9 +67,9 @@ from sync_netbox_interfaces import (
 # --------------------------------------------------------------------------- #
 
 # NetBox custom-field names (must match what is defined in the NetBox UI).
-_CF_STATE         = "STATE"
-_CF_STATE_CHANGE  = "state_change"
-_CF_LAST_INPUT    = "last_input"
+_CF_STATE          = "STATE"
+_CF_LAST_INPUT     = "last_input"
+_CF_IF_LAST_UPDATE = "if_last_update"
 
 # Matches:  "Last input 00:02:13,"  "Last input never,"  "Last input 3w2d,"
 # Captures everything between "Last input " and the first comma or newline.
@@ -483,10 +483,9 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
                 )
             else:
                 log.info(
-                    "DRY-RUN  %-30s  would update STATE for %s: %s → %s; "
-                    "state_change=%s",
+                    "DRY-RUN  %-30s  would update STATE for %s: %s → %s",
                     device_name, iface_name,
-                    nb_state or "(null)", iface_state, now_ts,
+                    nb_state or "(null)", iface_state,
                 )
             continue
 
@@ -496,7 +495,6 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
                 device_id=target_id,
                 interface_name=iface_name,
                 state_value=iface_state,
-                state_change_ts=now_ts,
             )
         except NetBoxClientError as exc:
             err = f"STATE update {iface_name!r}: {exc}"
@@ -510,9 +508,9 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
         if action == "updated":
             summary["states_updated"] += 1
             log.info(
-                "%-30s  Updating STATE for %s: %s → %s; state_change=%s",
+                "%-30s  Updating STATE for %s: %s → %s",
                 device_name, iface_name,
-                old_state or "(null)", iface_state, now_ts,
+                old_state or "(null)", iface_state,
             )
         elif action == "not_found":
             log.warning(
@@ -559,13 +557,16 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
             try:
                 nb.update_interface(
                     nb_rec["id"],
-                    {"custom_fields": {_CF_LAST_INPUT: last_input_val}},
+                    {"custom_fields": {
+                        _CF_LAST_INPUT:     last_input_val,
+                        _CF_IF_LAST_UPDATE: now_ts,
+                    }},
                 )
                 summary["last_input_updated"] += 1
                 log.info(
-                    "%-30s  last_input updated for %s: %r → %r",
+                    "%-30s  last_input updated for %s: %r → %r  if_last_update=%s",
                     device_name, iface_name,
-                    current_val or "(null)", last_input_val,
+                    current_val or "(null)", last_input_val, now_ts,
                 )
             except NetBoxClientError as exc:
                 err = f"last_input update {iface_name!r}: {exc}"
