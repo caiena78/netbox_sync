@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -68,8 +69,93 @@ from sync_netbox_interfaces import (
 # NetBox custom-field names (must match what is defined in the NetBox UI).
 _CF_STATE         = "STATE"
 _CF_STATE_CHANGE  = "state_change"
+_CF_LAST_INPUT    = "last_input"
+
+# Matches:  "Last input 00:02:13,"  "Last input never,"  "Last input 3w2d,"
+# Captures everything between "Last input " and the first comma or newline.
+_LAST_INPUT_RE = re.compile(r"Last input\s+([^,\n]+)", re.IGNORECASE)
+
+# Matches the opening line of a "show interfaces" interface block, e.g.:
+#   "GigabitEthernet1/0/1 is up, line protocol is up (connected)"
+_IFACE_HEADER_RE = re.compile(
+    r"^([A-Za-z][A-Za-z0-9/.\-]+)\s+is\s+(?:up|down|administratively down)",
+    re.MULTILINE,
+)
 
 log = logging.getLogger("netbox_update_State")
+
+
+# --------------------------------------------------------------------------- #
+# Last-input helpers                                                           #
+# --------------------------------------------------------------------------- #
+
+
+def parse_last_input(block: str) -> Optional[str]:
+    """
+    Extract the ``Last input`` timer from one interface block.
+
+    Handles all Cisco IOS / IOS-XE formats seen in ``show interfaces``:
+
+    - ``never``
+    - ``00:02:13``   (HH:MM:SS)
+    - ``3w2d``       (compact: weeks+days)
+    - ``2y11w``      (compact: years+weeks)
+    - ``0Y 5W 0D 0H 0m 0S``  (verbose long form)
+
+    Returns the raw string as-is (stripped) so the caller stores the exact
+    value the device reports.  Returns ``None`` when the pattern is absent.
+    """
+    m = _LAST_INPUT_RE.search(block)
+    if not m:
+        return None
+    return m.group(1).strip()
+
+
+def collect_last_input(cisco: CiscoDeviceClient) -> Dict[str, str]:
+    """
+    Run ``show interfaces`` once and return a mapping of interface name to
+    its ``Last input`` timer string.
+
+    Reuses the open CLI connection established by
+    ``get_interface_state_inventory()`` — never reconnects or disconnects.
+
+    Returns
+    -------
+    dict
+        ``{expanded_interface_name: last_input_string}``
+        Only interfaces where the timer was successfully parsed are included.
+    """
+    try:
+        raw = cisco._cli_connection.send_command("show interfaces")
+    except Exception as exc:
+        log.warning("show interfaces failed: %s", exc)
+        return {}
+
+    result: Dict[str, str] = {}
+
+    # Split on each interface-header line.  re.split with a look-ahead keeps
+    # the header as the first line of each block so we can extract the name.
+    blocks = re.split(r"(?=^[A-Za-z][A-Za-z0-9/.\-]+ is (?:up|down|administratively down))",
+                      raw, flags=re.MULTILINE)
+
+    for block in blocks:
+        if not block.strip():
+            continue
+
+        header = _IFACE_HEADER_RE.match(block)
+        if not header:
+            continue
+
+        raw_name   = header.group(1)
+        iface_name = expand_interface_name(raw_name)
+
+        last_input = parse_last_input(block)
+        if last_input is not None:
+            result[iface_name] = last_input
+        else:
+            log.debug("No Last input found for interface %s", iface_name)
+
+    return result
 
 # --------------------------------------------------------------------------- #
 # Per-device worker                                                            #
@@ -110,13 +196,15 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
     device_id   = device.get("id")
 
     summary: dict = {
-        "device":             device_name,
-        "status":             "failed",
-        "transport_used":     None,
-        "interfaces_checked": 0,
-        "states_updated":     0,
-        "states_unchanged":   0,
-        "errors":             [],
+        "device":               device_name,
+        "status":               "failed",
+        "transport_used":       None,
+        "interfaces_checked":   0,
+        "states_updated":       0,
+        "states_unchanged":     0,
+        "last_input_updated":   0,
+        "last_input_unchanged": 0,
+        "errors":               [],
     }
 
     # ── Gate: device must have a primary IP ──────────────────────────────
@@ -196,6 +284,29 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
         "%-30s  collected state for %d interface(s)",
         device_name, len(states),
     )
+
+    # ── Collect last-input timers (IOS / IOS-XE only) ────────────────────
+    # "show interfaces" Last input parsing is only reliable on IOS and IOS-XE.
+    # NX-OS and other platforms produce different output formats; skip them.
+    _LAST_INPUT_SUPPORTED = {"ios", "iosxe"}
+    last_input_map: Dict[str, str] = {}
+    if os_type not in _LAST_INPUT_SUPPORTED:
+        log.info(
+            "%-30s  last_input collection skipped — not supported for os_type=%r",
+            device_name, os_type,
+        )
+    else:
+        try:
+            last_input_map = collect_last_input(cisco)
+            log.info(
+                "%-30s  collected last_input for %d interface(s)",
+                device_name, len(last_input_map),
+            )
+        except Exception as exc:
+            log.warning(
+                "%-30s  last_input collection failed — continuing without it: %s",
+                device_name, exc,
+            )
 
     # Compute a single timestamp for all state-change updates in this run so
     # the value is stable within a device pass.
@@ -285,6 +396,66 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
                 device_name, iface_name, iface_state,
             )
 
+    # ── Per-interface last_input update ──────────────────────────────────
+    if last_input_map and not args.dry_run:
+        for iface_name, last_input_val in last_input_map.items():
+            target_id = resolve_target_device_id(iface_name, device_id, vc_member_map)
+
+            try:
+                nb_rec = nb.get_interface_by_name(target_id, iface_name)
+            except NetBoxClientError as exc:
+                log.warning(
+                    "%-30s  last_input: lookup failed for %s: %s",
+                    device_name, iface_name, exc,
+                )
+                continue
+
+            if nb_rec is None:
+                log.debug(
+                    "%-30s  last_input: %s not in NetBox — skipped",
+                    device_name, iface_name,
+                )
+                continue
+
+            current_val = (nb_rec.get("custom_fields") or {}).get(_CF_LAST_INPUT)
+            if current_val == last_input_val:
+                summary["last_input_unchanged"] += 1
+                log.debug(
+                    "%-30s  last_input unchanged for %s (%s)",
+                    device_name, iface_name, last_input_val,
+                )
+                continue
+
+            try:
+                nb.update_interface(
+                    nb_rec["id"],
+                    {"custom_fields": {_CF_LAST_INPUT: last_input_val}},
+                )
+                summary["last_input_updated"] += 1
+                log.info(
+                    "%-30s  last_input updated for %s: %r → %r",
+                    device_name, iface_name,
+                    current_val or "(null)", last_input_val,
+                )
+            except NetBoxClientError as exc:
+                err = f"last_input update {iface_name!r}: {exc}"
+                log.warning("%-30s  %s", device_name, err)
+                summary["errors"].append(err)
+
+    elif last_input_map and args.dry_run:
+        for iface_name, last_input_val in last_input_map.items():
+            log.info(
+                "DRY-RUN  %-30s  would update last_input for %s: %r",
+                device_name, iface_name, last_input_val,
+            )
+
+    log.info(
+        "%-30s  last_input: updated=%d unchanged=%d",
+        device_name,
+        summary["last_input_updated"],
+        summary["last_input_unchanged"],
+    )
+
     cisco._cli_disconnect()
     summary["status"] = "success"
     return summary
@@ -364,13 +535,15 @@ def main() -> None:
                 result = future.result()
                 summaries.append(result)
                 log.info(
-                    "%-30s  status=%-8s  checked=%d  updated=%d  "
-                    "unchanged=%d  errs=%d",
+                    "%-30s  status=%-8s  checked=%d  "
+                    "state_upd=%d  state_unch=%d  "
+                    "last_input_upd=%d  errs=%d",
                     device_name,
                     result.get("status", "?"),
                     result.get("interfaces_checked", 0),
                     result.get("states_updated", 0),
                     result.get("states_unchanged", 0),
+                    result.get("last_input_updated", 0),
                     len(result.get("errors", [])),
                 )
             except Exception as exc:
@@ -392,10 +565,12 @@ def main() -> None:
     total_fail = len(summaries) - total_ok
     log.info(
         "DONE  devices=%d ok=%d failed=%d  "
-        "states: updated=%d unchanged=%d",
+        "states: updated=%d unchanged=%d  "
+        "last_input: updated=%d",
         len(summaries), total_ok, total_fail,
-        sum(s.get("states_updated",   0) for s in summaries),
-        sum(s.get("states_unchanged", 0) for s in summaries),
+        sum(s.get("states_updated",      0) for s in summaries),
+        sum(s.get("states_unchanged",    0) for s in summaries),
+        sum(s.get("last_input_updated",  0) for s in summaries),
     )
 
     print(json.dumps(summaries, indent=2))
