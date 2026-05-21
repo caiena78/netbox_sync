@@ -1944,6 +1944,11 @@ def _sync_interface_states(
         mark_connected = state["mark_connected"]
         iface_state    = state.get("state") or "UNKNOWN"
 
+        # Port-channels are logical aggregates — NetBox does not support
+        # mark_connected on LAG interfaces.
+        if iface_name.startswith("Port-channel"):
+            mark_connected = False
+
         # Route to the correct VC member device, just like _sync_trunks does.
         target_id = resolve_target_device_id(iface_name, device_id, vc_member_map)
 
