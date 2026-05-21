@@ -3228,7 +3228,10 @@ def sync_device(
         )
         if _iface_type == "other":
             _unknown_types.append({"name": iface_name, "reason": "no mapping rule matched"})
-        if args.force_type:
+        # Always include type when creating a new interface — mirrors the
+        # _relocate_interface path which calls create_payload.setdefault("type", "other").
+        _is_missing = not nb_ifaces_by_device.get(target_id, {}).get(iface_name)
+        if _is_missing or args.force_type:
             nb_payload["type"] = _iface_type
 
         # ── Log VRF detection (Stage 1 is inventory only; VRF is set on IPs) ─
