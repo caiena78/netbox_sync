@@ -655,6 +655,16 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
                     "excluded from unused count",
                     device_name, iface_name,
                 )
+            elif li_val.strip().lower() == "never":
+                # "never" means the port has never received any traffic.
+                # Treat as infinite inactivity — always exceeds any threshold.
+                unused_ports  += 1
+                threshold_cnt += 1
+                log.debug(
+                    "%-30s  %s: last_input='never' — infinite inactivity, "
+                    "counted as unused",
+                    device_name, iface_name,
+                )
             else:
                 li_secs = convert_last_input_to_seconds(li_val)
                 if li_secs is None:
