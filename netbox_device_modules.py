@@ -36,19 +36,26 @@ Environment variables  (per README.md)
 
 Usage
 -----
-  # Single device (by NetBox name)
+  # Single device (VC-aware)
   python netbox_device_modules.py --device core-sw-01
 
-  # All devices in a site (dry-run)
-  python netbox_device_modules.py --site my-site --dry-run
+  # Multiple devices
+  python netbox_device_modules.py --devices core-sw-01,core-sw-02
 
-  # Devices by role, limit to 10
-  python netbox_device_modules.py --role distribution --limit 10
+  # All devices in a site
+  python netbox_device_modules.py --site-slug dc1 --dry-run
+
+  # NetBox filter (JSON)
+  python netbox_device_modules.py --device-filter '{"site": "dc1", "role": "distribution"}'
+
+  # Legacy shorthand (equivalent to --device-filter)
+  python netbox_device_modules.py --site dc1 --role distribution --limit 10
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import logging.handlers
 import os
@@ -67,7 +74,7 @@ from sync_netbox_interfaces import (
     expand_interface_name,
     get_device_mgmt_ip,
     get_device_os_type,
-    resolve_single_device,
+    resolve_device_list,
     _MODEL_FAMILY_C3750,
     _MODEL_FAMILY_C9K,
     _MODEL_FAMILY_C9600,
@@ -1087,6 +1094,10 @@ def sync_device_modules(
     module_api: NetBoxModuleAPI,
     dry_run: bool,
     include_transceivers: bool = False,
+    username: str = "",
+    password: str = "",
+    enable_secret: str = "",
+    timeout: int = 30,
 ) -> SyncResult:
     """
     Full module sync for one device.
@@ -1149,14 +1160,13 @@ def sync_device_modules(
             log.warning("%s  VC member map failed: %s", device_name, exc)
 
     # ── Connect to device ─────────────────────────────────────────────────
-    enable_secret = os.environ.get("CISCO_ENABLE_PWD") or None
     cisco = CiscoDeviceClient(
         host=mgmt_ip,
-        username=os.environ.get("CISCO_SRV_ACCOUNT", ""),
-        password=os.environ.get("CISCO_SRV_PWD", ""),
+        username=username or os.environ.get("CISCO_SRV_ACCOUNT", ""),
+        password=password or os.environ.get("CISCO_SRV_PWD", ""),
         os_type=os_type,
-        enable_secret=enable_secret,
-        timeout=30,
+        enable_secret=enable_secret or os.environ.get("CISCO_ENABLE_PWD") or None,
+        timeout=timeout,
         verify_ssl=False,
     )
 
@@ -1468,8 +1478,8 @@ def _sync_module(
 # Logging setup                                                                #
 # --------------------------------------------------------------------------- #
 
-def _configure_logging(debug: bool) -> None:
-    level = logging.DEBUG if debug else logging.INFO
+def _configure_logging(log_level: str, log_file: Optional[str] = None) -> None:
+    level = getattr(logging, log_level.upper(), logging.INFO)
     fmt   = "%(asctime)s %(levelname)-8s %(name)s: %(message)s"
 
     root = logging.getLogger()
@@ -1479,6 +1489,14 @@ def _configure_logging(debug: bool) -> None:
     sh = logging.StreamHandler(sys.stderr)
     sh.setFormatter(logging.Formatter(fmt))
     root.addHandler(sh)
+
+    if log_file:
+        try:
+            fh = logging.FileHandler(log_file, mode="a", encoding="utf-8")
+            fh.setFormatter(logging.Formatter(fmt))
+            root.addHandler(fh)
+        except OSError as exc:
+            log.warning("Cannot open log file %r: %s", log_file, exc)
 
     # Error log file — WARNING and above only
     err_log.handlers.clear()
@@ -1508,39 +1526,86 @@ def build_parser() -> argparse.ArgumentParser:
 Environment variables:
   NETBOX_URL           NetBox base URL
   NETBOX_API           NetBox API token
-  CISCO_SRV_ACCOUNT    SSH username
-  CISCO_SRV_PWD        SSH password
-  CISCO_ENABLE_PWD     Enable secret (optional)
+  CISCO_SRV_ACCOUNT    SSH username  (overridden by --username)
+  CISCO_SRV_PWD        SSH password  (overridden by --password)
+  CISCO_ENABLE_PWD     Enable secret (overridden by --enable-secret)
 
 Examples:
+  # Single device
   python netbox_device_modules.py --device core-sw-01
-  python netbox_device_modules.py --site my-site --dry-run
-  python netbox_device_modules.py --role distribution --limit 5 --debug
+
+  # Comma-separated list
+  python netbox_device_modules.py --devices core-sw-01,core-sw-02
+
+  # Device file (one name per line, # comments ignored)
+  python netbox_device_modules.py --device-file hosts.txt
+
+  # NetBox filter (JSON)
+  python netbox_device_modules.py --device-filter '{"site": "dc1", "role": "distribution"}'
+
+  # All active devices in a site
+  python netbox_device_modules.py --site-slug dc1
+
+  # Legacy single-filter shortcuts
+  python netbox_device_modules.py --site dc1 --dry-run
+  python netbox_device_modules.py --role distribution --limit 5
+
+  # Verbose logging
+  python netbox_device_modules.py --device core-sw-01 --log-level DEBUG
 """,
     )
 
     nb_grp = p.add_argument_group("NetBox connection")
-    nb_grp.add_argument("--netbox-url",   default=os.environ.get("NETBOX_URL",  ""), metavar="URL")
-    nb_grp.add_argument("--netbox-token", default=os.environ.get("NETBOX_API",  ""), metavar="TOKEN")
-    nb_grp.add_argument("--netbox-verify-ssl", action=argparse.BooleanOptionalAction, default=True)
+    nb_grp.add_argument("--netbox-url",   default=os.environ.get("NETBOX_URL",  ""), metavar="URL",
+                        help="NetBox base URL (env: NETBOX_URL)")
+    nb_grp.add_argument("--netbox-token", default=os.environ.get("NETBOX_API",  ""), metavar="TOKEN",
+                        help="NetBox API token (env: NETBOX_API)")
+    nb_grp.add_argument("--netbox-verify-ssl", action=argparse.BooleanOptionalAction, default=True,
+                        help="Verify NetBox TLS certificate (default: true)")
 
-    sel_grp = p.add_argument_group("Device selection (pick one)")
-    sel_grp.add_argument("--device", metavar="NAME",     help="Single device by NetBox name")
-    sel_grp.add_argument("--site",   metavar="SLUG",     help="All devices in this site slug")
-    sel_grp.add_argument("--role",   metavar="SLUG",     help="Filter by device role slug")
-    sel_grp.add_argument("--tag",    metavar="SLUG",     help="Filter by device tag slug")
-    sel_grp.add_argument("--limit",  type=int, metavar="N", help="Process at most N devices")
+    sel_grp = p.add_argument_group("Device selection (pick one, or omit for all)")
+    sel_grp.add_argument("--device",      metavar="NAME",
+                         help="Single device by NetBox name")
+    sel_grp.add_argument("--devices",     metavar="NAME,...",
+                         help="Comma-separated device names")
+    sel_grp.add_argument("--device-file", metavar="PATH",
+                         help="File with one device name per line (#comments ignored)")
+    sel_grp.add_argument("--device-filter", default="{}",  metavar="JSON",
+                         help="NetBox DCIM device filter as JSON (default: all devices)")
+    sel_grp.add_argument("--all", dest="all_devices", action="store_true",
+                         help="Explicit 'process all' flag (use with caution)")
+    sel_grp.add_argument("--site-slug", default="", metavar="SLUG",
+                         help="Limit to devices in this NetBox site slug (stacks with --device-filter)")
+
+    leg_grp = p.add_argument_group("Legacy device selection (alternative to --device-filter)")
+    leg_grp.add_argument("--site",  metavar="SLUG", help="All devices in this site slug")
+    leg_grp.add_argument("--role",  metavar="SLUG", help="Filter by device role slug")
+    leg_grp.add_argument("--tag",   metavar="SLUG", help="Filter by device tag slug")
+    leg_grp.add_argument("--limit", type=int, metavar="N", help="Process at most N devices")
+
+    cred_grp = p.add_argument_group("Cisco credentials")
+    cred_grp.add_argument("--username",
+                          default=os.environ.get("CISCO_SRV_ACCOUNT", ""),
+                          help="SSH username (env: CISCO_SRV_ACCOUNT)")
+    cred_grp.add_argument("--password",
+                          default=os.environ.get("CISCO_SRV_PWD", ""),
+                          help="SSH password (env: CISCO_SRV_PWD)")
+    cred_grp.add_argument("--enable-secret",
+                          default=os.environ.get("CISCO_ENABLE_PWD", ""),
+                          help="Enable-mode secret (env: CISCO_ENABLE_PWD)")
 
     run_grp = p.add_argument_group("Run options")
-    run_grp.add_argument(
-        "--dry-run", action="store_true",
-        help="Print what would change without writing to NetBox",
-    )
-    run_grp.add_argument(
-        "--include-transceivers", action="store_true",
-        help="Also sync SFP/QSFP transceivers as modules (disabled by default)",
-    )
-    run_grp.add_argument("--debug", action="store_true", help="Verbose debug logging")
+    run_grp.add_argument("--dry-run", action="store_true",
+                         help="Print what would change without writing to NetBox")
+    run_grp.add_argument("--include-transceivers", action="store_true",
+                         help="Also sync SFP/QSFP transceivers as modules (disabled by default)")
+    run_grp.add_argument("--timeout", type=int, default=30, metavar="SEC",
+                         help="Device SSH timeout in seconds (default: 30)")
+    run_grp.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+                         default="INFO",
+                         help="Log verbosity (default: INFO; use DEBUG for verbose output)")
+    run_grp.add_argument("--log-file", metavar="PATH", default=None,
+                         help="Also write logs to this file (appended, UTF-8)")
 
     return p
 
@@ -1552,7 +1617,7 @@ Examples:
 def main() -> None:
     parser = build_parser()
     args   = parser.parse_args()
-    _configure_logging(args.debug)
+    _configure_logging(args.log_level, args.log_file)
 
     # ── Validate required config ──────────────────────────────────────────
     missing: list = []
@@ -1560,17 +1625,49 @@ def main() -> None:
         missing.append("--netbox-url / NETBOX_URL")
     if not args.netbox_token:
         missing.append("--netbox-token / NETBOX_API")
-    if not os.environ.get("CISCO_SRV_ACCOUNT"):
-        missing.append("CISCO_SRV_ACCOUNT")
-    if not os.environ.get("CISCO_SRV_PWD"):
-        missing.append("CISCO_SRV_PWD")
+    if not args.username:
+        missing.append("--username / CISCO_SRV_ACCOUNT")
+    if not args.password:
+        missing.append("--password / CISCO_SRV_PWD")
     if missing:
         log.error("Missing required config:\n  %s", "\n  ".join(missing))
         sys.exit(1)
 
-    if not any([args.device, args.site, args.role, args.tag]):
-        log.error("Specify at least one of: --device, --site, --role, --tag")
+    # ── Ensure at least one device selector is given ──────────────────────
+    has_new_selector = any([
+        args.device,
+        getattr(args, "devices", None),
+        getattr(args, "device_file", None),
+        args.all_devices,
+        args.device_filter != "{}",
+        args.site_slug,
+    ])
+    has_legacy_selector = any([args.site, args.role, args.tag])
+
+    if not has_new_selector and not has_legacy_selector:
+        log.error(
+            "Specify at least one device selector: "
+            "--device, --devices, --device-file, --device-filter, "
+            "--all, --site-slug, --site, --role, or --tag"
+        )
         sys.exit(1)
+
+    # ── Bridge legacy --site/--role/--tag into --device-filter ───────────
+    # resolve_device_list understands --device-filter but not --site/--role/--tag.
+    if has_legacy_selector and not has_new_selector:
+        try:
+            nb_filter: dict = json.loads(args.device_filter)
+        except json.JSONDecodeError:
+            nb_filter = {}
+        nb_filter.setdefault("status", "active")
+        nb_filter.setdefault("has_primary_ip", True)
+        if args.site:
+            nb_filter["site"] = args.site
+        if args.role:
+            nb_filter["role"] = args.role
+        if args.tag:
+            nb_filter["tag"] = args.tag
+        args.device_filter = json.dumps(nb_filter)
 
     if args.dry_run:
         log.info("*** DRY-RUN — no changes will be written to NetBox ***")
@@ -1582,28 +1679,13 @@ def main() -> None:
     )
     module_api = NetBoxModuleAPI(nb)
 
-    # ── Build device filter ───────────────────────────────────────────────
-    if args.device:
-        # resolve_single_device tries virtual chassis first, then falls back
-        # to a regular device lookup — so passing a VC name like "acc-stack-01"
-        # returns the master member with _vc_id already set.
-        device_rec = resolve_single_device(args.device.strip(), nb)
-        if not device_rec:
-            log.error(
-                "Device or virtual chassis %r not found in NetBox.", args.device
-            )
-            sys.exit(1)
-        devices = [device_rec]
-    else:
-        nb_filter: dict = {"status": "active", "has_primary_ip": True}
-        if args.site:
-            nb_filter["site"] = args.site
-        if args.role:
-            nb_filter["role"] = args.role
-        if args.tag:
-            nb_filter["tag"] = args.tag
-        devices = nb.get_devices(filters=nb_filter)
-        log.info("NetBox returned %d device(s).", len(devices))
+    # ── Resolve device list ───────────────────────────────────────────────
+    devices = resolve_device_list(args, nb)
+    log.info("Processing %d device(s).", len(devices))
+
+    if not devices:
+        log.warning("No devices matched the given selectors.")
+        sys.exit(0)
 
     if args.limit:
         devices = devices[: args.limit]
@@ -1611,14 +1693,11 @@ def main() -> None:
     # ── Run sync per device ───────────────────────────────────────────────
     all_results: list[SyncResult] = []
     for device in devices:
-        # Try to attach VC context (same pattern as sync_netbox_interfaces)
+        # Attach VC context if present
         try:
-            vc_id = None
             vc_obj = device.get("virtual_chassis")
             if isinstance(vc_obj, dict) and vc_obj.get("id"):
-                vc_id = vc_obj["id"]
-            if vc_id:
-                device["_vc_id"] = vc_id
+                device["_vc_id"] = vc_obj["id"]
         except Exception:
             pass
 
@@ -1628,6 +1707,10 @@ def main() -> None:
             module_api=module_api,
             dry_run=args.dry_run,
             include_transceivers=args.include_transceivers,
+            username=args.username,
+            password=args.password,
+            enable_secret=args.enable_secret,
+            timeout=args.timeout,
         )
         all_results.append(result)
 

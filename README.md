@@ -2118,24 +2118,56 @@ grep missing_module_type netbox_device_modules_errors.log \
 usage: netbox_device_modules.py [-h]
 
   NetBox connection:
-    --netbox-url URL          NetBox base URL (env: NETBOX_URL)
-    --netbox-token TOKEN      NetBox API token (env: NETBOX_API)
+    --netbox-url URL                  NetBox base URL (env: NETBOX_URL)
+    --netbox-token TOKEN              NetBox API token (env: NETBOX_API)
     --netbox-verify-ssl / --no-netbox-verify-ssl
 
-  Device selection (pick one):
-    --device NAME             Single device by NetBox name
-    --site SLUG               All active devices in this site slug
-    --role SLUG               Filter by device role slug
-    --tag SLUG                Filter by device tag slug
-    --limit N                 Process at most N devices
+  Device selection (pick one, or omit for all):
+    --device NAME                     Single device by NetBox name (VC-aware)
+    --devices NAME,...                Comma-separated device names (VC-aware)
+    --device-file PATH                File with one device name per line (#comments ignored)
+    --device-filter JSON              NetBox DCIM filter as JSON  (default: {})
+    --all                             Explicit "process all" flag
+    --site-slug SLUG                  Limit to devices in this site slug (stacks with --device-filter)
+
+  Legacy device selection (alternative to --device-filter):
+    --site SLUG                       Equivalent to --device-filter '{"site": SLUG}'
+    --role SLUG                       Equivalent to --device-filter '{"role": SLUG}'
+    --tag  SLUG                       Equivalent to --device-filter '{"tag": SLUG}'
+    --limit N                         Process at most N devices
+
+  Cisco credentials:
+    --username USER                   SSH username (env: CISCO_SRV_ACCOUNT)
+    --password PASS                   SSH password (env: CISCO_SRV_PWD)
+    --enable-secret SECRET            Enable secret (env: CISCO_ENABLE_PWD)
 
   Run options:
-    --dry-run                 Print what would change; no NetBox writes
-    --include-transceivers    Also sync SFP/QSFP transceivers (disabled by default)
-    --debug                   Verbose debug logging to stderr
+    --dry-run                         Print what would change; no NetBox writes
+    --include-transceivers            Also sync SFP/QSFP transceivers (disabled by default)
+    --timeout SEC                     Device SSH timeout in seconds (default: 30)
+    --log-level DEBUG|INFO|WARNING|ERROR
+                                      Log verbosity (default: INFO)
+    --log-file PATH                   Also write logs to this file (appended, UTF-8)
+```
 
-  Credentials (read from environment; not accepted as CLI flags):
-    CISCO_SRV_ACCOUNT         SSH username
-    CISCO_SRV_PWD             SSH password
-    CISCO_ENABLE_PWD          Enable secret (optional)
+#### Device selection examples
+
+```bash
+# Single device (resolves virtual chassis automatically)
+python netbox_device_modules.py --device acc-stack-01
+
+# Several devices
+python netbox_device_modules.py --devices acc-stack-01,acc-stack-02,dist-sw-01
+
+# From a file (one name per line, lines starting with # ignored)
+python netbox_device_modules.py --device-file /tmp/switches.txt
+
+# All devices in site "dc1" with role "access"
+python netbox_device_modules.py --device-filter '{"site": "dc1", "role": "access"}'
+
+# All devices in a site using --site-slug
+python netbox_device_modules.py --site-slug dc1
+
+# Legacy shorthand (equivalent to --device-filter)
+python netbox_device_modules.py --site dc1 --role distribution --limit 10
 ```
