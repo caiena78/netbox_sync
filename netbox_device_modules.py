@@ -382,6 +382,39 @@ _MODULE_IN_NAME_RE = re.compile(r"\bmodule\s*(\d+)\b",   re.IGNORECASE)
 _SWITCH_IN_NAME_RE = re.compile(r"\bswitch\s*(\d+)\b",   re.IGNORECASE)
 _MEMBER_IN_NAME_RE = re.compile(r"\bmember\s*(\d+)\b",   re.IGNORECASE)
 
+# Matches the identifier suffix of a PSU name: "Power Supply A", "PSU-2", etc.
+_PSU_LABEL_RE = re.compile(
+    r"\b(?:power[\s\-]*supply|psu|ps)[\s\-]*([A-Za-z0-9]+)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _derive_psu_bay_name(raw_name: str) -> str:
+    """
+    Return a normalised PSU module-bay name from a raw inventory NAME.
+
+    The convention is ``"PS-<identifier>"`` where the identifier is the
+    letter or number that distinguishes redundant power supplies on the
+    same device.
+
+    Examples
+    --------
+    ``"Switch 1 - Power Supply A"``  → ``"PS-A"``
+    ``"Switch 2 Power Supply B"``    → ``"PS-B"``
+    ``"WS-C4510R+E Power Supply A"`` → ``"PS-A"``
+    ``"Power Supply 1"``             → ``"PS-1"``
+    ``"Power Supply 2"``             → ``"PS-2"``
+    ``"N7K-C7010 Power Supply 1"``   → ``"PS-1"``
+    """
+    m = _PSU_LABEL_RE.search(raw_name)
+    if m:
+        return f"PS-{m.group(1).upper()}"
+    # Last-resort: trailing single letter or digit after a separator
+    m2 = re.search(r"[- ]([A-Za-z0-9])\s*$", raw_name.strip())
+    if m2:
+        return f"PS-{m2.group(1).upper()}"
+    return "PS-A"
+
 
 def map_component_to_slot(
     entry: InventoryEntry,
@@ -395,26 +428,42 @@ def map_component_to_slot(
 
     Bay-name conventions
     --------------------
+    PSUs (all platforms)
+        Always ``"PS-A"``, ``"PS-B"``, ``"PS-1"``, ``"PS-2"`` — a
+        ``dcim.module_bay`` is created on the target device (or VC member)
+        with this name and a ``dcim.module`` is installed in it.
+
     C4500 / C9600
-        "Slot 1", "Slot 2", …  The supervisor bay is also called by slot
-        number (e.g. "Slot 5" on a C4510 where slot 5 is the sup slot).
+        ``"Slot 1"``, ``"Slot 2"``, …  Supervisor without an explicit slot
+        number uses ``"Supervisor"``.
 
     C3750 / C3850 / C9K stacks (VC members)
-        Network/uplink modules are always installed in the bay labeled
-        "Network Module" on the correct VC member device.  The member is
-        identified by the switch number extracted from the inventory NAME
-        (e.g. "Switch 2 Slot 1 …" → switch_num=2 → vc_position=2 device).
-        Power supplies carry switch_num only so _sync_psu() can route them
-        to the right member; they do not get a bay_name because they are
-        stored as inventory items, not modules.
+        Network/uplink modules: ``"Network Module"`` on the target VC member.
+        PSUs: ``"PS-A"`` / ``"PS-B"`` on the target VC member.
+        The member is identified by the switch number in the inventory NAME.
 
     NX-OS
-        "Module 1", "Module 2", …  Supervisors use their module slot number.
+        ``"Module 1"``, ``"Module 2"``, …
     """
     name = entry.raw_name
 
+    # ── Power supplies: uniform "PS-X" bay name across all platforms ──────
+    # PSU bays are created directly under the target device (or VC member).
+    # This is done before platform-specific handling so the PSU path is
+    # identical regardless of which device family is being processed.
+    if entry.kind == _KIND_PSU:
+        entry.bay_name = _derive_psu_bay_name(name)
+        # Stack families also need switch_num to route to the correct VC member.
+        if family in (_FAM_C3750, _FAM_C3850, _FAM_C9K):
+            sw_m = _SWITCH_IN_NAME_RE.search(name) or _MEMBER_IN_NAME_RE.search(name)
+            if sw_m:
+                entry.switch_num = int(sw_m.group(1))
+        return entry
+
+    # ── Module-slot mapping (non-PSU components) ───────────────────────────
+
     # Matches "Slot N", "FRU Uplink Module", "Network Module", "Uplink Module"
-    # keywords that indicate a physical module slot (not a PSU or chassis row).
+    # keywords that indicate a physical module slot.
     _has_module_slot = bool(re.search(
         r"\bslot\b"
         r"|\buplink[\s\-]*module\b"
@@ -426,10 +475,9 @@ def map_component_to_slot(
     if family in (_FAM_C4500, _FAM_C9600):
         m = _SLOT_IN_NAME_RE.search(name)
         if m:
-            entry.slot_num  = int(m.group(1))
-            entry.bay_name  = f"Slot {entry.slot_num}"
+            entry.slot_num = int(m.group(1))
+            entry.bay_name = f"Slot {entry.slot_num}"
         elif entry.kind == _KIND_SUPERVISOR:
-            # Supervisor without an explicit slot number — use "Supervisor"
             entry.bay_name = "Supervisor"
 
     elif family in (_FAM_C3750, _FAM_C3850, _FAM_C9K):
@@ -445,22 +493,10 @@ def map_component_to_slot(
             if trailing:
                 entry.slot_num = int(trailing.group(1))
 
-        if entry.switch_num is not None:
-            if entry.kind == _KIND_PSU:
-                # PSUs on stacked platforms also go into module bays on the
-                # correct VC member.  Derive the bay name from the inventory
-                # NAME after stripping the "Switch N – " prefix, since the
-                # item will live on the member device (e.g. "Power Supply A").
-                raw_psu = entry.raw_name.strip()
-                cleaned = re.sub(
-                    rf"(?i)^\s*switch\s+{entry.switch_num}\s*[-–]?\s*",
-                    "", raw_psu,
-                ).strip()
-                entry.bay_name = cleaned or f"Power Supply ({entry.pid})"
-            elif entry.slot_num is not None or _has_module_slot:
-                # Linecards, supervisors, uplink modules → "Network Module" bay
-                entry.bay_name = "Network Module"
-            # else: bare chassis row for this member — no module bay applies
+        if entry.switch_num is not None and (entry.slot_num is not None or _has_module_slot):
+            # Linecards, supervisors, uplink modules → "Network Module" bay
+            entry.bay_name = "Network Module"
+        # else: bare chassis row for this member — no module bay
 
     elif family == _FAM_NEXUS:
         mod_m = _MODULE_IN_NAME_RE.search(name)
@@ -1059,12 +1095,6 @@ def sync_device_modules(
         if entry.kind not in (_KIND_CHASSIS, _KIND_UNKNOWN, _KIND_FAN):
             map_component_to_slot(entry, family)
 
-    # ── Look up PSU role ID once (best-effort) ────────────────────────────
-    psu_role_id = module_api.ensure_inventory_item_role(
-        "power-supply", "Power Supply"
-    )
-    cisco_mfr_id = module_api.get_manufacturer_id("Cisco")
-
     # ── Process each entry ────────────────────────────────────────────────
     for entry in entries:
         # ── SKIP: chassis, fan, unknown ───────────────────────────────────
@@ -1086,37 +1116,23 @@ def sync_device_modules(
             continue
 
         # ── POWER SUPPLY path ─────────────────────────────────────────────
+        # PSUs always go into dcim.module_bays (PS-A / PS-B) on every
+        # platform.  map_component_to_slot() already set entry.bay_name
+        # via _derive_psu_bay_name().  The same _sync_module() function
+        # handles bay creation, module insertion, and VC member routing.
         if entry.kind == _KIND_PSU:
-            # Stack platforms (3750 / 3850 / 9300 / 9200): PSUs go into
-            # module bays on the correct VC member device, exactly like
-            # linecards.  entry.bay_name was set in map_component_to_slot().
-            # All other platforms (C4500, Nexus, generic) keep PSUs as
-            # dcim.inventory_items.
-            if family in (_FAM_C3750, _FAM_C3850, _FAM_C9K) and entry.bay_name:
-                _sync_module(
-                    entry=entry,
-                    device=device,
-                    device_id=device_id,
-                    device_name=device_name,
-                    family=family,
-                    vc_member_map=vc_member_map,
-                    nb=nb,
-                    module_api=module_api,
-                    dry_run=dry_run,
-                    result=result,
-                )
-            else:
-                _sync_psu(
-                    entry=entry,
-                    device_id=device_id,
-                    device_name=device_name,
-                    vc_member_map=vc_member_map,
-                    module_api=module_api,
-                    psu_role_id=psu_role_id,
-                    cisco_mfr_id=cisco_mfr_id,
-                    dry_run=dry_run,
-                    result=result,
-                )
+            _sync_module(
+                entry=entry,
+                device=device,
+                device_id=device_id,
+                device_name=device_name,
+                family=family,
+                vc_member_map=vc_member_map,
+                nb=nb,
+                module_api=module_api,
+                dry_run=dry_run,
+                result=result,
+            )
             continue
 
         # ── MODULE path (LINECARD / SUPERVISOR / TRANSCEIVER) ─────────────
@@ -1141,93 +1157,6 @@ def sync_device_modules(
         flush=True,
     )
     return result
-
-
-def _sync_psu(
-    entry: InventoryEntry,
-    device_id: int,
-    device_name: str,
-    vc_member_map: Dict[int, int],
-    module_api: NetBoxModuleAPI,
-    psu_role_id: Optional[int],
-    cisco_mfr_id: Optional[int],
-    dry_run: bool,
-    result: SyncResult,
-) -> None:
-    """
-    Upsert one power supply as a NetBox inventory item on the correct device.
-
-    For VC/stack devices the PSU is written to the VC member whose
-    ``vc_position`` matches ``entry.switch_num`` (derived from
-    "Switch N – Power Supply A" style names).  The "Switch N – " prefix is
-    stripped from the inventory item name since the item lives on the member
-    device and the prefix would be redundant there.
-    """
-    # ── Route to the correct VC member ────────────────────────────────────
-    target_device_id = device_id
-    if entry.switch_num is not None and vc_member_map:
-        target_device_id = vc_member_map.get(entry.switch_num, device_id)
-
-    # ── Build a clean PSU name ────────────────────────────────────────────
-    # Strip "Switch N" prefix (with optional " - " / " – " separator) so the
-    # item name on the member device reads "Power Supply A", not
-    # "Switch 1 - Power Supply A".
-    raw = entry.raw_name.strip()
-    if entry.switch_num is not None:
-        cleaned = re.sub(
-            rf"(?i)^\s*switch\s+{entry.switch_num}\s*[-–]?\s*",
-            "",
-            raw,
-        ).strip()
-        name = cleaned or raw
-    else:
-        name = raw
-    name = name or f"Power Supply ({entry.pid})"
-
-    print(
-        f"  {'[DRY-RUN] ' if dry_run else ''}PSU  {name!r}  "
-        f"PID={entry.pid}  SN={entry.serial or '(none)'}  "
-        f"dev_id={target_device_id}",
-        flush=True,
-    )
-
-    if dry_run:
-        result.psus_added += 1
-        return
-
-    try:
-        item, action = module_api.upsert_inventory_item(
-            device_id=target_device_id,
-            name=name,
-            part_id=entry.pid,
-            serial=entry.serial,
-            description=entry.descr,
-            manufacturer_id=cisco_mfr_id,
-            role_id=psu_role_id,
-        )
-        if action == "created":
-            result.psus_added += 1
-            log.info(
-                "%s  PSU created: %s  SN=%s  dev_id=%s",
-                device_name, name, entry.serial, target_device_id,
-            )
-        elif action == "updated":
-            result.psus_updated += 1
-            log.info(
-                "%s  PSU updated: %s  SN=%s  dev_id=%s",
-                device_name, name, entry.serial, target_device_id,
-            )
-        else:
-            log.debug("%s  PSU unchanged: %s", device_name, name)
-    except NetBoxClientError as exc:
-        msg = f"PSU upsert failed name={name!r} pid={entry.pid}: {exc}"
-        log.error("%s  %s", device_name, msg)
-        err_log.error(
-            "PSU | device=%s pid=%s name=%r sn=%s dev_id=%s | %s",
-            device_name, entry.pid, entry.raw_name, entry.serial,
-            target_device_id, exc,
-        )
-        result.errors.append(msg)
 
 
 def _sync_module(
