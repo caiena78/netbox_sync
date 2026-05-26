@@ -2006,15 +2006,30 @@ python netbox_device_modules.py \
 The script infers which NetBox module bay to target from the `NAME` field in
 `show inventory` output, using platform-specific conventions:
 
-| Platform | `show inventory` NAME example | NetBox bay name | Interface pattern used for deletion |
-|---|---|---|---|
-| Catalyst 4500 / 4510 | `WS-C4510R+E Slot 1` | `Slot 1` | `GigabitEthernetX/Y` where `X = slot` |
-| Catalyst 4500 supervisor | `WS-C4510R+E Slot 6` | `Slot 6` | `TenGigabitEthernetX/Y` where `X = slot` |
-| Catalyst 3850 stack base | `Switch 1` | `Switch 1` | All `Gi1/0/*`, `Te1/0/*` |
-| Catalyst 3850 uplink module | `Switch 1 Slot 1 - WS-C3850-24T` | `Switch 1 Slot 1` | `Gi1/1/*`, `Te1/1/*` |
-| Catalyst 3850 stack member 2 | `Switch 2 Slot 1 - ...` | `Switch 2 Slot 1` | `Gi2/1/*` on member device |
-| Nexus linecard | `Module 3` | `Module 3` | `EthernetX/Y` where `X = module` |
-| Nexus supervisor | `Module 1` | `Module 1` | `EthernetX/Y` where `X = 1` |
+| Platform | `show inventory` NAME example | Target device | NetBox bay name | Interface pattern deleted before insert |
+|---|---|---|---|---|
+| Catalyst 4500 / 4510 | `WS-C4510R+E Slot 1` | Device itself | `Slot 1` | `GigabitEthernetX/Y` where `X = slot` |
+| Catalyst 4500 supervisor | `WS-C4510R+E Slot 6` | Device itself | `Slot 6` | `TenGigabitEthernetX/Y` where `X = slot` |
+| Catalyst 3750 / 3850 / 9300 / 9200 uplink module | `Switch 1 Slot 1 - C3850-NM-4-1G` | VC member `vc_position = 1` | `Network Module` | `Gi1/1/*`, `Te1/1/*` on member 1 device |
+| Catalyst 3750 / 3850 / 9300 / 9200 — member 2 | `Switch 2 Slot 1 - C9300-NM-8X` | VC member `vc_position = 2` | `Network Module` | `Gi2/1/*`, `Te2/1/*` on member 2 device |
+| Catalyst 9300 FRU uplink | `Switch 1 FRU Uplink Module 1` | VC member `vc_position = 1` | `Network Module` | `Gi1/1/*`, `Te1/1/*` on member 1 device |
+| Nexus linecard | `Module 3` | Device itself | `Module 3` | `EthernetX/Y` where `X = module` |
+| Nexus supervisor | `Module 1` | Device itself | `Module 1` | `EthernetX/Y` where `X = 1` |
+
+**Power supply routing for VC stacks:**
+
+PSUs are stored as NetBox inventory items (not modules) and are also routed to
+the correct VC member.  The `"Switch N – "` prefix is stripped from the item
+name before writing, since the item already lives on member N's device record.
+
+| `show inventory` NAME | Target device | Inventory item name written |
+|---|---|---|
+| `Switch 1 - Power Supply A` | VC member `vc_position = 1` | `Power Supply A` |
+| `Switch 2 - Power Supply B` | VC member `vc_position = 2` | `Power Supply B` |
+| `Switch 3 Power Supply A` | VC member `vc_position = 3` | `Power Supply A` |
+
+For non-VC devices (standalone switch or modular chassis) the PSU inventory
+item is written directly to the device without any name modification.
 
 For VC/stack devices the switch number extracted from the NAME is mapped to the
 correct VC member `device_id` via `vc_position`, so modules and interface

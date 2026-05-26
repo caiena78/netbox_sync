@@ -399,14 +399,29 @@ def map_component_to_slot(
         "Slot 1", "Slot 2", …  The supervisor bay is also called by slot
         number (e.g. "Slot 5" on a C4510 where slot 5 is the sup slot).
 
-    C3750 / C3850 / C9K stacks
-        "Switch 1", "Switch 2" for the base module of each member.
-        "Switch 1 Slot 1" for uplink / network modules on that member.
+    C3750 / C3850 / C9K stacks (VC members)
+        Network/uplink modules are always installed in the bay labeled
+        "Network Module" on the correct VC member device.  The member is
+        identified by the switch number extracted from the inventory NAME
+        (e.g. "Switch 2 Slot 1 …" → switch_num=2 → vc_position=2 device).
+        Power supplies carry switch_num only so _sync_psu() can route them
+        to the right member; they do not get a bay_name because they are
+        stored as inventory items, not modules.
 
     NX-OS
         "Module 1", "Module 2", …  Supervisors use their module slot number.
     """
     name = entry.raw_name
+
+    # Matches "Slot N", "FRU Uplink Module", "Network Module", "Uplink Module"
+    # keywords that indicate a physical module slot (not a PSU or chassis row).
+    _has_module_slot = bool(re.search(
+        r"\bslot\b"
+        r"|\buplink[\s\-]*module\b"
+        r"|\bnetwork[\s\-]*module\b"
+        r"|\bfru\b",
+        name, re.IGNORECASE,
+    ))
 
     if family in (_FAM_C4500, _FAM_C9600):
         m = _SLOT_IN_NAME_RE.search(name)
@@ -424,11 +439,20 @@ def map_component_to_slot(
             entry.switch_num = int(sw_m.group(1))
         if slot_m:
             entry.slot_num = int(slot_m.group(1))
+        elif _has_module_slot:
+            # "Switch 1 FRU Uplink Module 1" — extract trailing digit as slot
+            trailing = re.search(r"\b(\d+)\s*$", name)
+            if trailing:
+                entry.slot_num = int(trailing.group(1))
 
-        if entry.switch_num is not None and entry.slot_num is not None:
-            entry.bay_name = f"Switch {entry.switch_num} Slot {entry.slot_num}"
-        elif entry.switch_num is not None:
-            entry.bay_name = f"Switch {entry.switch_num}"
+        # PSUs only need switch_num to reach the correct VC member device.
+        # All module types (linecards, uplink modules, supervisors) go into
+        # the "Network Module" bay on that member — stack platforms have exactly
+        # one module slot per member switch.
+        if entry.kind != _KIND_PSU and entry.switch_num is not None:
+            if entry.slot_num is not None or _has_module_slot:
+                entry.bay_name = "Network Module"
+            # else: bare chassis row for this member — no module bay applies
 
     elif family == _FAM_NEXUS:
         mod_m = _MODULE_IN_NAME_RE.search(name)
@@ -1059,6 +1083,7 @@ def sync_device_modules(
                 entry=entry,
                 device_id=device_id,
                 device_name=device_name,
+                vc_member_map=vc_member_map,
                 module_api=module_api,
                 psu_role_id=psu_role_id,
                 cisco_mfr_id=cisco_mfr_id,
@@ -1095,19 +1120,47 @@ def _sync_psu(
     entry: InventoryEntry,
     device_id: int,
     device_name: str,
+    vc_member_map: Dict[int, int],
     module_api: NetBoxModuleAPI,
     psu_role_id: Optional[int],
     cisco_mfr_id: Optional[int],
     dry_run: bool,
     result: SyncResult,
 ) -> None:
-    """Upsert one power supply as an inventory item."""
-    # Compute a friendly name from raw_name
-    name = entry.raw_name.strip() or f"Power Supply ({entry.pid})"
+    """
+    Upsert one power supply as a NetBox inventory item on the correct device.
+
+    For VC/stack devices the PSU is written to the VC member whose
+    ``vc_position`` matches ``entry.switch_num`` (derived from
+    "Switch N – Power Supply A" style names).  The "Switch N – " prefix is
+    stripped from the inventory item name since the item lives on the member
+    device and the prefix would be redundant there.
+    """
+    # ── Route to the correct VC member ────────────────────────────────────
+    target_device_id = device_id
+    if entry.switch_num is not None and vc_member_map:
+        target_device_id = vc_member_map.get(entry.switch_num, device_id)
+
+    # ── Build a clean PSU name ────────────────────────────────────────────
+    # Strip "Switch N" prefix (with optional " - " / " – " separator) so the
+    # item name on the member device reads "Power Supply A", not
+    # "Switch 1 - Power Supply A".
+    raw = entry.raw_name.strip()
+    if entry.switch_num is not None:
+        cleaned = re.sub(
+            rf"(?i)^\s*switch\s+{entry.switch_num}\s*[-–]?\s*",
+            "",
+            raw,
+        ).strip()
+        name = cleaned or raw
+    else:
+        name = raw
+    name = name or f"Power Supply ({entry.pid})"
 
     print(
         f"  {'[DRY-RUN] ' if dry_run else ''}PSU  {name!r}  "
-        f"PID={entry.pid}  SN={entry.serial or '(none)'}",
+        f"PID={entry.pid}  SN={entry.serial or '(none)'}  "
+        f"dev_id={target_device_id}",
         flush=True,
     )
 
@@ -1117,7 +1170,7 @@ def _sync_psu(
 
     try:
         item, action = module_api.upsert_inventory_item(
-            device_id=device_id,
+            device_id=target_device_id,
             name=name,
             part_id=entry.pid,
             serial=entry.serial,
@@ -1127,17 +1180,26 @@ def _sync_psu(
         )
         if action == "created":
             result.psus_added += 1
-            log.info("%s  PSU created: %s  SN=%s", device_name, name, entry.serial)
+            log.info(
+                "%s  PSU created: %s  SN=%s  dev_id=%s",
+                device_name, name, entry.serial, target_device_id,
+            )
         elif action == "updated":
             result.psus_updated += 1
-            log.info("%s  PSU updated: %s  SN=%s", device_name, name, entry.serial)
+            log.info(
+                "%s  PSU updated: %s  SN=%s  dev_id=%s",
+                device_name, name, entry.serial, target_device_id,
+            )
         else:
             log.debug("%s  PSU unchanged: %s", device_name, name)
     except NetBoxClientError as exc:
         msg = f"PSU upsert failed name={name!r} pid={entry.pid}: {exc}"
         log.error("%s  %s", device_name, msg)
-        err_log.error("PSU | device=%s ip=%s pid=%s name=%r sn=%s | %s",
-                      device_name, "", entry.pid, entry.raw_name, entry.serial, exc)
+        err_log.error(
+            "PSU | device=%s pid=%s name=%r sn=%s dev_id=%s | %s",
+            device_name, entry.pid, entry.raw_name, entry.serial,
+            target_device_id, exc,
+        )
         result.errors.append(msg)
 
 
