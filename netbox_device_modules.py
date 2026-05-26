@@ -710,6 +710,64 @@ class NetBoxModuleAPI:
                 self._mtype_cache[key] = None
         return self._mtype_cache.get(key)
 
+    def ensure_module_type(
+        self,
+        model: str,
+        description: str = "",
+    ) -> Optional[dict]:
+        """
+        Return the NetBox module type for *model*, auto-creating it when absent.
+
+        Manufacturer is resolved (or auto-created) as ``Cisco``.  The PID
+        is used as both ``model`` and ``part_number``.  Returns None only
+        when the Cisco manufacturer cannot be resolved and the create call
+        fails — callers should then log and skip the entry.
+        """
+        existing = self.get_module_type_by_model(model)
+        if existing is not None:
+            return existing
+
+        mfr_id = self.get_manufacturer_id("Cisco")
+        if mfr_id is None:
+            log.warning(
+                "ensure_module_type: Cisco manufacturer not found — "
+                "cannot auto-create module type %r",
+                model,
+            )
+            return None
+
+        payload: dict = {
+            "manufacturer": mfr_id,
+            "model":        model,
+            "part_number":  model,
+        }
+        if description:
+            payload["comments"] = description[:200]
+
+        try:
+            rec = self._api.dcim.module_types.create(payload)
+            d   = self._nb._to_dict(rec)
+            self._mtype_cache[model.upper()] = d
+            log.info(
+                "Module type AUTO-CREATED: model=%r  id=%s  mfr_id=%s",
+                model, d.get("id"), mfr_id,
+            )
+            return d
+        except pynetbox.RequestError as exc:
+            # Race condition — another process may have just created it
+            log.debug(
+                "ensure_module_type: create conflict for %r (%s) — re-fetching",
+                model, exc,
+            )
+            refetched = self.get_module_type_by_model(model)
+            if refetched:
+                return refetched
+            log.warning(
+                "ensure_module_type: cannot create or find module type %r: %s",
+                model, exc,
+            )
+            return None
+
     # ── Installed-module helpers ──────────────────────────────────────────
 
     def get_module_by_bay(self, bay_id: int) -> Optional[dict]:
@@ -1251,11 +1309,11 @@ def _sync_module(
         flush=True,
     )
 
-    # ── Look up module type ────────────────────────────────────────────────
-    module_type = module_api.get_module_type_by_model(entry.pid)
+    # ── Look up module type, auto-creating from PID if absent ────────────
+    module_type = module_api.ensure_module_type(entry.pid, description=entry.descr)
     if module_type is None:
         msg = (
-            f"MODULE TYPE MISSING: device={device_name} "
+            f"MODULE TYPE MISSING (auto-create failed): device={device_name} "
             f"pid={entry.pid} name={entry.raw_name!r} "
             f"descr={entry.descr!r} sn={entry.serial}"
         )
