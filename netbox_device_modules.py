@@ -380,7 +380,6 @@ def determine_platform_family(model_string: str, os_type: str) -> str:
 # Regexes to extract numbers from inventory NAME fields
 _SLOT_IN_NAME_RE   = re.compile(r"\bslot\s*(\d+)\b",    re.IGNORECASE)
 _MODULE_IN_NAME_RE = re.compile(r"\bmodule\s*(\d+)\b",   re.IGNORECASE)
-_SWITCH_IN_NAME_RE = re.compile(r"\bswitch\s*(\d+)\b",   re.IGNORECASE)
 _MEMBER_IN_NAME_RE = re.compile(r"\bmember\s*(\d+)\b",   re.IGNORECASE)
 
 # Matches the identifier suffix of a PSU name: "Power Supply A", "PSU-2", etc.
@@ -388,6 +387,32 @@ _PSU_LABEL_RE = re.compile(
     r"\b(?:power[\s\-]*supply|psu|ps)[\s\-]*([A-Za-z0-9]+)\s*$",
     re.IGNORECASE,
 )
+
+# Explicit "Switch N" extractor — used for VC member routing.
+# Defined here so both map_component_to_slot and _sync_module share the same pattern.
+_SWITCH_NUM_RE = re.compile(r"\bSwitch\s+(\d+)\b", re.IGNORECASE)
+
+
+def _extract_switch_num(raw_name: str) -> Optional[int]:
+    """
+    Return the stack member number embedded in an inventory NAME field.
+
+    Matches "Switch N" first, then "Member N" as a fallback.
+    Returns None when no match is found (caller should default to member 1).
+
+    Examples
+    --------
+    "Switch 5 - Power Supply A"  → 5
+    "Switch 3 FRU Uplink Module 1" → 3
+    "Switch 1 FRU Uplink Module 1" → 1
+    """
+    m = _SWITCH_NUM_RE.search(raw_name)
+    if m:
+        return int(m.group(1))
+    m = _MEMBER_IN_NAME_RE.search(raw_name)
+    if m:
+        return int(m.group(1))
+    return None
 
 
 def _derive_psu_bay_name(raw_name: str) -> str:
@@ -454,11 +479,9 @@ def map_component_to_slot(
     # identical regardless of which device family is being processed.
     if entry.kind == _KIND_PSU:
         entry.bay_name = _derive_psu_bay_name(name)
-        # Stack families also need switch_num to route to the correct VC member.
-        if family in (_FAM_C3750, _FAM_C3850, _FAM_C9K):
-            sw_m = _SWITCH_IN_NAME_RE.search(name) or _MEMBER_IN_NAME_RE.search(name)
-            if sw_m:
-                entry.switch_num = int(sw_m.group(1))
+        # Always parse "Switch N" / "Member N" so the correct VC member is
+        # targeted even when family detection falls back to _FAM_GENERIC.
+        entry.switch_num = _extract_switch_num(name)
         return entry
 
     # ── Module-slot mapping (non-PSU components) ───────────────────────────
@@ -482,10 +505,8 @@ def map_component_to_slot(
             entry.bay_name = "Supervisor"
 
     elif family in (_FAM_C3750, _FAM_C3850, _FAM_C9K):
-        sw_m   = _SWITCH_IN_NAME_RE.search(name) or _MEMBER_IN_NAME_RE.search(name)
         slot_m = _SLOT_IN_NAME_RE.search(name)
-        if sw_m:
-            entry.switch_num = int(sw_m.group(1))
+        entry.switch_num = _extract_switch_num(name)
         if slot_m:
             entry.slot_num = int(slot_m.group(1))
         elif _has_module_slot:
@@ -1183,7 +1204,20 @@ def _sync_module(
     # ── Resolve the target device_id for VC stack members ────────────────
     target_device_id = device_id
     if entry.switch_num is not None and vc_member_map:
-        target_device_id = vc_member_map.get(entry.switch_num, device_id)
+        resolved = vc_member_map.get(entry.switch_num)
+        if resolved is not None:
+            target_device_id = resolved
+            log.debug(
+                "%s  %s switch=%s → device_id=%s",
+                device_name, entry.kind, entry.switch_num, target_device_id,
+            )
+        else:
+            log.warning(
+                "%s  Switch %s not in vc_member_map (keys=%s) — "
+                "defaulting to device_id=%s; check NetBox VC positions",
+                device_name, entry.switch_num,
+                sorted(vc_member_map.keys()), device_id,
+            )
 
     print(
         f"  {'[DRY-RUN] ' if dry_run else ''}{entry.kind.upper()}  "
@@ -1271,7 +1305,10 @@ def _sync_module(
                     return
 
     if dry_run:
-        result.modules_added += 1
+        if entry.kind == _KIND_PSU:
+            result.psus_added += 1
+        else:
+            result.modules_added += 1
         return
 
     if bay_id is None:
@@ -1287,23 +1324,33 @@ def _sync_module(
             serial=entry.serial,
             description=entry.descr,
         )
+        is_psu = entry.kind == _KIND_PSU
         if action == "created":
-            result.modules_added += 1
+            if is_psu:
+                result.psus_added += 1
+            else:
+                result.modules_added += 1
             log.info(
-                "%s  Module CREATED  bay=%r  pid=%s  sn=%s  id=%s",
-                device_name, entry.bay_name, entry.pid, entry.serial, mod.get("id"),
+                "%s  %s CREATED  bay=%r  pid=%s  sn=%s  id=%s",
+                device_name, "PSU" if is_psu else "Module",
+                entry.bay_name, entry.pid, entry.serial, mod.get("id"),
             )
         elif action == "updated":
-            result.modules_updated += 1
+            if is_psu:
+                result.psus_updated += 1
+            else:
+                result.modules_updated += 1
             log.info(
-                "%s  Module UPDATED  bay=%r  pid=%s  sn=%s",
-                device_name, entry.bay_name, entry.pid, entry.serial,
+                "%s  %s UPDATED  bay=%r  pid=%s  sn=%s",
+                device_name, "PSU" if is_psu else "Module",
+                entry.bay_name, entry.pid, entry.serial,
             )
         else:
             result.modules_skipped += 1
             log.debug(
-                "%s  Module unchanged  bay=%r  pid=%s",
-                device_name, entry.bay_name, entry.pid,
+                "%s  %s unchanged  bay=%r  pid=%s",
+                device_name, "PSU" if is_psu else "Module",
+                entry.bay_name, entry.pid,
             )
     except NetBoxClientError as exc:
         msg = (
