@@ -2143,6 +2143,11 @@ usage: netbox_device_modules.py [-h]
 
   Run options:
     --dry-run                         Print what would change; no NetBox writes
+    --force                           Delete existing slot interfaces before installing a module.
+                                      Required when NetBox already has interfaces on a slot that
+                                      conflict with the module's auto-created interfaces.
+                                      Without this flag conflicting interfaces are left untouched
+                                      and an error is logged instead.
     --include-transceivers            Also sync SFP/QSFP transceivers (disabled by default)
     --timeout SEC                     Device SSH timeout in seconds (default: 30)
     --log-level DEBUG|INFO|WARNING|ERROR

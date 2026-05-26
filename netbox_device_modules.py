@@ -1098,6 +1098,7 @@ def sync_device_modules(
     password: str = "",
     enable_secret: str = "",
     timeout: int = 30,
+    force: bool = False,
 ) -> SyncResult:
     """
     Full module sync for one device.
@@ -1249,6 +1250,7 @@ def sync_device_modules(
                 nb=nb,
                 module_api=module_api,
                 dry_run=dry_run,
+                force=force,
                 result=result,
             )
             continue
@@ -1264,6 +1266,7 @@ def sync_device_modules(
             nb=nb,
             module_api=module_api,
             dry_run=dry_run,
+            force=force,
             result=result,
         )
 
@@ -1287,6 +1290,7 @@ def _sync_module(
     nb: NetBoxClient,
     module_api: NetBoxModuleAPI,
     dry_run: bool,
+    force: bool,
     result: SyncResult,
 ) -> None:
     """Upsert one linecard / supervisor module."""
@@ -1381,30 +1385,42 @@ def _sync_module(
 
     bay_id = bay.get("id") if bay else None
 
-    # ── Check whether the bay is occupied by the WRONG module type ────────
-    if bay_id and not dry_run:
+    # ── Pre-install interface cleanup ─────────────────────────────────────
+    # NetBox auto-creates interfaces from module-type templates when a module
+    # is installed.  If those interfaces already exist as free (unbound)
+    # records the insert fails with a 500 unique-constraint error.
+    # Deletion is only performed when --force is set; without it an error is
+    # logged and the entry is skipped so no data is accidentally removed.
+    # PSU bays never have associated interfaces; skip for them.
+    if bay_id and not dry_run and entry.kind != _KIND_PSU:
         existing_mod = module_api.get_module_by_bay(bay_id)
         if existing_mod:
             ex_type_id = module_api._extract_id(existing_mod.get("module_type"))
             if ex_type_id != module_type_id:
+                if not force:
+                    msg = (
+                        f"Bay {entry.bay_name!r} is occupied by a different module "
+                        f"type (id={ex_type_id}, required={module_type_id}). "
+                        f"Re-run with --force to delete existing interfaces and "
+                        f"replace the module."
+                    )
+                    log.error("%s  %s", device_name, msg)
+                    result.errors.append(msg)
+                    return
                 log.info(
-                    "%s  Bay %r occupied by wrong type (id=%s) — replacing",
+                    "%s  Bay %r occupied by wrong type (id=%s) — replacing (--force)",
                     device_name, entry.bay_name, ex_type_id,
                 )
-                # Delete interfaces for this slot first.
-                # PSU bays never have interfaces — skip deletion for them.
-                if entry.kind != _KIND_PSU:
-                    deleted, del_errors = delete_interfaces_for_slot(
-                        nb, target_device_id, family,
-                        entry.slot_num, entry.switch_num, dry_run=False,
+                deleted, del_errors = delete_interfaces_for_slot(
+                    nb, target_device_id, family,
+                    entry.slot_num, entry.switch_num, dry_run=False,
+                )
+                if deleted:
+                    log.info(
+                        "%s  Deleted %d interface(s) for slot %s",
+                        device_name, deleted, entry.slot_num,
                     )
-                    if deleted:
-                        log.info(
-                            "%s  Deleted %d interface(s) for slot %s",
-                            device_name, deleted, entry.slot_num,
-                        )
-                    result.errors.extend(del_errors)
-                # Now delete the stale module
+                result.errors.extend(del_errors)
                 try:
                     module_api.delete_module(existing_mod["id"])
                 except NetBoxClientError as exc:
@@ -1412,6 +1428,22 @@ def _sync_module(
                     log.error("%s  %s", device_name, msg)
                     result.errors.append(msg)
                     return
+        elif entry.slot_num is not None:
+            # Bay is empty — stale slot interfaces from a prior run may exist.
+            if force:
+                deleted, del_errors = delete_interfaces_for_slot(
+                    nb, target_device_id, family,
+                    entry.slot_num, entry.switch_num, dry_run=False,
+                )
+                if deleted:
+                    log.info(
+                        "%s  Deleted %d stale interface(s) for slot %s "
+                        "before module install (--force)",
+                        device_name, deleted, entry.slot_num,
+                    )
+                result.errors.extend(del_errors)
+            # Without --force we proceed to upsert; if stale interfaces exist
+            # NetBox will return a 500 which is caught below with a --force hint.
 
     if dry_run:
         if entry.kind == _KIND_PSU:
@@ -1462,10 +1494,18 @@ def _sync_module(
                 entry.bay_name, entry.pid,
             )
     except NetBoxClientError as exc:
-        msg = (
-            f"upsert_module failed bay={entry.bay_name!r} "
-            f"pid={entry.pid} sn={entry.serial}: {exc}"
-        )
+        exc_str = str(exc)
+        if "duplicate key value" in exc_str and "unique constraint" in exc_str and not force:
+            msg = (
+                f"Module install failed for bay={entry.bay_name!r} pid={entry.pid}: "
+                f"interfaces already exist on this slot in NetBox. "
+                f"Re-run with --force to delete them and install the module."
+            )
+        else:
+            msg = (
+                f"upsert_module failed bay={entry.bay_name!r} "
+                f"pid={entry.pid} sn={entry.serial}: {exc}"
+            )
         log.error("%s  %s", device_name, msg)
         err_log.error(
             "module_upsert_failed | device=%s bay=%r pid=%s sn=%s | %s",
@@ -1597,6 +1637,14 @@ Examples:
     run_grp = p.add_argument_group("Run options")
     run_grp.add_argument("--dry-run", action="store_true",
                          help="Print what would change without writing to NetBox")
+    run_grp.add_argument("--force", action="store_true",
+                         help=(
+                             "Delete existing slot interfaces before installing a module. "
+                             "Required when NetBox already has interfaces on a slot that "
+                             "would conflict with the module's auto-created interfaces. "
+                             "Without this flag conflicting interfaces are left untouched "
+                             "and an error is logged instead."
+                         ))
     run_grp.add_argument("--include-transceivers", action="store_true",
                          help="Also sync SFP/QSFP transceivers as modules (disabled by default)")
     run_grp.add_argument("--timeout", type=int, default=30, metavar="SEC",
@@ -1711,6 +1759,7 @@ def main() -> None:
             password=args.password,
             enable_secret=args.enable_secret,
             timeout=args.timeout,
+            force=args.force,
         )
         all_results.append(result)
 
