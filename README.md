@@ -17,6 +17,7 @@ classes (`CiscoDeviceClient`, `NetBoxClient`) and two runnable programs.
 | `netbox_cables.py` | CDP-based physical cable discovery and creation |
 | `netbox_ap.py` | CDP-based Cisco Access Point discovery — creates/updates AP devices, interfaces, IPs, and `software_version` in NetBox |
 | `netbox_shoretel.py` | LLDP-based ShoreTel and Mitel IP phone discovery — creates/updates phone devices, interfaces, IPs, cables, and `software_version` / `last_seen` in NetBox |
+| `netbox_device_modules.py` | Hardware module inventory sync — reads `show inventory` from Cisco devices and creates/updates linecards, supervisors, and power supplies in NetBox |
 | `example_usage.py` | Short usage examples for both classes |
 | `requirements.txt` | Python package dependencies |
 
@@ -1885,4 +1886,230 @@ usage: netbox_device_connections.py [-h]
   Runtime options:
     --log-level {DEBUG,INFO,WARNING,ERROR}
                              Log verbosity on stderr (default: WARNING — silent)
+```
+
+---
+
+## Running `netbox_device_modules.py`
+
+`netbox_device_modules.py` connects to Cisco devices via SSH, runs
+`show inventory` (and `show module` on NX-OS), and creates or updates the
+corresponding hardware records in NetBox:
+
+- **Linecards and supervisors** → `dcim.modules` installed in `dcim.module_bays`
+- **Power supplies** → `dcim.inventory_items` with role `power-supply`
+
+**Idempotent by design** — re-running never creates duplicates.  Only the
+serial number or description is patched when those fields differ.
+
+**Safety guarantees:**
+- Read-only on devices (`show` commands only — no config changes).
+- A module is only replaced when the bay is occupied by a *different* module
+  type; serial-only updates are done in-place.
+- Before inserting a replacement module, interfaces belonging to that slot are
+  deleted from NetBox first so they can be recreated cleanly by
+  `sync_netbox_interfaces.py`.
+- Transceivers (SFP/QSFP) are skipped by default; enable with
+  `--include-transceivers`.
+
+**NetBox pre-requisites:**
+- `dcim.module_types` must exist for every PID you want to track.  PIDs with
+  no matching module type are logged to `netbox_device_modules_errors.log` and
+  skipped — the script continues to the next component.
+- Module bays are created automatically when absent (name and position are
+  derived from the inventory output).
+
+Logs go to **stderr**; per-device progress is printed to **stdout** as it runs.
+
+---
+
+### Quickstart — credentials from environment variables
+
+**Linux / macOS:**
+```bash
+python netbox_device_modules.py \
+    --site dc1
+```
+
+**Windows PowerShell:**
+```powershell
+python netbox_device_modules.py --site dc1
+```
+
+### Single device
+
+```bash
+python netbox_device_modules.py \
+    --device core-sw-01
+```
+
+### All devices in a site (dry-run first)
+
+```bash
+# Preview what would change — no NetBox writes
+python netbox_device_modules.py \
+    --site dc1 \
+    --dry-run
+
+# Apply after reviewing
+python netbox_device_modules.py \
+    --site dc1
+```
+
+### Filter by role
+
+```bash
+python netbox_device_modules.py \
+    --role distribution \
+    --limit 10
+```
+
+### Filter by tag
+
+```bash
+python netbox_device_modules.py \
+    --tag modular-chassis
+```
+
+### Include SFP/QSFP transceivers
+
+By default transceivers are skipped.  Pass `--include-transceivers` to sync
+them as modules too (requires matching `dcim.module_types` for transceiver PIDs).
+
+```bash
+python netbox_device_modules.py \
+    --device nexus-agg-01 \
+    --include-transceivers
+```
+
+### Explicit credentials on the command line
+
+```bash
+python netbox_device_modules.py \
+    --netbox-url   https://netbox.example.org \
+    --netbox-token your-api-token \
+    --device       core-sw-01
+```
+
+### Verbose debug output
+
+```bash
+python netbox_device_modules.py \
+    --device core-sw-01 \
+    --debug
+```
+
+---
+
+### Platform slot mapping
+
+The script infers which NetBox module bay to target from the `NAME` field in
+`show inventory` output, using platform-specific conventions:
+
+| Platform | `show inventory` NAME example | NetBox bay name | Interface pattern used for deletion |
+|---|---|---|---|
+| Catalyst 4500 / 4510 | `WS-C4510R+E Slot 1` | `Slot 1` | `GigabitEthernetX/Y` where `X = slot` |
+| Catalyst 4500 supervisor | `WS-C4510R+E Slot 6` | `Slot 6` | `TenGigabitEthernetX/Y` where `X = slot` |
+| Catalyst 3850 stack base | `Switch 1` | `Switch 1` | All `Gi1/0/*`, `Te1/0/*` |
+| Catalyst 3850 uplink module | `Switch 1 Slot 1 - WS-C3850-24T` | `Switch 1 Slot 1` | `Gi1/1/*`, `Te1/1/*` |
+| Catalyst 3850 stack member 2 | `Switch 2 Slot 1 - ...` | `Switch 2 Slot 1` | `Gi2/1/*` on member device |
+| Nexus linecard | `Module 3` | `Module 3` | `EthernetX/Y` where `X = module` |
+| Nexus supervisor | `Module 1` | `Module 1` | `EthernetX/Y` where `X = 1` |
+
+For VC/stack devices the switch number extracted from the NAME is mapped to the
+correct VC member `device_id` via `vc_position`, so modules and interface
+deletions always target the right physical device.
+
+---
+
+### Missing module types
+
+When a PID has no matching `dcim.module_type` in NetBox:
+
+1. An error line is written to **stderr** and to `netbox_device_modules_errors.log`.
+2. The component is skipped.
+3. All other components on the same device continue processing.
+
+```
+ERROR  device_modules_errors: missing_module_type | device=core-sw-01 pid=WS-X4648-RJ45V+E name='WS-C4510R+E Slot 1' descr='48-Port ...' sn=JAB12345678
+```
+
+Create the missing `ModuleType` in NetBox (Manufacturer + Model = PID) and
+re-run — the script will pick it up on the next execution.
+
+---
+
+### Error log file
+
+All warnings and errors are appended to `netbox_device_modules_errors.log` in
+the working directory.  Each line includes a structured prefix for easy
+`grep` filtering:
+
+| Prefix | Meaning |
+|---|---|
+| `missing_module_type` | PID not found in `dcim.module_types` |
+| `module_upsert_failed` | NetBox API error when creating/updating a module |
+| `missing_psu_type` | PSU PID not found (informational — PSUs use inventory items) |
+
+```bash
+# Show all devices with missing module types
+grep missing_module_type netbox_device_modules_errors.log | awk -F'|' '{print $2}'
+
+# Show all unique missing PIDs
+grep missing_module_type netbox_device_modules_errors.log \
+    | grep -oP 'pid=\K\S+'  | sort -u
+```
+
+---
+
+### Console output example
+
+```
+============================================================
+  Device: core-sw-01  IP: 10.10.0.5  OS: iosxe
+============================================================
+  Platform family: c4500
+  Connecting to 10.10.0.5 …
+  Connected.
+  Running: show inventory
+  Parsed 12 inventory blocks.
+  SUPERVISOR  bay='Slot 6'  PID=WS-X45-SUP7L-E  SN=JAE12345678
+  LINECARD    bay='Slot 1'  PID=WS-X4648-RJ45V+E  SN=JAB12345678
+    DELETE interface GigabitEthernet1/1 (dev_id=42)
+    DELETE interface GigabitEthernet1/2 (dev_id=42)
+  LINECARD    bay='Slot 2'  PID=WS-X4648-RJ45V+E  SN=JAB87654321
+  PSU         'WS-C4510R+E Power Supply A'  PID=PWR-C45-1400AC  SN=AZS12345678
+  PSU         'WS-C4510R+E Power Supply B'  PID=PWR-C45-1400AC  SN=AZS87654321
+
+  Summary: modules +2 updated=1 skipped=0  PSUs +2 updated=0
+```
+
+---
+
+### All `netbox_device_modules.py` CLI flags
+
+```
+usage: netbox_device_modules.py [-h]
+
+  NetBox connection:
+    --netbox-url URL          NetBox base URL (env: NETBOX_URL)
+    --netbox-token TOKEN      NetBox API token (env: NETBOX_API)
+    --netbox-verify-ssl / --no-netbox-verify-ssl
+
+  Device selection (pick one):
+    --device NAME             Single device by NetBox name
+    --site SLUG               All active devices in this site slug
+    --role SLUG               Filter by device role slug
+    --tag SLUG                Filter by device tag slug
+    --limit N                 Process at most N devices
+
+  Run options:
+    --dry-run                 Print what would change; no NetBox writes
+    --include-transceivers    Also sync SFP/QSFP transceivers (disabled by default)
+    --debug                   Verbose debug logging to stderr
+
+  Credentials (read from environment; not accepted as CLI flags):
+    CISCO_SRV_ACCOUNT         SSH username
+    CISCO_SRV_PWD             SSH password
+    CISCO_ENABLE_PWD          Enable secret (optional)
 ```
