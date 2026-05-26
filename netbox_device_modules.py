@@ -629,12 +629,38 @@ class NetBoxModuleAPI:
         self,
         device_id: int,
         bay_name: str,
+        position: Optional[int] = None,
     ) -> Optional[dict]:
-        """Return the bay dict whose ``name`` exactly matches *bay_name*, or None."""
+        """
+        Return the bay matching *bay_name* on *device_id*.
+
+        When *position* is supplied an exact name+position match is
+        preferred.  Falls back to a name-only match so bays that were
+        created without a position value are still located.  Returns None
+        when no name match exists at all.
+        """
+        name_only: Optional[dict] = None
         for bay in self.get_module_bays(device_id):
-            if (bay.get("name") or "").strip().lower() == bay_name.strip().lower():
+            if (bay.get("name") or "").strip().lower() != bay_name.strip().lower():
+                continue
+            if position is None:
                 return bay
-        return None
+            # position may be stored as int or str depending on NetBox version
+            try:
+                if int(bay.get("position")) == int(position):
+                    return bay
+            except (TypeError, ValueError):
+                pass
+            if name_only is None:
+                name_only = bay
+
+        if name_only is not None and position is not None:
+            log.debug(
+                "find_module_bay: no position=%s match for %r on device_id=%s "
+                "(bay found with position=%s) — using name-only match",
+                position, bay_name, device_id, name_only.get("position"),
+            )
+        return name_only
 
     def ensure_module_bay(
         self,
@@ -647,7 +673,7 @@ class NetBoxModuleAPI:
 
         Returns dict with ``_action``: ``"existing"`` or ``"created"``.
         """
-        existing = self.find_module_bay(device_id, name)
+        existing = self.find_module_bay(device_id, name, position=position)
         if existing:
             existing["_action"] = "existing"
             return existing
@@ -1244,11 +1270,18 @@ def _sync_module(
     module_type_id = module_type.get("id")
 
     # ── Ensure the module bay exists ──────────────────────────────────────
-    bay: Optional[dict] = module_api.find_module_bay(target_device_id, entry.bay_name)
+    log.debug(
+        "%s  Bay lookup: device_id=%s  name=%r  position=%s",
+        device_name, target_device_id, entry.bay_name, entry.slot_num,
+    )
+    bay: Optional[dict] = module_api.find_module_bay(
+        target_device_id, entry.bay_name, position=entry.slot_num
+    )
     if bay is None:
-        log.info(
-            "%s  Bay %r not found on device_id=%s — creating …",
-            device_name, entry.bay_name, target_device_id,
+        log.warning(
+            "%s  No module bay found for device_id=%s  name=%r  position=%s — %s",
+            device_name, target_device_id, entry.bay_name, entry.slot_num,
+            "creating" if not dry_run else "skipping (dry-run)",
         )
         if not dry_run:
             try:
@@ -1269,6 +1302,12 @@ def _sync_module(
                 return
         else:
             log.info("%s  [DRY-RUN] would create bay %r", device_name, entry.bay_name)
+    else:
+        log.debug(
+            "%s  Found bay %r  id=%s  position=%s  device_id=%s",
+            device_name, entry.bay_name, bay.get("id"),
+            bay.get("position"), target_device_id,
+        )
 
     bay_id = bay.get("id") if bay else None
 
