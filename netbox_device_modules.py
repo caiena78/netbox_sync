@@ -445,12 +445,20 @@ def map_component_to_slot(
             if trailing:
                 entry.slot_num = int(trailing.group(1))
 
-        # PSUs only need switch_num to reach the correct VC member device.
-        # All module types (linecards, uplink modules, supervisors) go into
-        # the "Network Module" bay on that member — stack platforms have exactly
-        # one module slot per member switch.
-        if entry.kind != _KIND_PSU and entry.switch_num is not None:
-            if entry.slot_num is not None or _has_module_slot:
+        if entry.switch_num is not None:
+            if entry.kind == _KIND_PSU:
+                # PSUs on stacked platforms also go into module bays on the
+                # correct VC member.  Derive the bay name from the inventory
+                # NAME after stripping the "Switch N – " prefix, since the
+                # item will live on the member device (e.g. "Power Supply A").
+                raw_psu = entry.raw_name.strip()
+                cleaned = re.sub(
+                    rf"(?i)^\s*switch\s+{entry.switch_num}\s*[-–]?\s*",
+                    "", raw_psu,
+                ).strip()
+                entry.bay_name = cleaned or f"Power Supply ({entry.pid})"
+            elif entry.slot_num is not None or _has_module_slot:
+                # Linecards, supervisors, uplink modules → "Network Module" bay
                 entry.bay_name = "Network Module"
             # else: bare chassis row for this member — no module bay applies
 
@@ -1079,17 +1087,36 @@ def sync_device_modules(
 
         # ── POWER SUPPLY path ─────────────────────────────────────────────
         if entry.kind == _KIND_PSU:
-            _sync_psu(
-                entry=entry,
-                device_id=device_id,
-                device_name=device_name,
-                vc_member_map=vc_member_map,
-                module_api=module_api,
-                psu_role_id=psu_role_id,
-                cisco_mfr_id=cisco_mfr_id,
-                dry_run=dry_run,
-                result=result,
-            )
+            # Stack platforms (3750 / 3850 / 9300 / 9200): PSUs go into
+            # module bays on the correct VC member device, exactly like
+            # linecards.  entry.bay_name was set in map_component_to_slot().
+            # All other platforms (C4500, Nexus, generic) keep PSUs as
+            # dcim.inventory_items.
+            if family in (_FAM_C3750, _FAM_C3850, _FAM_C9K) and entry.bay_name:
+                _sync_module(
+                    entry=entry,
+                    device=device,
+                    device_id=device_id,
+                    device_name=device_name,
+                    family=family,
+                    vc_member_map=vc_member_map,
+                    nb=nb,
+                    module_api=module_api,
+                    dry_run=dry_run,
+                    result=result,
+                )
+            else:
+                _sync_psu(
+                    entry=entry,
+                    device_id=device_id,
+                    device_name=device_name,
+                    vc_member_map=vc_member_map,
+                    module_api=module_api,
+                    psu_role_id=psu_role_id,
+                    cisco_mfr_id=cisco_mfr_id,
+                    dry_run=dry_run,
+                    result=result,
+                )
             continue
 
         # ── MODULE path (LINECARD / SUPERVISOR / TRANSCEIVER) ─────────────
@@ -1291,17 +1318,19 @@ def _sync_module(
                     "%s  Bay %r occupied by wrong type (id=%s) — replacing",
                     device_name, entry.bay_name, ex_type_id,
                 )
-                # Delete interfaces for this slot first
-                deleted, del_errors = delete_interfaces_for_slot(
-                    nb, target_device_id, family,
-                    entry.slot_num, entry.switch_num, dry_run=False,
-                )
-                if deleted:
-                    log.info(
-                        "%s  Deleted %d interface(s) for slot %s",
-                        device_name, deleted, entry.slot_num,
+                # Delete interfaces for this slot first.
+                # PSU bays never have interfaces — skip deletion for them.
+                if entry.kind != _KIND_PSU:
+                    deleted, del_errors = delete_interfaces_for_slot(
+                        nb, target_device_id, family,
+                        entry.slot_num, entry.switch_num, dry_run=False,
                     )
-                result.errors.extend(del_errors)
+                    if deleted:
+                        log.info(
+                            "%s  Deleted %d interface(s) for slot %s",
+                            device_name, deleted, entry.slot_num,
+                        )
+                    result.errors.extend(del_errors)
                 # Now delete the stale module
                 try:
                     module_api.delete_module(existing_mod["id"])

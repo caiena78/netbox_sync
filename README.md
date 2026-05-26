@@ -2016,20 +2016,31 @@ The script infers which NetBox module bay to target from the `NAME` field in
 | Nexus linecard | `Module 3` | Device itself | `Module 3` | `EthernetX/Y` where `X = module` |
 | Nexus supervisor | `Module 1` | Device itself | `Module 1` | `EthernetX/Y` where `X = 1` |
 
-**Power supply routing for VC stacks:**
+**Power supply handling — stack vs. chassis platforms:**
 
-PSUs are stored as NetBox inventory items (not modules) and are also routed to
-the correct VC member.  The `"Switch N – "` prefix is stripped from the item
-name before writing, since the item already lives on member N's device record.
+On stacked platforms (3750 / 3850 / 9300 / 9200) power supplies are inserted
+as **`dcim.modules` in `dcim.module_bays`** on the correct VC member device —
+the same path used for linecards and uplink modules.  The `"Switch N – "`
+prefix is stripped so the bay is named cleanly on the member device.
 
-| `show inventory` NAME | Target device | Inventory item name written |
+| `show inventory` NAME | Target device | Module bay created | NetBox object |
+|---|---|---|---|
+| `Switch 1 - Power Supply A` | VC member `vc_position = 1` | `Power Supply A` | `dcim.module` |
+| `Switch 2 - Power Supply B` | VC member `vc_position = 2` | `Power Supply B` | `dcim.module` |
+| `Switch 3 Power Supply A` | VC member `vc_position = 3` | `Power Supply A` | `dcim.module` |
+
+On modular chassis platforms (C4500 / Nexus / generic) power supplies remain
+as **`dcim.inventory_items`** since those platforms model PSUs differently.
+
+| `show inventory` NAME | Target device | NetBox object |
 |---|---|---|
-| `Switch 1 - Power Supply A` | VC member `vc_position = 1` | `Power Supply A` |
-| `Switch 2 - Power Supply B` | VC member `vc_position = 2` | `Power Supply B` |
-| `Switch 3 Power Supply A` | VC member `vc_position = 3` | `Power Supply A` |
+| `WS-C4510R+E Power Supply A` | Device itself | `dcim.inventory_item` |
+| `Power Supply 1` (Nexus) | Device itself | `dcim.inventory_item` |
 
-For non-VC devices (standalone switch or modular chassis) the PSU inventory
-item is written directly to the device without any name modification.
+> **NetBox pre-requisite for stack PSUs** — a `dcim.module_type` must exist
+> for each PSU PID (e.g. `C3KX-PWR-1000WAC`, `C9300-PWR-250WAC`).  If the
+> module type is missing the PSU is logged to `netbox_device_modules_errors.log`
+> and skipped, identical to the behaviour for missing linecard types.
 
 For VC/stack devices the switch number extracted from the NAME is mapped to the
 correct VC member `device_id` via `vc_position`, so modules and interface
