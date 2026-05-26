@@ -67,6 +67,7 @@ from sync_netbox_interfaces import (
     expand_interface_name,
     get_device_mgmt_ip,
     get_device_os_type,
+    resolve_single_device,
     _MODEL_FAMILY_C3750,
     _MODEL_FAMILY_C9K,
     _MODEL_FAMILY_C9600,
@@ -1437,9 +1438,14 @@ def main() -> None:
 
     # ── Build device filter ───────────────────────────────────────────────
     if args.device:
-        device_rec = nb.get_device(name=args.device)
+        # resolve_single_device tries virtual chassis first, then falls back
+        # to a regular device lookup — so passing a VC name like "acc-stack-01"
+        # returns the master member with _vc_id already set.
+        device_rec = resolve_single_device(args.device.strip(), nb)
         if not device_rec:
-            log.error("Device %r not found in NetBox.", args.device)
+            log.error(
+                "Device or virtual chassis %r not found in NetBox.", args.device
+            )
             sys.exit(1)
         devices = [device_rec]
     else:
