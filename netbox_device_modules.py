@@ -351,16 +351,18 @@ def determine_platform_family(model_string: str, os_type: str) -> str:
 
     m = (model_string or "").upper()
 
-    if re.search(r"C4510|C4507|C4506|C4503|C4500|WS-C45\d\d", m):
+    if re.search(r"C4510|C4507|C4506|C4503|C4500|WS-C45\d\d|CATALYST[\s-]*45\d\d", m):
         return _FAM_C4500
 
-    if re.search(r"C9606|C9610|C9616|C96\d\d", m):
+    if re.search(r"C9606|C9610|C9616|C96\d\d|CATALYST[\s-]*96\d\d", m):
         return _FAM_C9600
 
-    if re.search(r"C3850|WS-C3850|C9300|C9200", m):
+    # "Catalyst 3850-48U" style names (NetBox device-type model field) must
+    # match here; the bare "C3850" pattern does not match them.
+    if re.search(r"C3850|WS-C3850|CATALYST[\s-]*3850|C9300|C9200|CATALYST[\s-]*9[23]00", m):
         return _FAM_C3850
 
-    if re.search(r"C9[45]\d\d|C9500|C9400", m):
+    if re.search(r"C9[45]\d\d|C9500|C9400|CATALYST[\s-]*9[45]\d\d", m):
         return _FAM_C9K
 
     # classify_device_model already handles C3750 / C9K patterns
