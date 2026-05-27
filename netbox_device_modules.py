@@ -1548,6 +1548,23 @@ def _sync_module(
 
     bay_id = bay.get("id") if bay else None
 
+    # ── Early exit: already installed with correct module type ────────────
+    # Skip port cleanup, interface cleanup, and upsert entirely when the bay
+    # already contains a module of the expected type.  A matching type means
+    # its ports are already present; there is nothing to clean up or recreate.
+    if bay_id and module_type_id:
+        _existing_check = module_api.get_module_by_bay(bay_id)
+        if _existing_check is not None:
+            _ex_type_id = module_api._extract_id(_existing_check.get("module_type"))
+            if _ex_type_id == module_type_id:
+                _label = "PSU" if entry.kind == _KIND_PSU else "Module"
+                log.debug(
+                    "%s  %s already installed in bay %r (module_type_id=%s) — skipping",
+                    device_name, _label, entry.bay_name, module_type_id,
+                )
+                result.modules_skipped += 1
+                return
+
     # ── Pre-install power-port / console-port conflict cleanup ───────────
     # Remove unconnected ports whose names collide with what the module-type
     # template would auto-create on install.  This prevents unique-constraint
