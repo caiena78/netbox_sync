@@ -812,6 +812,16 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--dry-run", action="store_true",
                      help="Print changes without writing to NetBox")
     run.add_argument(
+        "--force", action="store_true",
+        help=(
+            "Relocate interfaces that are assigned to the wrong VC member device. "
+            "Without this flag, misplaced interfaces are left untouched and an "
+            "error is logged instead. Module-slot corrections (wrong module "
+            "association on the same device) are always applied regardless of "
+            "this flag."
+        ),
+    )
+    run.add_argument(
         "--force-type", action="store_true",
         help=(
             "Write the inferred interface type to NetBox. "
@@ -3280,6 +3290,13 @@ def sync_device(
                                 device_name, target_id, iface_name,
                                 ex_dev_id, ex_mod_id, target_module_id,
                             )
+                        elif wrong_dev and not args.force:
+                            log.info(
+                                "DRY-RUN  %-30s  WRONG VC MEMBER %-42s  "
+                                "existing dev_id=%s  target dev_id=%s  "
+                                "(add --force to relocate)",
+                                device_name, iface_name, ex_dev_id, target_id,
+                            )
                         else:
                             log.info(
                                 "DRY-RUN  %-30s  WOULD RELOCATE %-42s  "
@@ -3346,6 +3363,25 @@ def sync_device(
                         summary["interfaces_relocation_skipped_dest_exists"] += 1
                         # Upsert below still runs against the correctly-placed
                         # target interface to apply any field updates.
+                    elif wrong_dev and not args.force:
+                        # Interface is on the wrong VC member but --force was not
+                        # given.  Log an error and leave it untouched.
+                        _sync_err_log.warning(
+                            "wrong_vc_member_no_force | device=%s iface=%s "
+                            "existing_dev=%s target_dev=%s",
+                            device_name, iface_name, ex_dev_id, target_id,
+                        )
+                        log.error(
+                            "%-30s  WRONG VC MEMBER %-42s  "
+                            "existing dev_id=%s, expected dev_id=%s — "
+                            "re-run with --force to relocate",
+                            device_name, iface_name, ex_dev_id, target_id,
+                        )
+                        summary["errors"].append(
+                            f"Interface {iface_name!r} is on wrong VC member "
+                            f"(dev_id={ex_dev_id}, expected dev_id={target_id}). "
+                            f"Re-run with --force to relocate."
+                        )
                     else:
                         _relocate_interface(
                             nb=nb,
