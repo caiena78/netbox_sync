@@ -976,6 +976,162 @@ class NetBoxModuleAPI:
                 self._mfr_cache[key] = None
         return self._mfr_cache.get(key)
 
+    # ── Port-conflict helpers ─────────────────────────────────────────────
+
+    @staticmethod
+    def _is_port_connected(port: Any) -> bool:
+        """Return True if *port* has any cable / endpoint / link-peer attachment."""
+        return any([
+            getattr(port, "cable",              None),
+            getattr(port, "connected_endpoint", None),
+            getattr(port, "link_peers",         None),
+            getattr(port, "link_peers_type",    None),
+        ])
+
+    def get_power_port_template_names(self, module_type_id: int) -> List[str]:
+        """Return power port template names for *module_type_id* (empty list on failure)."""
+        try:
+            templates = list(
+                self._api.dcim.power_port_templates.filter(module_type_id=module_type_id)
+            )
+            return [t.name for t in templates]
+        except pynetbox.RequestError as exc:
+            log.debug(
+                "power_port_templates lookup failed module_type_id=%s: %s",
+                module_type_id, exc,
+            )
+            return []
+
+    def get_console_port_template_names(self, module_type_id: int) -> List[str]:
+        """Return console port template names for *module_type_id* (empty list on failure)."""
+        try:
+            templates = list(
+                self._api.dcim.console_port_templates.filter(module_type_id=module_type_id)
+            )
+            return [t.name for t in templates]
+        except pynetbox.RequestError as exc:
+            log.debug(
+                "console_port_templates lookup failed module_type_id=%s: %s",
+                module_type_id, exc,
+            )
+            return []
+
+    def ensure_unconnected_power_port_removed(
+        self,
+        device_id: int,
+        port_name: str,
+        dry_run: bool,
+        device_name: str = "",
+    ) -> bool:
+        """
+        Delete an unconnected power port named *port_name* on *device_id*.
+
+        Returns True if a port was deleted (or would-delete in dry-run).
+        Connected ports are never touched.  All exceptions are logged; the
+        caller continues regardless.
+        """
+        try:
+            ports = list(self._api.dcim.power_ports.filter(
+                device_id=device_id, name=port_name
+            ))
+        except pynetbox.RequestError as exc:
+            log.warning(
+                "%s  Cannot query power ports (name=%r device_id=%s): %s",
+                device_name, port_name, device_id, exc,
+            )
+            return False
+
+        deleted = False
+        for port in ports:
+            if self._is_port_connected(port):
+                log.info(
+                    "%s  PRESERVE power port %r (device_id=%s, port_id=%s)"
+                    " — connected, skipping delete",
+                    device_name, port_name, device_id, port.id,
+                )
+                continue
+            if dry_run:
+                log.info(
+                    "%s  [DRY-RUN] would DELETE power port %r"
+                    " (device_id=%s, port_id=%s) — unconnected",
+                    device_name, port_name, device_id, port.id,
+                )
+                deleted = True
+                continue
+            try:
+                port.delete()
+                log.info(
+                    "%s  DELETED power port %r (device_id=%s, port_id=%s)"
+                    " — unconnected, clearing conflict before PSU install",
+                    device_name, port_name, device_id, port.id,
+                )
+                deleted = True
+            except pynetbox.RequestError as exc:
+                log.warning(
+                    "%s  Failed to delete power port %r"
+                    " (device_id=%s, port_id=%s): %s",
+                    device_name, port_name, device_id, port.id, exc,
+                )
+        return deleted
+
+    def ensure_unconnected_console_port_removed(
+        self,
+        device_id: int,
+        port_name: str,
+        dry_run: bool,
+        device_name: str = "",
+    ) -> bool:
+        """
+        Delete an unconnected console port named *port_name* on *device_id*.
+
+        Returns True if a port was deleted (or would-delete in dry-run).
+        Connected ports are never touched.  All exceptions are logged; the
+        caller continues regardless.
+        """
+        try:
+            ports = list(self._api.dcim.console_ports.filter(
+                device_id=device_id, name=port_name
+            ))
+        except pynetbox.RequestError as exc:
+            log.warning(
+                "%s  Cannot query console ports (name=%r device_id=%s): %s",
+                device_name, port_name, device_id, exc,
+            )
+            return False
+
+        deleted = False
+        for port in ports:
+            if self._is_port_connected(port):
+                log.info(
+                    "%s  PRESERVE console port %r (device_id=%s, port_id=%s)"
+                    " — connected, skipping delete",
+                    device_name, port_name, device_id, port.id,
+                )
+                continue
+            if dry_run:
+                log.info(
+                    "%s  [DRY-RUN] would DELETE console port %r"
+                    " (device_id=%s, port_id=%s) — unconnected",
+                    device_name, port_name, device_id, port.id,
+                )
+                deleted = True
+                continue
+            try:
+                port.delete()
+                log.info(
+                    "%s  DELETED console port %r (device_id=%s, port_id=%s)"
+                    " — unconnected, clearing conflict before module install",
+                    device_name, port_name, device_id, port.id,
+                )
+                deleted = True
+            except pynetbox.RequestError as exc:
+                log.warning(
+                    "%s  Failed to delete console port %r"
+                    " (device_id=%s, port_id=%s): %s",
+                    device_name, port_name, device_id, port.id, exc,
+                )
+        return deleted
+
     # ── Utility ───────────────────────────────────────────────────────────
 
     @staticmethod
@@ -1391,6 +1547,28 @@ def _sync_module(
         )
 
     bay_id = bay.get("id") if bay else None
+
+    # ── Pre-install power-port / console-port conflict cleanup ───────────
+    # Remove unconnected ports whose names collide with what the module-type
+    # template would auto-create on install.  This prevents unique-constraint
+    # 500 errors.  Connected ports are NEVER deleted.
+    if module_type_id:
+        if entry.kind == _KIND_PSU:
+            for pname in module_api.get_power_port_template_names(module_type_id):
+                module_api.ensure_unconnected_power_port_removed(
+                    device_id=target_device_id,
+                    port_name=pname,
+                    dry_run=dry_run,
+                    device_name=device_name,
+                )
+        else:
+            for cname in module_api.get_console_port_template_names(module_type_id):
+                module_api.ensure_unconnected_console_port_removed(
+                    device_id=target_device_id,
+                    port_name=cname,
+                    dry_run=dry_run,
+                    device_name=device_name,
+                )
 
     # ── Pre-install interface cleanup ─────────────────────────────────────
     # NetBox auto-creates interfaces from module-type templates when a module
