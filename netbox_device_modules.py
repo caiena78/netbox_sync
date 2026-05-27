@@ -1004,12 +1004,18 @@ def delete_interfaces_for_slot(
     dry_run: bool,
 ) -> Tuple[int, List[str]]:
     """
-    Delete all NetBox interfaces on *device_id* that belong to the given slot.
+    Delete unbound (module=null) NetBox interfaces on *device_id* that belong
+    to the given slot.
+
+    Only interfaces with no module association are removed.  Interfaces that
+    are already bound to an installed module are left alone — NetBox cascade-
+    deletes them automatically when their owning module is deleted.
+
+    This targeted deletion avoids removing interfaces that belong to other
+    modules sharing the same device, and only clears the stale free records
+    that would cause a unique-constraint 500 error on module installation.
 
     Returns ``(deleted_count, list_of_errors)``.
-
-    The caller is responsible for supplying the correct *device_id* for the
-    target VC member — this function does not resolve VC membership itself.
     """
     deleted = 0
     errors: List[str] = []
@@ -1027,6 +1033,7 @@ def delete_interfaces_for_slot(
             slot_num,
             switch_num,
         )
+        and not iface.get("module")   # skip interfaces already bound to a module
     ]
 
     if not targets:
@@ -1038,7 +1045,7 @@ def delete_interfaces_for_slot(
         return 0, []
 
     log.info(
-        "%s  slot %s  — deleting %d interface(s) before module insert",
+        "%s  slot %s  — deleting %d unbound interface(s) before module insert",
         "DRY-RUN" if dry_run else "LIVE",
         slot_num, len(targets),
     )
