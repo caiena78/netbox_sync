@@ -669,7 +669,22 @@ class NetBoxModuleAPI:
                 "(bay found with position=%s) — using name-only match",
                 position, bay_name, device_id, name_only.get("position"),
             )
-        return name_only
+        if name_only is not None:
+            return name_only
+
+        # Normalized fallback: treat "PS-1" and "PS1" as the same bay name so
+        # devices whose bay names were imported without hyphens are found rather
+        # than duplicated (e.g. existing "PS1" matches requested "PS-1").
+        norm_target = re.sub(r"[\s\-]+", "", bay_name).upper()
+        for bay in self.get_module_bays(device_id):
+            norm_name = re.sub(r"[\s\-]+", "", bay.get("name", "")).upper()
+            if norm_name == norm_target:
+                log.debug(
+                    "find_module_bay: normalized match %r → %r on device_id=%s",
+                    bay_name, bay.get("name"), device_id,
+                )
+                return bay
+        return None
 
     def ensure_module_bay(
         self,
