@@ -10,6 +10,7 @@ classes (`CiscoDeviceClient`, `NetBoxClient`) and two runnable programs.
 
 | File | Purpose |
 |---|---|
+| `vault_client.py` | Single point of contact with HashiCorp Vault — AppRole auth, KV v2 secret fetch |
 | `cisco_device_client.py` | Cisco device client — CLI (Netmiko), RESTCONF, NETCONF |
 | `netbox_client.py` | NetBox REST API client — get/create/update devices and interfaces |
 | `sync_netbox_interfaces.py` | Interface, VLAN, prefix, LAG, and state sync program |
@@ -46,36 +47,65 @@ pip install "genie>=23.0" "pyats>=23.0"
 
 ---
 
-## Environment Variables
+## Authentication — HashiCorp Vault
 
-All credentials can be supplied as environment variables so nothing
-sensitive needs to appear on the command line.
+All credentials (SSH username/password and NetBox URL/token) are sourced
+exclusively from **HashiCorp Vault** using AppRole authentication.  Credential
+values are never passed on the command line or read from plain environment
+variables — passing any of `--username`, `--password`, `--netbox-url`, or
+`--netbox-token` at runtime is treated as a configuration error and the script
+will exit immediately.
 
-### NetBox
+### Required Vault secret keys (KV v2)
+
+The Vault secret must contain exactly these four keys:
+
+| Key | Description |
+|---|---|
+| `user` | SSH / service-account username |
+| `password` | SSH / service-account password |
+| `netbox_url` | NetBox base URL, e.g. `https://netbox.example.org` |
+| `netbox_token` | NetBox API token |
+
+### Environment variables
+
+Vault connection parameters can be supplied via environment variables so
+nothing sensitive appears on the command line:
 
 | Variable | CLI flag equivalent | Description |
 |---|---|---|
-| `NETBOX_URL` | `--netbox-url` | Full base URL, e.g. `https://netbox.example.org` |
-| `NETBOX_API` | `--netbox-token` | NetBox API token |
+| `VAULT_ADDR` | `--VAULT_ADDR` | Vault server URL, e.g. `https://vault.example.org` |
+| `VAULT_ROLE_ID` | `--VAULT_ROLE_ID` | Vault AppRole role ID |
+| `VAULT_SECRET_ID` | `--VAULT_SECRET_ID` | Vault AppRole secret ID |
 
-### Cisco devices
-
-| Variable | CLI flag equivalent | Description |
-|---|---|---|
-| `CISCO_SRV_ACCOUNT` | `--username` | SSH login username |
-| `CISCO_SRV_PWD` | `--password` | SSH login password |
-| `CISCO_ENABLE_PWD` | `--enable-secret` | Enable-mode secret (IOS/IOS-XE only; omit if not needed) |
-
-Set them in your shell, `.env` file, or CI/CD secret store:
+All three are required.  Set them in your shell, `.env` file, or CI/CD secret
+store:
 
 ```bash
-export NETBOX_URL=https://netbox.example.org
-export NETBOX_API=your-netbox-api-token
-
-export CISCO_SRV_ACCOUNT=svc-netauto
-export CISCO_SRV_PWD=s3cr3t
-export CISCO_ENABLE_PWD=en4bl3s3cr3t   # omit if not used
+export VAULT_ADDR=https://vault.example.org
+export VAULT_ROLE_ID=your-role-id
+export VAULT_SECRET_ID=your-secret-id
 ```
+
+### Vault secret path
+
+The `--vault-mount` (default `secret`) and `--vault-path` (default
+`network/device`) flags control which KV v2 secret is read.  Change them if
+your Vault layout differs:
+
+```bash
+python sync_netbox_interfaces.py \
+    --vault-mount kv \
+    --vault-path automation/netbox \
+    --device core-rtr-01
+```
+
+### `--use-env-only`
+
+Pass `--use-env-only` to force all three Vault parameters to come from
+environment variables, refusing any `--VAULT_ADDR` / `--VAULT_ROLE_ID` /
+`--VAULT_SECRET_ID` CLI args.  Useful in CI pipelines where credentials are
+injected as env vars and you want to prevent accidental CLI overrides.
 
 ---
 
@@ -83,16 +113,26 @@ export CISCO_ENABLE_PWD=en4bl3s3cr3t   # omit if not used
 
 Logs go to **stderr**; the JSON result array goes to **stdout**.
 
-### Quickstart — all credentials from environment variables
+### Quickstart — credentials from Vault environment variables
+
+Set the three Vault env vars once, then run:
 
 **Linux / macOS (bash/zsh):**
 ```bash
+export VAULT_ADDR=https://vault.example.org
+export VAULT_ROLE_ID=your-role-id
+export VAULT_SECRET_ID=your-secret-id
+
 python sync_netbox_interfaces.py \
     --device-filter '{"platform": "iosxe", "status": "active"}'
 ```
 
 **Windows PowerShell:**
 ```powershell
+$env:VAULT_ADDR      = "https://vault.example.org"
+$env:VAULT_ROLE_ID   = "your-role-id"
+$env:VAULT_SECRET_ID = "your-secret-id"
+
 python sync_netbox_interfaces.py `
     --device-filter '{\"platform\": \"iosxe\", \"status\": \"active\"}'
 ```
@@ -108,24 +148,9 @@ python sync_netbox_interfaces.py `
 
 ### All matching devices with a filter
 
-**Linux / macOS:**
 ```bash
 python sync_netbox_interfaces.py \
-    --netbox-url https://netbox.example.org \
-    --netbox-token <token> \
-    --username svc-netauto \
-    --password s3cr3t \
     --device-filter '{"platform": "iosxe", "status": "active"}'
-```
-
-**Windows PowerShell:**
-```powershell
-python sync_netbox_interfaces.py `
-    --netbox-url https://netbox.example.org `
-    --netbox-token <token> `
-    --username svc-netauto `
-    --password s3cr3t `
-    --device-filter '{\"platform\": \"iosxe\", \"status\": \"active\"}'
 ```
 
 ### Single device
@@ -531,16 +556,23 @@ Logs go to **stderr**; the JSON result array goes to **stdout**.
 
 ---
 
-### Quickstart — credentials from environment variables
+### Quickstart — credentials from Vault environment variables
 
-**Linux / macOS:**
 ```bash
+export VAULT_ADDR=https://vault.example.org
+export VAULT_ROLE_ID=your-role-id
+export VAULT_SECRET_ID=your-secret-id
+
 python netbox_update_State.py \
     --device-filter '{"platform": "iosxe", "status": "active"}'
 ```
 
 **Windows PowerShell:**
 ```powershell
+$env:VAULT_ADDR      = "https://vault.example.org"
+$env:VAULT_ROLE_ID   = "your-role-id"
+$env:VAULT_SECRET_ID = "your-secret-id"
+
 $f = '{"platform": "iosxe", "status": "active"}'
 python netbox_update_State.py --device-filter $f
 ```
@@ -620,18 +652,6 @@ python netbox_update_State.py \
 > `CiscoDeviceClient` instance is configured but does not change which
 > protocol carries the state query.  Setting `--transport cli` is the most
 > predictable choice for this script.
-
-### Explicit credentials on the command line
-
-```bash
-python netbox_update_State.py \
-    --netbox-url https://netbox.example.org \
-    --netbox-token your-api-token \
-    --username svc-netauto \
-    --password s3cr3t \
-    --enable-secret en4bl3s3cr3t \
-    --device core-sw-01
-```
 
 ### Increase concurrency and verbosity
 
@@ -775,9 +795,9 @@ python C:\netauto\netbox_update_State.py `
 ```
 usage: netbox_update_State.py [-h]
 
-  NetBox connection:
-    --netbox-url URL          NetBox base URL (env: NETBOX_URL)
-    --netbox-token TOKEN      NetBox API token (env: NETBOX_API)
+  NetBox connection (deprecated — blocked at runtime; values come from Vault):
+    --netbox-url URL          Blocked — source from Vault (key: netbox_url)
+    --netbox-token TOKEN      Blocked — source from Vault (key: netbox_token)
     --netbox-verify-ssl / --no-netbox-verify-ssl
 
   Device selection (pick one, or omit for all):
@@ -788,10 +808,10 @@ usage: netbox_update_State.py [-h]
     --all                     Explicit "process all" flag
     --site-slug SLUG          Limit to devices in this site (slug, optional)
 
-  Cisco credentials:
-    --username USER           SSH username (env: CISCO_SRV_ACCOUNT)
-    --password PASS           SSH password (env: CISCO_SRV_PWD)
-    --enable-secret SECRET    Enable secret (env: CISCO_ENABLE_PWD)
+  Cisco credentials (deprecated — blocked at runtime; values come from Vault):
+    --username USER           Blocked — source from Vault (key: user)
+    --password PASS           Blocked — source from Vault (key: password)
+    --enable-secret SECRET    Enable-mode secret (CLI only; optional)
 
   Runtime options:
     --transport {auto,cli,restconf,netconf}   (default: auto)
@@ -799,6 +819,14 @@ usage: netbox_update_State.py [-h]
     --max-workers N           Concurrent threads (default: 5)
     --timeout SEC             Device SSH timeout in seconds (default: 30)
     --log-level {DEBUG,INFO,WARNING,ERROR}    (default: INFO)
+
+  Vault authentication:
+    --VAULT_ADDR URL          Vault server address (env: VAULT_ADDR)
+    --VAULT_ROLE_ID ROLE_ID   AppRole role ID (env: VAULT_ROLE_ID)
+    --VAULT_SECRET_ID ID      AppRole secret ID (env: VAULT_SECRET_ID)
+    --use-env-only            Read Vault credentials from env vars only
+    --vault-mount MOUNT       KV v2 mount point (default: secret)
+    --vault-path PATH         KV v2 secret path (default: network/device)
 ```
 
 ---
@@ -821,18 +849,23 @@ Logs go to **stderr**; the JSON summary goes to **stdout**.
 
 ---
 
-### Quickstart — credentials from environment variables
+### Quickstart — credentials from Vault environment variables
 
-**Linux / macOS:**
 ```bash
+export VAULT_ADDR=https://vault.example.org
+export VAULT_ROLE_ID=your-role-id
+export VAULT_SECRET_ID=your-secret-id
+
 python netbox_cables.py \
     --device-filter '{"status": "active"}'
 ```
 
 **Windows PowerShell:**
 ```powershell
-python netbox_cables.py --device-filter '{\"status\": \"active\"}'
-# Or use a variable:
+$env:VAULT_ADDR      = "https://vault.example.org"
+$env:VAULT_ROLE_ID   = "your-role-id"
+$env:VAULT_SECRET_ID = "your-secret-id"
+
 $f = '{"status": "active"}'
 python netbox_cables.py --device-filter $f
 ```
@@ -908,18 +941,6 @@ python netbox_cables.py \
 > dry-run first so you can confirm which cables would be affected.
 
 ---
-
-### Explicit credentials on the command line
-
-```bash
-python netbox_cables.py \
-    --netbox-url https://netbox.example.org \
-    --netbox-token your-api-token \
-    --username svc-netauto \
-    --password s3cr3t \
-    --enable-secret en4bl3s3cr3t \
-    --device acc-sw-01
-```
 
 ### Limit to a specific platform
 
@@ -1056,9 +1077,9 @@ When `--site-slug` is omitted all sites are included (existing behaviour).
 ```
 usage: netbox_cables.py [-h]
 
-  NetBox connection:
-    --netbox-url URL          NetBox base URL (env: NETBOX_URL)
-    --netbox-token TOKEN      NetBox API token (env: NETBOX_API)
+  NetBox connection (deprecated — blocked at runtime; values come from Vault):
+    --netbox-url URL          Blocked — source from Vault (key: netbox_url)
+    --netbox-token TOKEN      Blocked — source from Vault (key: netbox_token)
     --netbox-verify-ssl / --no-netbox-verify-ssl
 
   Device selection (pick one, or omit for all):
@@ -1068,10 +1089,10 @@ usage: netbox_cables.py [-h]
     --device-filter JSON      NetBox DCIM filter (default: {})
     --site-slug SLUG          Limit to devices in this site (slug, optional)
 
-  Cisco credentials:
-    --username USER           SSH username (env: CISCO_SRV_ACCOUNT)
-    --password PASS           SSH password (env: CISCO_SRV_PWD)
-    --enable-secret SECRET    Enable secret (env: CISCO_ENABLE_PWD)
+  Cisco credentials (deprecated — blocked at runtime; values come from Vault):
+    --username USER           Blocked — source from Vault (key: user)
+    --password PASS           Blocked — source from Vault (key: password)
+    --enable-secret SECRET    Enable-mode secret (CLI only; optional)
 
   Runtime options:
     --transport {auto,cli,netconf,restconf}   (default: auto)
@@ -1086,6 +1107,14 @@ usage: netbox_cables.py [-h]
     --max-workers N           Concurrent threads (default: 5)
     --timeout SEC             Device timeout seconds (default: 30)
     --log-level {DEBUG,INFO,WARNING,ERROR}    (default: INFO)
+
+  Vault authentication:
+    --VAULT_ADDR URL          Vault server address (env: VAULT_ADDR)
+    --VAULT_ROLE_ID ROLE_ID   AppRole role ID (env: VAULT_ROLE_ID)
+    --VAULT_SECRET_ID ID      AppRole secret ID (env: VAULT_SECRET_ID)
+    --use-env-only            Read Vault credentials from env vars only
+    --vault-mount MOUNT       KV v2 mount point (default: secret)
+    --vault-path PATH         KV v2 secret path (default: network/device)
 ```
 
 ---
@@ -1117,9 +1146,10 @@ When `--site-slug` is omitted all sites are included (existing behaviour).
 
 ```
 usage: sync_netbox_interfaces.py [-h]
-  NetBox connection:
-    --netbox-url URL          NetBox base URL (env: NETBOX_URL)
-    --netbox-token TOKEN      NetBox API token (env: NETBOX_API)
+
+  NetBox connection (deprecated — blocked at runtime; values come from Vault):
+    --netbox-url URL          Blocked — source from Vault (key: netbox_url)
+    --netbox-token TOKEN      Blocked — source from Vault (key: netbox_token)
     --netbox-verify-ssl / --no-netbox-verify-ssl
 
   Device selection (pick one, or omit for all):
@@ -1130,10 +1160,10 @@ usage: sync_netbox_interfaces.py [-h]
     --all                     Explicit "process all" flag
     --site-slug SLUG          Limit to devices in this site (slug, optional)
 
-  Cisco credentials:
-    --username USER           SSH username (env: CISCO_SRV_ACCOUNT)
-    --password PASS           SSH password (env: CISCO_SRV_PWD)
-    --enable-secret SECRET    Enable secret (env: CISCO_ENABLE_PWD)
+  Cisco credentials (deprecated — blocked at runtime; values come from Vault):
+    --username USER           Blocked — source from Vault (key: user)
+    --password PASS           Blocked — source from Vault (key: password)
+    --enable-secret SECRET    Enable-mode secret (CLI only; optional)
 
   Runtime options:
     --transport {auto,cli,restconf,netconf}   (default: auto)
@@ -1163,6 +1193,15 @@ usage: sync_netbox_interfaces.py [-h]
     --deny-vlan-group-name-substring STR
                              Exclude VLAN groups whose name contains STR
                              (default: internet)
+
+  Vault authentication:
+    --VAULT_ADDR URL          Vault server address (env: VAULT_ADDR)
+    --VAULT_ROLE_ID ROLE_ID   AppRole role ID (env: VAULT_ROLE_ID)
+    --VAULT_SECRET_ID ID      AppRole secret ID (env: VAULT_SECRET_ID)
+    --use-env-only            Read Vault credentials from env vars only;
+                             reject any --VAULT_* CLI args
+    --vault-mount MOUNT       KV v2 mount point (default: secret)
+    --vault-path PATH         KV v2 secret path (default: network/device)
 ```
 
 ---
@@ -1194,16 +1233,23 @@ Logs go to **stderr**; the JSON result array goes to **stdout**.
 
 ---
 
-### Quickstart — credentials from environment variables
+### Quickstart — credentials from Vault environment variables
 
-**Linux / macOS:**
 ```bash
+export VAULT_ADDR=https://vault.example.org
+export VAULT_ROLE_ID=your-role-id
+export VAULT_SECRET_ID=your-secret-id
+
 python netbox_ap.py \
     --device-filter '{"platform": "iosxe", "status": "active"}'
 ```
 
 **Windows PowerShell:**
 ```powershell
+$env:VAULT_ADDR      = "https://vault.example.org"
+$env:VAULT_ROLE_ID   = "your-role-id"
+$env:VAULT_SECRET_ID = "your-secret-id"
+
 $f = '{"platform": "iosxe", "status": "active"}'
 python netbox_ap.py --device-filter $f
 ```
@@ -1250,18 +1296,6 @@ INFO  netbox_ap: acc-sw-01   Collected CDP neighbors from acc-sw-01
 INFO  netbox_ap: acc-sw-01   12 AP neighbor(s) identified
 INFO  netbox_ap: DRY-RUN  AP ap-floor3-01          model=C9130AXI-B  ip=10.10.3.50  site_id=4  sw_ver=17.9.4
 INFO  netbox_ap: DRY-RUN  AP ap-floor3-02          model=C9120AXI-B  ip=10.10.3.51  site_id=4  sw_ver=17.9.4
-```
-
-### Explicit credentials on the command line
-
-```bash
-python netbox_ap.py \
-    --netbox-url https://netbox.example.org \
-    --netbox-token your-api-token \
-    --username svc-netauto \
-    --password s3cr3t \
-    --enable-secret en4bl3s3cr3t \
-    --device acc-sw-01
 ```
 
 ### Increase concurrency and verbosity
@@ -1382,9 +1416,9 @@ All device-selection, credential, and runtime flags are identical:
 ```
 usage: netbox_ap [-h]
 
-  NetBox connection:
-    --netbox-url URL          NetBox base URL (env: NETBOX_URL)
-    --netbox-token TOKEN      NetBox API token (env: NETBOX_API)
+  NetBox connection (deprecated — blocked at runtime; values come from Vault):
+    --netbox-url URL          Blocked — source from Vault (key: netbox_url)
+    --netbox-token TOKEN      Blocked — source from Vault (key: netbox_token)
     --netbox-verify-ssl / --no-netbox-verify-ssl
 
   Device selection (pick one, or omit for all):
@@ -1395,10 +1429,10 @@ usage: netbox_ap [-h]
     --all                     Explicit "process all" flag
     --site-slug SLUG          Limit to devices in this site (slug, optional)
 
-  Cisco credentials:
-    --username USER           SSH username (env: CISCO_SRV_ACCOUNT)
-    --password PASS           SSH password (env: CISCO_SRV_PWD)
-    --enable-secret SECRET    Enable secret (env: CISCO_ENABLE_PWD)
+  Cisco credentials (deprecated — blocked at runtime; values come from Vault):
+    --username USER           Blocked — source from Vault (key: user)
+    --password PASS           Blocked — source from Vault (key: password)
+    --enable-secret SECRET    Enable-mode secret (CLI only; optional)
 
   Runtime options:
     --transport {auto,cli,restconf,netconf}   (default: auto)
@@ -1407,6 +1441,14 @@ usage: netbox_ap [-h]
     --timeout SEC             Device timeout seconds (default: 30)
     --log-level {DEBUG,INFO,WARNING,ERROR}    (default: INFO)
     --log-file PATH           Also write logs to this file (appended, UTF-8)
+
+  Vault authentication:
+    --VAULT_ADDR URL          Vault server address (env: VAULT_ADDR)
+    --VAULT_ROLE_ID ROLE_ID   AppRole role ID (env: VAULT_ROLE_ID)
+    --VAULT_SECRET_ID ID      AppRole secret ID (env: VAULT_SECRET_ID)
+    --use-env-only            Read Vault credentials from env vars only
+    --vault-mount MOUNT       KV v2 mount point (default: secret)
+    --vault-path PATH         KV v2 secret path (default: network/device)
 ```
 
 ---
@@ -1449,16 +1491,23 @@ Logs go to **stderr**; the JSON result array goes to **stdout**.
 
 ---
 
-### Quickstart — credentials from environment variables
+### Quickstart — credentials from Vault environment variables
 
-**Linux / macOS:**
 ```bash
+export VAULT_ADDR=https://vault.example.org
+export VAULT_ROLE_ID=your-role-id
+export VAULT_SECRET_ID=your-secret-id
+
 python netbox_shoretel.py \
     --device-filter '{"platform": "iosxe", "status": "active"}'
 ```
 
 **Windows PowerShell:**
 ```powershell
+$env:VAULT_ADDR      = "https://vault.example.org"
+$env:VAULT_ROLE_ID   = "your-role-id"
+$env:VAULT_SECRET_ID = "your-secret-id"
+
 $f = '{"platform": "iosxe", "status": "active"}'
 python netbox_shoretel.py --device-filter $f
 ```
@@ -1505,18 +1554,6 @@ INFO  netbox_shoretel: acc-sw-01  Collected LLDP neighbors from acc-sw-01
 INFO  netbox_shoretel: acc-sw-01  14 phone(s) identified (10 ShoreTel, 4 Mitel)
 INFO  netbox_shoretel: DRY-RUN  [shoretel] shoretel-001049413d4b  serial=001049413D4B  ip=10.173.141.147  sw_ver=804.2002.1100.0
 INFO  netbox_shoretel: DRY-RUN  [mitel]    mitel-08000fd6b36b     serial=08-00-0F-D6-B3-6B  ip=10.173.124.144  sw_ver=5.2.1.1071
-```
-
-### Explicit credentials on the command line
-
-```bash
-python netbox_shoretel.py \
-    --netbox-url https://netbox.example.org \
-    --netbox-token your-api-token \
-    --username svc-netauto \
-    --password s3cr3t \
-    --enable-secret en4bl3s3cr3t \
-    --device acc-sw-01
 ```
 
 ### Increase concurrency and verbosity
@@ -1673,9 +1710,9 @@ All device-selection, credential, and runtime flags are identical:
 ```
 usage: netbox_shoretel [-h]
 
-  NetBox connection:
-    --netbox-url URL          NetBox base URL (env: NETBOX_URL)
-    --netbox-token TOKEN      NetBox API token (env: NETBOX_API)
+  NetBox connection (deprecated — blocked at runtime; values come from Vault):
+    --netbox-url URL          Blocked — source from Vault (key: netbox_url)
+    --netbox-token TOKEN      Blocked — source from Vault (key: netbox_token)
     --netbox-verify-ssl / --no-netbox-verify-ssl
 
   Device selection (pick one, or omit for all):
@@ -1686,10 +1723,10 @@ usage: netbox_shoretel [-h]
     --all                     Explicit "process all" flag
     --site-slug SLUG          Limit to devices in this site (slug, optional)
 
-  Cisco credentials:
-    --username USER           SSH username (env: CISCO_SRV_ACCOUNT)
-    --password PASS           SSH password (env: CISCO_SRV_PWD)
-    --enable-secret SECRET    Enable secret (env: CISCO_ENABLE_PWD)
+  Cisco credentials (deprecated — blocked at runtime; values come from Vault):
+    --username USER           Blocked — source from Vault (key: user)
+    --password PASS           Blocked — source from Vault (key: password)
+    --enable-secret SECRET    Enable-mode secret (CLI only; optional)
 
   Runtime options:
     --transport {auto,cli,restconf,netconf}   (default: auto)
@@ -1698,6 +1735,14 @@ usage: netbox_shoretel [-h]
     --timeout SEC             Device timeout seconds (default: 30)
     --log-level {DEBUG,INFO,WARNING,ERROR}    (default: INFO)
     --log-file PATH           Also write logs to this file (appended, UTF-8)
+
+  Vault authentication:
+    --VAULT_ADDR URL          Vault server address (env: VAULT_ADDR)
+    --VAULT_ROLE_ID ROLE_ID   AppRole role ID (env: VAULT_ROLE_ID)
+    --VAULT_SECRET_ID ID      AppRole secret ID (env: VAULT_SECRET_ID)
+    --use-env-only            Read Vault credentials from env vars only
+    --vault-mount MOUNT       KV v2 mount point (default: secret)
+    --vault-path PATH         KV v2 secret path (default: network/device)
 ```
 
 ---
@@ -1720,23 +1765,23 @@ For each interface that has a cable the output record includes:
 | `remote_device_primary_ip` | Remote device management IP (no prefix length) |
 | `remote_interface` | Remote interface name |
 
-**Authentication** — two modes, tried in this order:
-
-1. **Basic Auth** (`--username` + `--password`) — authenticates as the full
-   user account.  Use this when the API token has restricted object permissions
-   (returns 403 on list endpoints).
-2. **Token Auth** (`--netbox-token` only) — uses `Authorization: Token`.
-   Works when the token's user has unrestricted view permission on devices and
-   interfaces.
+**Authentication** — credentials (`netbox_url`, `netbox_token`, `user`,
+`password`) are fetched from Vault at startup.  The NetBox token sourced from
+Vault is used for API calls; the `user` / `password` pair is available for
+Basic Auth when the token has restricted object permissions.
 
 Logs go to **stderr** (default level `WARNING` — silent unless something goes
 wrong); the JSON array goes to **stdout**.
 
 ---
 
-### Quickstart — credentials from environment variables
+### Quickstart — credentials from Vault environment variables
 
 ```bash
+export VAULT_ADDR=https://vault.example.org
+export VAULT_ROLE_ID=your-role-id
+export VAULT_SECRET_ID=your-secret-id
+
 python netbox_device_connections.py \
     --name apc4d6.662f.2c60
 ```
@@ -1760,35 +1805,14 @@ python netbox_device_connections.py \
     --name acc-sw-01
 ```
 
-### Explicit credentials on the command line
+### Query a device (credentials from Vault)
+
+All NetBox credentials (`netbox_url`, `netbox_token`) come from Vault.  The
+`--username` / `--password` flags are blocked at runtime.
 
 ```bash
 python netbox_device_connections.py \
-    --netbox-url   https://netbox.example.org \
-    --netbox-token your-api-token \
-    --name         acc-sw-01
-```
-
-### Basic Auth when the token lacks list permissions
-
-```bash
-python netbox_device_connections.py \
-    --netbox-url   https://netbox.example.org \
-    --netbox-token your-api-token \
-    --username     your-netbox-username \
-    --password     your-netbox-password \
-    --name         acc-sw-01
-```
-
-Or via environment variables:
-
-```bash
-export NETBOX_URL=https://netbox.example.org
-export NETBOX_API=your-api-token
-export NETBOX_USERNAME=your-netbox-username
-export NETBOX_PASSWORD=your-netbox-password
-
-python netbox_device_connections.py --name acc-sw-01
+    --name acc-sw-01
 ```
 
 ### Control log verbosity
@@ -1872,13 +1896,13 @@ python netbox_device_connections.py --name ej-3h3-9300s-6 | jq length
 ```
 usage: netbox_device_connections.py [-h]
 
-  NetBox connection:
-    --netbox-url URL          NetBox base URL (env: NETBOX_URL)
-    --netbox-token TOKEN      NetBox API token (env: NETBOX_API)
+  NetBox connection (deprecated — blocked at runtime; values come from Vault):
+    --netbox-url URL          Blocked — source from Vault (key: netbox_url)
+    --netbox-token TOKEN      Blocked — source from Vault (key: netbox_token)
 
-  Authentication (use when token has restricted permissions):
-    --username USER           NetBox username for Basic Auth (env: NETBOX_USERNAME)
-    --password PASS           NetBox password for Basic Auth (env: NETBOX_PASSWORD)
+  Authentication (deprecated — blocked at runtime; values come from Vault):
+    --username USER           Blocked — source from Vault (key: user)
+    --password PASS           Blocked — source from Vault (key: password)
 
   Target:
     --name NAME               Virtual chassis name or device name / search term
@@ -1886,6 +1910,14 @@ usage: netbox_device_connections.py [-h]
   Runtime options:
     --log-level {DEBUG,INFO,WARNING,ERROR}
                              Log verbosity on stderr (default: WARNING — silent)
+
+  Vault authentication:
+    --VAULT_ADDR URL          Vault server address (env: VAULT_ADDR)
+    --VAULT_ROLE_ID ROLE_ID   AppRole role ID (env: VAULT_ROLE_ID)
+    --VAULT_SECRET_ID ID      AppRole secret ID (env: VAULT_SECRET_ID)
+    --use-env-only            Read Vault credentials from env vars only
+    --vault-mount MOUNT       KV v2 mount point (default: secret)
+    --vault-path PATH         KV v2 secret path (default: network/device)
 ```
 
 ---
@@ -1923,16 +1955,23 @@ Logs go to **stderr**; per-device progress is printed to **stdout** as it runs.
 
 ---
 
-### Quickstart — credentials from environment variables
+### Quickstart — credentials from Vault environment variables
 
-**Linux / macOS:**
 ```bash
+export VAULT_ADDR=https://vault.example.org
+export VAULT_ROLE_ID=your-role-id
+export VAULT_SECRET_ID=your-secret-id
+
 python netbox_device_modules.py \
     --site dc1
 ```
 
 **Windows PowerShell:**
 ```powershell
+$env:VAULT_ADDR      = "https://vault.example.org"
+$env:VAULT_ROLE_ID   = "your-role-id"
+$env:VAULT_SECRET_ID = "your-secret-id"
+
 python netbox_device_modules.py --site dc1
 ```
 
@@ -1980,15 +2019,6 @@ them as modules too (requires matching `dcim.module_types` for transceiver PIDs)
 python netbox_device_modules.py \
     --device nexus-agg-01 \
     --include-transceivers
-```
-
-### Explicit credentials on the command line
-
-```bash
-python netbox_device_modules.py \
-    --netbox-url   https://netbox.example.org \
-    --netbox-token your-api-token \
-    --device       core-sw-01
 ```
 
 ### Verbose debug output
@@ -2117,9 +2147,9 @@ grep missing_module_type netbox_device_modules_errors.log \
 ```
 usage: netbox_device_modules.py [-h]
 
-  NetBox connection:
-    --netbox-url URL                  NetBox base URL (env: NETBOX_URL)
-    --netbox-token TOKEN              NetBox API token (env: NETBOX_API)
+  NetBox connection (deprecated — blocked at runtime; values come from Vault):
+    --netbox-url URL                  Blocked — source from Vault (key: netbox_url)
+    --netbox-token TOKEN              Blocked — source from Vault (key: netbox_token)
     --netbox-verify-ssl / --no-netbox-verify-ssl
 
   Device selection (pick one, or omit for all):
@@ -2136,10 +2166,10 @@ usage: netbox_device_modules.py [-h]
     --tag  SLUG                       Equivalent to --device-filter '{"tag": SLUG}'
     --limit N                         Process at most N devices
 
-  Cisco credentials:
-    --username USER                   SSH username (env: CISCO_SRV_ACCOUNT)
-    --password PASS                   SSH password (env: CISCO_SRV_PWD)
-    --enable-secret SECRET            Enable secret (env: CISCO_ENABLE_PWD)
+  Cisco credentials (deprecated — blocked at runtime; values come from Vault):
+    --username USER                   Blocked — source from Vault (key: user)
+    --password PASS                   Blocked — source from Vault (key: password)
+    --enable-secret SECRET            Enable-mode secret (CLI only; optional)
 
   Run options:
     --dry-run                         Print what would change; no NetBox writes
@@ -2153,6 +2183,14 @@ usage: netbox_device_modules.py [-h]
     --log-level DEBUG|INFO|WARNING|ERROR
                                       Log verbosity (default: INFO)
     --log-file PATH                   Also write logs to this file (appended, UTF-8)
+
+  Vault authentication:
+    --VAULT_ADDR URL                  Vault server address (env: VAULT_ADDR)
+    --VAULT_ROLE_ID ROLE_ID           AppRole role ID (env: VAULT_ROLE_ID)
+    --VAULT_SECRET_ID ID              AppRole secret ID (env: VAULT_SECRET_ID)
+    --use-env-only                    Read Vault credentials from env vars only
+    --vault-mount MOUNT               KV v2 mount point (default: secret)
+    --vault-path PATH                 KV v2 secret path (default: network/device)
 ```
 
 #### Device selection examples

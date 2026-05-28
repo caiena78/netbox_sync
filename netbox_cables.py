@@ -64,6 +64,13 @@ from typing import Dict, List, Optional, Set
 
 from cisco_device_client import CiscoDeviceClient, CiscoDeviceClientError
 from netbox_client import NetBoxClient, NetBoxClientError
+from vault_client import (
+    VaultClient,
+    VaultError,
+    add_vault_parser_args,
+    check_legacy_credential_flags,
+    resolve_vault_auth,
+)
 
 # --------------------------------------------------------------------------- #
 # Platform slug → os_type                                                      #
@@ -271,11 +278,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     nb = p.add_argument_group("NetBox connection")
     nb.add_argument("--netbox-url",
-                    default=os.environ.get("NETBOX_URL", ""),
-                    help="NetBox base URL (env: NETBOX_URL)")
+                    default=None,
+                    help="LEGACY — do not use; credentials come from Vault.")
     nb.add_argument("--netbox-token",
-                    default=os.environ.get("NETBOX_API", ""),
-                    help="NetBox API token (env: NETBOX_API)")
+                    default=None,
+                    help="LEGACY — do not use; credentials come from Vault.")
     nb.add_argument("--netbox-verify-ssl",
                     action=argparse.BooleanOptionalAction, default=True)
 
@@ -299,11 +306,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     cred = p.add_argument_group("Cisco credentials")
     cred.add_argument("--username",
-                      default=os.environ.get("CISCO_SRV_ACCOUNT", ""),
-                      help="SSH username (env: CISCO_SRV_ACCOUNT)")
+                      default=None,
+                      help="LEGACY — do not use; credentials come from Vault.")
     cred.add_argument("--password",
-                      default=os.environ.get("CISCO_SRV_PWD", ""),
-                      help="SSH password (env: CISCO_SRV_PWD)")
+                      default=None,
+                      help="LEGACY — do not use; credentials come from Vault.")
     cred.add_argument("--enable-secret",
                       default=os.environ.get("CISCO_ENABLE_PWD", ""),
                       help="Enable secret (env: CISCO_ENABLE_PWD)")
@@ -340,6 +347,13 @@ def build_parser() -> argparse.ArgumentParser:
             "Stderr output is always kept regardless of this setting."
         ),
     )
+
+    vault_grp = p.add_argument_group(
+        "Vault authentication",
+        "HashiCorp Vault AppRole credentials. CLI args take precedence over env vars. "
+        "Use --use-env-only to restrict to environment variables only.",
+    )
+    add_vault_parser_args(vault_grp)
 
     return p
 
@@ -1226,25 +1240,35 @@ def main() -> None:
 
     _configure_logging(args.log_level, args.log_file)
 
-    missing: List[str] = []
-    if not args.netbox_url:
-        missing.append("--netbox-url  or  NETBOX_URL")
-    if not args.netbox_token:
-        missing.append("--netbox-token  or  NETBOX_API")
-    if not args.username:
-        missing.append("--username  or  CISCO_SRV_ACCOUNT")
-    if not args.password:
-        missing.append("--password  or  CISCO_SRV_PWD")
-    if missing:
-        log.error("Missing:\n  %s", "\n  ".join(missing))
+    # ── Block legacy credential flags — credentials must come from Vault ──
+    check_legacy_credential_flags(args, log)
+
+    # ── Vault auth resolution and secret fetch ────────────────────────────
+    vault_addr, vault_role_id, vault_secret_id = resolve_vault_auth(args)
+    vault = VaultClient(
+        addr=vault_addr,
+        role_id=vault_role_id,
+        secret_id=vault_secret_id,
+        mount=args.vault_mount,
+        path=args.vault_path,
+    )
+    try:
+        secrets = vault.get_secrets()
+    except VaultError as exc:
+        log.error("Failed to load credentials from Vault: %s", exc)
         sys.exit(1)
+
+    # Wire secrets into args so per-device workers (which receive args) pick
+    # up the correct credentials without requiring a signature change.
+    args.username = secrets["user"]
+    args.password = secrets["password"]
 
     if args.dry_run:
         log.info("*** DRY-RUN — no NetBox writes ***")
 
     nb = NetBoxClient(
-        base_url=args.netbox_url,
-        token=args.netbox_token,
+        base_url=secrets["netbox_url"],
+        token=secrets["netbox_token"],
         verify_ssl=args.netbox_verify_ssl,
         threading=True,
     )

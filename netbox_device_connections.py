@@ -36,11 +36,18 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import sys
 from typing import Any, Dict, Iterator, List, Optional
 
 import requests
+
+from vault_client import (
+    VaultClient,
+    VaultError,
+    add_vault_parser_args,
+    check_legacy_credential_flags,
+    resolve_vault_auth,
+)
 
 log = logging.getLogger("netbox_connections")
 
@@ -539,29 +546,23 @@ def main() -> None:
 
     parser.add_argument(
         "--netbox-url",
-        default=os.environ.get("NETBOX_URL", ""),
-        help="NetBox base URL, e.g. https://netbox.example.com  (env: NETBOX_URL)",
+        default=None,
+        help="LEGACY — do not use; credentials come from Vault.",
     )
     parser.add_argument(
         "--netbox-token",
-        default=os.environ.get("NETBOX_API", ""),
-        help="NetBox API token  (env: NETBOX_API)",
+        default=None,
+        help="LEGACY — do not use; credentials come from Vault.",
     )
     parser.add_argument(
         "--username",
-        default=os.environ.get("NETBOX_USERNAME", ""),
-        help=(
-            "NetBox username for Basic Auth on the REST API  (env: NETBOX_USERNAME). "
-            "Use when the API token has restricted permissions (403 on list endpoints)."
-        ),
+        default=None,
+        help="LEGACY — do not use; credentials come from Vault.",
     )
     parser.add_argument(
         "--password",
-        default=os.environ.get("NETBOX_PASSWORD", ""),
-        help=(
-            "NetBox password for Basic Auth on the REST API  (env: NETBOX_PASSWORD). "
-            "Required together with --username."
-        ),
+        default=None,
+        help="LEGACY — do not use; credentials come from Vault.",
     )
     parser.add_argument(
         "--name",
@@ -575,6 +576,13 @@ def main() -> None:
         help="Log verbosity written to stderr (default: WARNING)",
     )
 
+    vault_grp = parser.add_argument_group(
+        "Vault authentication",
+        "HashiCorp Vault AppRole credentials. CLI args take precedence over env vars. "
+        "Use --use-env-only to restrict to environment variables only.",
+    )
+    add_vault_parser_args(vault_grp)
+
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -583,17 +591,30 @@ def main() -> None:
         format="%(levelname)-8s %(message)s",
     )
 
-    if not args.netbox_url:
-        parser.error("--netbox-url is required (or set NETBOX_URL)")
-    if not args.netbox_token:
-        parser.error("--netbox-token is required (or set NETBOX_API)")
+    # ── Block legacy credential flags — credentials must come from Vault ──
+    check_legacy_credential_flags(args, log)
+
+    # ── Vault auth resolution and secret fetch ────────────────────────────
+    vault_addr, vault_role_id, vault_secret_id = resolve_vault_auth(args)
+    vault = VaultClient(
+        addr=vault_addr,
+        role_id=vault_role_id,
+        secret_id=vault_secret_id,
+        mount=args.vault_mount,
+        path=args.vault_path,
+    )
+    try:
+        secrets = vault.get_secrets()
+    except VaultError as exc:
+        log.error("Failed to load credentials from Vault: %s", exc)
+        sys.exit(1)
 
     run(
-        base_url=args.netbox_url.rstrip("/"),
-        token=args.netbox_token,
+        base_url=secrets["netbox_url"].rstrip("/"),
+        token=secrets["netbox_token"],
         name=args.name,
-        username=args.username or None,
-        password=args.password or None,
+        username=secrets["user"] or None,
+        password=secrets["password"] or None,
     )
 
 

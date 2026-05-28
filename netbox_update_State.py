@@ -46,6 +46,7 @@ from typing import Dict, List, Optional
 
 from cisco_device_client import CiscoDeviceClient, CiscoDeviceClientError
 from netbox_client import NetBoxClient, NetBoxClientError
+from vault_client import VaultClient, VaultError, add_vault_parser_args, resolve_vault_auth
 
 # Reuse the exact same parser, helpers, and shared logic from the sync script
 # so device selection, credential flags, concurrency, and transport behaviour
@@ -862,34 +863,53 @@ def main() -> None:
         "Collect Cisco interface operational state and update the NetBox "
         "STATE custom field (plus state_change on transitions)."
     )
+    vault_grp = parser.add_argument_group(
+        "Vault authentication",
+        "HashiCorp Vault AppRole credentials. CLI args take precedence over env vars. "
+        "Use --use-env-only to restrict to environment variables only.",
+    )
+    add_vault_parser_args(vault_grp)
     args = parser.parse_args()
 
     _configure_logging(args.log_level, args.log_file)
 
-    # ── Validate required fields ─────────────────────────────────────────
-    missing: List[str] = []
-    if not args.netbox_url:
-        missing.append("--netbox-url  or  NETBOX_URL")
-    if not args.netbox_token:
-        missing.append("--netbox-token  or  NETBOX_API")
-    if not args.username:
-        missing.append("--username  or  CISCO_SRV_ACCOUNT")
-    if not args.password:
-        missing.append("--password  or  CISCO_SRV_PWD")
-    if missing:
+    # ── Block legacy credential flags — credentials must come from Vault ──
+    _LEGACY = frozenset({"--username", "--password", "--netbox-url", "--netbox-token"})
+    _legacy_provided = [f for f in sys.argv[1:] if f in _LEGACY]
+    if _legacy_provided:
         log.error(
-            "Missing required arguments / environment variables:\n  %s",
-            "\n  ".join(missing),
+            "Credential flags %s are no longer accepted. "
+            "All credentials must come from Vault. See --help for Vault options.",
+            ", ".join(_legacy_provided),
         )
         sys.exit(1)
+
+    # ── Vault auth resolution and secret fetch ────────────────────────────
+    vault_addr, vault_role_id, vault_secret_id = resolve_vault_auth(args)
+    vault = VaultClient(
+        addr=vault_addr,
+        role_id=vault_role_id,
+        secret_id=vault_secret_id,
+        mount=args.vault_mount,
+        path=args.vault_path,
+    )
+    try:
+        secrets = vault.get_secrets()
+    except VaultError as exc:
+        log.error("Failed to load credentials from Vault: %s", exc)
+        sys.exit(1)
+
+    # Wire vault secrets into args so per-device workers receive correct creds.
+    args.username = secrets["user"]
+    args.password = secrets["password"]
 
     if args.dry_run:
         log.info("*** DRY-RUN mode — no changes will be written to NetBox ***")
 
     # ── NetBox client ────────────────────────────────────────────────────
     nb = NetBoxClient(
-        base_url=args.netbox_url,
-        token=args.netbox_token,
+        base_url=secrets["netbox_url"],
+        token=secrets["netbox_token"],
         verify_ssl=args.netbox_verify_ssl,
         threading=True,
     )

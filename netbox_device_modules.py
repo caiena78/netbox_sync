@@ -68,6 +68,13 @@ import pynetbox
 
 from cisco_device_client import CiscoDeviceClient, CiscoDeviceClientError
 from netbox_client import NetBoxClient, NetBoxClientError
+from vault_client import (
+    VaultClient,
+    VaultError,
+    add_vault_parser_args,
+    check_legacy_credential_flags,
+    resolve_vault_auth,
+)
 from sync_netbox_interfaces import (
     build_vc_member_map,
     classify_device_model,
@@ -1780,12 +1787,24 @@ def build_parser() -> argparse.ArgumentParser:
         description="Sync Cisco hardware module inventory into NetBox.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Environment variables:
-  NETBOX_URL           NetBox base URL
-  NETBOX_API           NetBox API token
-  CISCO_SRV_ACCOUNT    SSH username  (overridden by --username)
-  CISCO_SRV_PWD        SSH password  (overridden by --password)
+Vault secrets (KV v2):
+  Credentials are fetched exclusively from HashiCorp Vault.
+  The secret at --vault-mount / --vault-path must contain:
+    user          SSH username
+    password      SSH password
+    netbox_url    NetBox base URL
+    netbox_token  NetBox API token
+
+Vault auth environment variables:
+  VAULT_ADDR           Vault server address   (overridden by --VAULT_ADDR)
+  VAULT_ROLE_ID        AppRole role ID        (overridden by --VAULT_ROLE_ID)
+  VAULT_SECRET_ID      AppRole secret ID      (overridden by --VAULT_SECRET_ID)
+
+Other environment variables:
   CISCO_ENABLE_PWD     Enable secret (overridden by --enable-secret)
+
+Legacy flags kept for compatibility (DO NOT USE — Vault is the credential source):
+  --username, --password, --netbox-url, --netbox-token
 
 Examples:
   # Single device
@@ -1813,10 +1832,10 @@ Examples:
     )
 
     nb_grp = p.add_argument_group("NetBox connection")
-    nb_grp.add_argument("--netbox-url",   default=os.environ.get("NETBOX_URL",  ""), metavar="URL",
-                        help="NetBox base URL (env: NETBOX_URL)")
-    nb_grp.add_argument("--netbox-token", default=os.environ.get("NETBOX_API",  ""), metavar="TOKEN",
-                        help="NetBox API token (env: NETBOX_API)")
+    nb_grp.add_argument("--netbox-url",   default=None, metavar="URL",
+                        help="LEGACY — do not use; credentials come from Vault.")
+    nb_grp.add_argument("--netbox-token", default=None, metavar="TOKEN",
+                        help="LEGACY — do not use; credentials come from Vault.")
     nb_grp.add_argument("--netbox-verify-ssl", action=argparse.BooleanOptionalAction, default=True,
                         help="Verify NetBox TLS certificate (default: true)")
 
@@ -1842,11 +1861,11 @@ Examples:
 
     cred_grp = p.add_argument_group("Cisco credentials")
     cred_grp.add_argument("--username",
-                          default=os.environ.get("CISCO_SRV_ACCOUNT", ""),
-                          help="SSH username (env: CISCO_SRV_ACCOUNT)")
+                          default=None,
+                          help="LEGACY — do not use; credentials come from Vault.")
     cred_grp.add_argument("--password",
-                          default=os.environ.get("CISCO_SRV_PWD", ""),
-                          help="SSH password (env: CISCO_SRV_PWD)")
+                          default=None,
+                          help="LEGACY — do not use; credentials come from Vault.")
     cred_grp.add_argument("--enable-secret",
                           default=os.environ.get("CISCO_ENABLE_PWD", ""),
                           help="Enable-mode secret (env: CISCO_ENABLE_PWD)")
@@ -1872,6 +1891,13 @@ Examples:
     run_grp.add_argument("--log-file", metavar="PATH", default=None,
                          help="Also write logs to this file (appended, UTF-8)")
 
+    vault_grp = p.add_argument_group(
+        "Vault authentication",
+        "HashiCorp Vault AppRole credentials. CLI args take precedence over env vars. "
+        "Use --use-env-only to restrict to environment variables only.",
+    )
+    add_vault_parser_args(vault_grp)
+
     return p
 
 
@@ -1884,18 +1910,25 @@ def main() -> None:
     args   = parser.parse_args()
     _configure_logging(args.log_level, args.log_file)
 
-    # ── Validate required config ──────────────────────────────────────────
-    missing: list = []
-    if not args.netbox_url:
-        missing.append("--netbox-url / NETBOX_URL")
-    if not args.netbox_token:
-        missing.append("--netbox-token / NETBOX_API")
-    if not args.username:
-        missing.append("--username / CISCO_SRV_ACCOUNT")
-    if not args.password:
-        missing.append("--password / CISCO_SRV_PWD")
-    if missing:
-        log.error("Missing required config:\n  %s", "\n  ".join(missing))
+    # ── Block legacy credential flags — credentials must come from Vault ──
+    check_legacy_credential_flags(args, err_log)
+
+    # ── Vault auth resolution ─────────────────────────────────────────────
+    vault_addr, vault_role_id, vault_secret_id = resolve_vault_auth(args)
+
+    # ── Fetch secrets (cached for the full run — one Vault round-trip) ────
+    vault = VaultClient(
+        addr=vault_addr,
+        role_id=vault_role_id,
+        secret_id=vault_secret_id,
+        mount=args.vault_mount,
+        path=args.vault_path,
+    )
+    try:
+        secrets = vault.get_secrets()
+    except VaultError as exc:
+        log.error("Failed to load credentials from Vault: %s", exc)
+        err_log.error("vault_error | %s", exc)
         sys.exit(1)
 
     # ── Ensure at least one device selector is given ──────────────────────
@@ -1938,8 +1971,8 @@ def main() -> None:
         log.info("*** DRY-RUN — no changes will be written to NetBox ***")
 
     nb         = NetBoxClient(
-        base_url=args.netbox_url,
-        token=args.netbox_token,
+        base_url=secrets["netbox_url"],
+        token=secrets["netbox_token"],
         verify_ssl=args.netbox_verify_ssl,
     )
     module_api = NetBoxModuleAPI(nb)
@@ -1972,8 +2005,8 @@ def main() -> None:
             module_api=module_api,
             dry_run=args.dry_run,
             include_transceivers=args.include_transceivers,
-            username=args.username,
-            password=args.password,
+            username=secrets["user"],
+            password=secrets["password"],
             enable_secret=args.enable_secret,
             timeout=args.timeout,
             force=args.force,
