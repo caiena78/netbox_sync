@@ -11,6 +11,7 @@ Public API
 ----------
 VaultClient                  — AppRole-authenticated KV v2 client
 VaultError                   — raised on auth / fetch / validation failures
+is_vault_configured(args)    — True if any Vault param is present (CLI or env var)
 resolve_vault_auth(args)     — resolves (addr, role_id, secret_id) from parsed args
 add_vault_parser_args(group) — registers all Vault argparse flags onto a group/parser
 check_legacy_credential_flags(args, err_log)
@@ -241,6 +242,22 @@ def add_vault_parser_args(group) -> None:
 # --------------------------------------------------------------------------- #
 # Runtime helpers — call from any script's main()                              #
 # --------------------------------------------------------------------------- #
+
+def is_vault_configured(args) -> bool:
+    """
+    Return True if any Vault auth parameter is present via CLI arg or env var.
+
+    Use this to decide whether to authenticate via Vault or fall back to legacy
+    CLI credential flags (--netbox-url, --netbox-token, --username, --password).
+    If Vault is configured, resolve_vault_auth() will enforce all three params
+    are present and exit with an error if any are missing.
+    """
+    return bool(
+        getattr(args, "VAULT_ADDR",      None) or os.environ.get("VAULT_ADDR")
+        or getattr(args, "VAULT_ROLE_ID",   None) or os.environ.get("VAULT_ROLE_ID")
+        or getattr(args, "VAULT_SECRET_ID", None) or os.environ.get("VAULT_SECRET_ID")
+    )
+
 
 def resolve_vault_auth(args) -> Tuple[str, str, str]:
     """

@@ -46,6 +46,7 @@ import argparse
 import ipaddress
 import json
 import logging
+import os
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -57,7 +58,7 @@ from vault_client import (
     VaultClient,
     VaultError,
     add_vault_parser_args,
-    check_legacy_credential_flags,
+    is_vault_configured,
     resolve_vault_auth,
 )
 
@@ -756,15 +757,15 @@ def build_parser() -> argparse.ArgumentParser:
     nb = p.add_argument_group("NetBox connection")
     nb.add_argument(
         "--netbox-url",
-        default=None,
+        default=os.environ.get("NETBOX_URL", ""),
         metavar="URL",
-        help="NetBox base URL (deprecated — credentials now come from Vault)",
+        help="NetBox base URL (env: NETBOX_URL). Ignored when Vault is configured.",
     )
     nb.add_argument(
         "--netbox-token",
-        default=None,
+        default=os.environ.get("NETBOX_API", ""),
         metavar="TOKEN",
-        help="NetBox API token (deprecated — credentials now come from Vault)",
+        help="NetBox API token (env: NETBOX_API). Ignored when Vault is configured.",
     )
     nb.add_argument(
         "--netbox-verify-ssl",
@@ -798,14 +799,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     cred = p.add_argument_group("Cisco credentials")
     cred.add_argument("--username",
-                      default=None,
-                      help="SSH username (deprecated — credentials now come from Vault)")
+                      default=os.environ.get("CISCO_SRV_ACCOUNT", ""),
+                      help="SSH username (env: CISCO_SRV_ACCOUNT). Ignored when Vault is configured.")
     cred.add_argument("--password",
-                      default=None,
-                      help="SSH password (deprecated — credentials now come from Vault)")
+                      default=os.environ.get("CISCO_SRV_PWD", ""),
+                      help="SSH password (env: CISCO_SRV_PWD). Ignored when Vault is configured.")
     cred.add_argument("--enable-secret",
-                      default=None,
-                      help="Enable-mode secret (deprecated — credentials now come from Vault)")
+                      default=os.environ.get("CISCO_ENABLE_PWD", ""),
+                      help="Enable-mode secret (env: CISCO_ENABLE_PWD)")
 
     run = p.add_argument_group("Runtime options")
     run.add_argument(
@@ -3671,25 +3672,40 @@ def main() -> None:
 
     _configure_logging(args.log_level, args.log_file)
 
-    check_legacy_credential_flags(args, _sync_err_log)
-
-    vault_addr, vault_role_id, vault_secret_id = resolve_vault_auth(args)
-    vault = VaultClient(
-        addr=vault_addr,
-        role_id=vault_role_id,
-        secret_id=vault_secret_id,
-        mount=args.vault_mount,
-        path=args.vault_path,
-    )
-    try:
-        secrets = vault.get_secrets()
-    except VaultError as exc:
-        log.error("Failed to load credentials from Vault: %s", exc)
-        _sync_err_log.error("vault_error | %s", exc)
-        sys.exit(1)
-
-    args.username = secrets["user"]
-    args.password = secrets["password"]
+    if is_vault_configured(args):
+        vault_addr, vault_role_id, vault_secret_id = resolve_vault_auth(args)
+        vault = VaultClient(
+            addr=vault_addr,
+            role_id=vault_role_id,
+            secret_id=vault_secret_id,
+            mount=args.vault_mount,
+            path=args.vault_path,
+        )
+        try:
+            secrets = vault.get_secrets()
+        except VaultError as exc:
+            log.error("Failed to load credentials from Vault: %s", exc)
+            _sync_err_log.error("vault_error | %s", exc)
+            sys.exit(1)
+        args.username = secrets["user"]
+        args.password = secrets["password"]
+        netbox_url   = secrets["netbox_url"]
+        netbox_token = secrets["netbox_token"]
+    else:
+        missing: List[str] = []
+        if not args.netbox_url:
+            missing.append("--netbox-url / NETBOX_URL")
+        if not args.netbox_token:
+            missing.append("--netbox-token / NETBOX_API")
+        if not args.username:
+            missing.append("--username / CISCO_SRV_ACCOUNT")
+        if not args.password:
+            missing.append("--password / CISCO_SRV_PWD")
+        if missing:
+            log.error("Missing required credentials: %s", ", ".join(missing))
+            sys.exit(1)
+        netbox_url   = args.netbox_url
+        netbox_token = args.netbox_token
 
     # Parse skip VLAN IDs
     skip_vids: Set[int] = set()
@@ -3718,8 +3734,8 @@ def main() -> None:
     log.debug("NetBox HTTP pool size: %d", _pool_size)
 
     nb = NetBoxClient(
-        base_url=secrets["netbox_url"],
-        token=secrets["netbox_token"],
+        base_url=netbox_url,
+        token=netbox_token,
         verify_ssl=args.netbox_verify_ssl,
         threading=True,
         pool_size=_pool_size,

@@ -47,16 +47,25 @@ pip install "genie>=23.0" "pyats>=23.0"
 
 ---
 
-## Authentication — HashiCorp Vault
+## Authentication
 
-All credentials (SSH username/password and NetBox URL/token) are sourced
-exclusively from **HashiCorp Vault** using AppRole authentication.  Credential
-values are never passed on the command line or read from plain environment
-variables — passing any of `--username`, `--password`, `--netbox-url`, or
-`--netbox-token` at runtime is treated as a configuration error and the script
-will exit immediately.
+Two authentication modes are supported.  The scripts automatically detect which
+to use based on whether any Vault parameter is present.
 
-### Required Vault secret keys (KV v2)
+### Mode 1 — HashiCorp Vault (recommended)
+
+When any of `VAULT_ADDR`, `VAULT_ROLE_ID`, or `VAULT_SECRET_ID` is set (via
+environment variable or CLI flag), the script authenticates to Vault via
+AppRole and fetches all credentials from a KV v2 secret.  The legacy CLI
+flags (`--netbox-url`, `--netbox-token`, `--username`, `--password`) are
+ignored in this mode.
+
+### Mode 2 — Direct CLI / environment variables (legacy)
+
+When no Vault parameters are present the scripts fall back to reading
+credentials directly from CLI flags or environment variables.
+
+### Vault — required KV v2 secret keys
 
 The Vault secret must contain exactly these four keys:
 
@@ -67,10 +76,7 @@ The Vault secret must contain exactly these four keys:
 | `netbox_url` | NetBox base URL, e.g. `https://netbox.example.org` |
 | `netbox_token` | NetBox API token |
 
-### Environment variables
-
-Vault connection parameters can be supplied via environment variables so
-nothing sensitive appears on the command line:
+### Vault — environment variables
 
 | Variable | CLI flag equivalent | Description |
 |---|---|---|
@@ -78,8 +84,7 @@ nothing sensitive appears on the command line:
 | `VAULT_ROLE_ID` | `--VAULT_ROLE_ID` | Vault AppRole role ID |
 | `VAULT_SECRET_ID` | `--VAULT_SECRET_ID` | Vault AppRole secret ID |
 
-All three are required.  Set them in your shell, `.env` file, or CI/CD secret
-store:
+All three are required when using Vault mode.  Example:
 
 ```bash
 export VAULT_ADDR=https://vault.example.org
@@ -87,11 +92,10 @@ export VAULT_ROLE_ID=your-role-id
 export VAULT_SECRET_ID=your-secret-id
 ```
 
-### Vault secret path
+### Vault — secret path
 
 The `--vault-mount` (default `secret`) and `--vault-path` (default
-`network/device`) flags control which KV v2 secret is read.  Change them if
-your Vault layout differs:
+`network/device`) flags control which KV v2 secret is read:
 
 ```bash
 python sync_netbox_interfaces.py \
@@ -100,12 +104,36 @@ python sync_netbox_interfaces.py \
     --device core-rtr-01
 ```
 
-### `--use-env-only`
+### Vault — `--use-env-only`
 
 Pass `--use-env-only` to force all three Vault parameters to come from
-environment variables, refusing any `--VAULT_ADDR` / `--VAULT_ROLE_ID` /
+environment variables only, rejecting any `--VAULT_ADDR` / `--VAULT_ROLE_ID` /
 `--VAULT_SECRET_ID` CLI args.  Useful in CI pipelines where credentials are
 injected as env vars and you want to prevent accidental CLI overrides.
+
+### Legacy — environment variables
+
+When Vault is not configured the scripts fall back to these environment
+variables:
+
+| Variable | CLI flag equivalent | Description |
+|---|---|---|
+| `NETBOX_URL` | `--netbox-url` | NetBox base URL |
+| `NETBOX_API` | `--netbox-token` | NetBox API token |
+| `CISCO_SRV_ACCOUNT` | `--username` | SSH username |
+| `CISCO_SRV_PWD` | `--password` | SSH password |
+| `CISCO_ENABLE_PWD` | `--enable-secret` | Enable-mode secret (optional) |
+
+`netbox_device_connections.py` uses `NETBOX_USERNAME` / `NETBOX_PASSWORD`
+instead of `CISCO_SRV_ACCOUNT` / `CISCO_SRV_PWD` for its Basic Auth pair.
+
+```bash
+export NETBOX_URL=https://netbox.example.org
+export NETBOX_API=your-netbox-api-token
+export CISCO_SRV_ACCOUNT=svc-netauto
+export CISCO_SRV_PWD=s3cr3t
+export CISCO_ENABLE_PWD=en4bl3s3cr3t   # omit if not needed
+```
 
 ---
 
@@ -146,10 +174,14 @@ python sync_netbox_interfaces.py `
 > python sync_netbox_interfaces.py --device-filter $f
 > ```
 
-### All matching devices with a filter
+### All matching devices with a filter (legacy credentials)
 
 ```bash
 python sync_netbox_interfaces.py \
+    --netbox-url https://netbox.example.org \
+    --netbox-token your-api-token \
+    --username svc-netauto \
+    --password s3cr3t \
     --device-filter '{"platform": "iosxe", "status": "active"}'
 ```
 
@@ -795,9 +827,9 @@ python C:\netauto\netbox_update_State.py `
 ```
 usage: netbox_update_State.py [-h]
 
-  NetBox connection (deprecated — blocked at runtime; values come from Vault):
-    --netbox-url URL          Blocked — source from Vault (key: netbox_url)
-    --netbox-token TOKEN      Blocked — source from Vault (key: netbox_token)
+  NetBox connection (ignored when Vault is configured; required otherwise):
+    --netbox-url URL          NetBox base URL (env: NETBOX_URL; ignored when Vault is configured)
+    --netbox-token TOKEN      NetBox API token (env: NETBOX_API; ignored when Vault is configured)
     --netbox-verify-ssl / --no-netbox-verify-ssl
 
   Device selection (pick one, or omit for all):
@@ -808,10 +840,10 @@ usage: netbox_update_State.py [-h]
     --all                     Explicit "process all" flag
     --site-slug SLUG          Limit to devices in this site (slug, optional)
 
-  Cisco credentials (deprecated — blocked at runtime; values come from Vault):
-    --username USER           Blocked — source from Vault (key: user)
-    --password PASS           Blocked — source from Vault (key: password)
-    --enable-secret SECRET    Enable-mode secret (CLI only; optional)
+  Cisco credentials (ignored when Vault is configured; required otherwise):
+    --username USER           SSH username (env: CISCO_SRV_ACCOUNT; ignored when Vault is configured)
+    --password PASS           SSH password (env: CISCO_SRV_PWD; ignored when Vault is configured)
+    --enable-secret SECRET    Enable-mode secret (env: CISCO_ENABLE_PWD; optional)
 
   Runtime options:
     --transport {auto,cli,restconf,netconf}   (default: auto)
@@ -1077,9 +1109,9 @@ When `--site-slug` is omitted all sites are included (existing behaviour).
 ```
 usage: netbox_cables.py [-h]
 
-  NetBox connection (deprecated — blocked at runtime; values come from Vault):
-    --netbox-url URL          Blocked — source from Vault (key: netbox_url)
-    --netbox-token TOKEN      Blocked — source from Vault (key: netbox_token)
+  NetBox connection (ignored when Vault is configured; required otherwise):
+    --netbox-url URL          NetBox base URL (env: NETBOX_URL; ignored when Vault is configured)
+    --netbox-token TOKEN      NetBox API token (env: NETBOX_API; ignored when Vault is configured)
     --netbox-verify-ssl / --no-netbox-verify-ssl
 
   Device selection (pick one, or omit for all):
@@ -1089,10 +1121,10 @@ usage: netbox_cables.py [-h]
     --device-filter JSON      NetBox DCIM filter (default: {})
     --site-slug SLUG          Limit to devices in this site (slug, optional)
 
-  Cisco credentials (deprecated — blocked at runtime; values come from Vault):
-    --username USER           Blocked — source from Vault (key: user)
-    --password PASS           Blocked — source from Vault (key: password)
-    --enable-secret SECRET    Enable-mode secret (CLI only; optional)
+  Cisco credentials (ignored when Vault is configured; required otherwise):
+    --username USER           SSH username (env: CISCO_SRV_ACCOUNT; ignored when Vault is configured)
+    --password PASS           SSH password (env: CISCO_SRV_PWD; ignored when Vault is configured)
+    --enable-secret SECRET    Enable-mode secret (env: CISCO_ENABLE_PWD; optional)
 
   Runtime options:
     --transport {auto,cli,netconf,restconf}   (default: auto)
@@ -1147,9 +1179,9 @@ When `--site-slug` is omitted all sites are included (existing behaviour).
 ```
 usage: sync_netbox_interfaces.py [-h]
 
-  NetBox connection (deprecated — blocked at runtime; values come from Vault):
-    --netbox-url URL          Blocked — source from Vault (key: netbox_url)
-    --netbox-token TOKEN      Blocked — source from Vault (key: netbox_token)
+  NetBox connection (ignored when Vault is configured; required otherwise):
+    --netbox-url URL          NetBox base URL (env: NETBOX_URL; ignored when Vault is configured)
+    --netbox-token TOKEN      NetBox API token (env: NETBOX_API; ignored when Vault is configured)
     --netbox-verify-ssl / --no-netbox-verify-ssl
 
   Device selection (pick one, or omit for all):
@@ -1160,10 +1192,10 @@ usage: sync_netbox_interfaces.py [-h]
     --all                     Explicit "process all" flag
     --site-slug SLUG          Limit to devices in this site (slug, optional)
 
-  Cisco credentials (deprecated — blocked at runtime; values come from Vault):
-    --username USER           Blocked — source from Vault (key: user)
-    --password PASS           Blocked — source from Vault (key: password)
-    --enable-secret SECRET    Enable-mode secret (CLI only; optional)
+  Cisco credentials (ignored when Vault is configured; required otherwise):
+    --username USER           SSH username (env: CISCO_SRV_ACCOUNT; ignored when Vault is configured)
+    --password PASS           SSH password (env: CISCO_SRV_PWD; ignored when Vault is configured)
+    --enable-secret SECRET    Enable-mode secret (env: CISCO_ENABLE_PWD; optional)
 
   Runtime options:
     --transport {auto,cli,restconf,netconf}   (default: auto)
@@ -1416,9 +1448,9 @@ All device-selection, credential, and runtime flags are identical:
 ```
 usage: netbox_ap [-h]
 
-  NetBox connection (deprecated — blocked at runtime; values come from Vault):
-    --netbox-url URL          Blocked — source from Vault (key: netbox_url)
-    --netbox-token TOKEN      Blocked — source from Vault (key: netbox_token)
+  NetBox connection (ignored when Vault is configured; required otherwise):
+    --netbox-url URL          NetBox base URL (env: NETBOX_URL; ignored when Vault is configured)
+    --netbox-token TOKEN      NetBox API token (env: NETBOX_API; ignored when Vault is configured)
     --netbox-verify-ssl / --no-netbox-verify-ssl
 
   Device selection (pick one, or omit for all):
@@ -1429,10 +1461,10 @@ usage: netbox_ap [-h]
     --all                     Explicit "process all" flag
     --site-slug SLUG          Limit to devices in this site (slug, optional)
 
-  Cisco credentials (deprecated — blocked at runtime; values come from Vault):
-    --username USER           Blocked — source from Vault (key: user)
-    --password PASS           Blocked — source from Vault (key: password)
-    --enable-secret SECRET    Enable-mode secret (CLI only; optional)
+  Cisco credentials (ignored when Vault is configured; required otherwise):
+    --username USER           SSH username (env: CISCO_SRV_ACCOUNT; ignored when Vault is configured)
+    --password PASS           SSH password (env: CISCO_SRV_PWD; ignored when Vault is configured)
+    --enable-secret SECRET    Enable-mode secret (env: CISCO_ENABLE_PWD; optional)
 
   Runtime options:
     --transport {auto,cli,restconf,netconf}   (default: auto)
@@ -1710,9 +1742,9 @@ All device-selection, credential, and runtime flags are identical:
 ```
 usage: netbox_shoretel [-h]
 
-  NetBox connection (deprecated — blocked at runtime; values come from Vault):
-    --netbox-url URL          Blocked — source from Vault (key: netbox_url)
-    --netbox-token TOKEN      Blocked — source from Vault (key: netbox_token)
+  NetBox connection (ignored when Vault is configured; required otherwise):
+    --netbox-url URL          NetBox base URL (env: NETBOX_URL; ignored when Vault is configured)
+    --netbox-token TOKEN      NetBox API token (env: NETBOX_API; ignored when Vault is configured)
     --netbox-verify-ssl / --no-netbox-verify-ssl
 
   Device selection (pick one, or omit for all):
@@ -1723,10 +1755,10 @@ usage: netbox_shoretel [-h]
     --all                     Explicit "process all" flag
     --site-slug SLUG          Limit to devices in this site (slug, optional)
 
-  Cisco credentials (deprecated — blocked at runtime; values come from Vault):
-    --username USER           Blocked — source from Vault (key: user)
-    --password PASS           Blocked — source from Vault (key: password)
-    --enable-secret SECRET    Enable-mode secret (CLI only; optional)
+  Cisco credentials (ignored when Vault is configured; required otherwise):
+    --username USER           SSH username (env: CISCO_SRV_ACCOUNT; ignored when Vault is configured)
+    --password PASS           SSH password (env: CISCO_SRV_PWD; ignored when Vault is configured)
+    --enable-secret SECRET    Enable-mode secret (env: CISCO_ENABLE_PWD; optional)
 
   Runtime options:
     --transport {auto,cli,restconf,netconf}   (default: auto)
@@ -1896,13 +1928,13 @@ python netbox_device_connections.py --name ej-3h3-9300s-6 | jq length
 ```
 usage: netbox_device_connections.py [-h]
 
-  NetBox connection (deprecated — blocked at runtime; values come from Vault):
-    --netbox-url URL          Blocked — source from Vault (key: netbox_url)
-    --netbox-token TOKEN      Blocked — source from Vault (key: netbox_token)
+  NetBox connection (ignored when Vault is configured; required otherwise):
+    --netbox-url URL          NetBox base URL (env: NETBOX_URL; ignored when Vault is configured)
+    --netbox-token TOKEN      NetBox API token (env: NETBOX_API; ignored when Vault is configured)
 
-  Authentication (deprecated — blocked at runtime; values come from Vault):
-    --username USER           Blocked — source from Vault (key: user)
-    --password PASS           Blocked — source from Vault (key: password)
+  Authentication (Basic Auth — optional, for when token has restricted permissions):
+    --username USER           NetBox username (env: NETBOX_USERNAME; ignored when Vault is configured)
+    --password PASS           NetBox password (env: NETBOX_PASSWORD; ignored when Vault is configured)
 
   Target:
     --name NAME               Virtual chassis name or device name / search term
@@ -2147,9 +2179,9 @@ grep missing_module_type netbox_device_modules_errors.log \
 ```
 usage: netbox_device_modules.py [-h]
 
-  NetBox connection (deprecated — blocked at runtime; values come from Vault):
-    --netbox-url URL                  Blocked — source from Vault (key: netbox_url)
-    --netbox-token TOKEN              Blocked — source from Vault (key: netbox_token)
+  NetBox connection (ignored when Vault is configured; required otherwise):
+    --netbox-url URL                  NetBox base URL (env: NETBOX_URL; ignored when Vault is configured)
+    --netbox-token TOKEN              NetBox API token (env: NETBOX_API; ignored when Vault is configured)
     --netbox-verify-ssl / --no-netbox-verify-ssl
 
   Device selection (pick one, or omit for all):
@@ -2166,9 +2198,9 @@ usage: netbox_device_modules.py [-h]
     --tag  SLUG                       Equivalent to --device-filter '{"tag": SLUG}'
     --limit N                         Process at most N devices
 
-  Cisco credentials (deprecated — blocked at runtime; values come from Vault):
-    --username USER                   Blocked — source from Vault (key: user)
-    --password PASS                   Blocked — source from Vault (key: password)
+  Cisco credentials (ignored when Vault is configured; required otherwise):
+    --username USER                   SSH username (env: CISCO_SRV_ACCOUNT; ignored when Vault is configured)
+    --password PASS                   SSH password (env: CISCO_SRV_PWD; ignored when Vault is configured)
     --enable-secret SECRET            Enable-mode secret (CLI only; optional)
 
   Run options:
