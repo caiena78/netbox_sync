@@ -821,11 +821,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--force", action="store_true",
         help=(
-            "Relocate interfaces that are assigned to the wrong VC member device. "
-            "Without this flag, misplaced interfaces are left untouched and an "
-            "error is logged instead. Module-slot corrections (wrong module "
-            "association on the same device) are always applied regardless of "
-            "this flag."
+            "Relocate interfaces that are assigned to the wrong VC member device "
+            "and remove duplicate source interfaces when the destination already "
+            "has a correctly-placed copy. Without this flag, misplaced or "
+            "duplicate interfaces are left untouched and a warning is logged "
+            "instead. Module-slot corrections (wrong module association on the "
+            "same device) are always applied regardless of this flag."
         ),
     )
     run.add_argument(
@@ -2808,6 +2809,74 @@ def _relocate_interface(
     )
 
 
+def _remove_duplicate_source_interface(
+    nb: NetBoxClient,
+    existing: dict,
+    iface_name: str,
+    device_name: str,
+    target_id: int,
+    summary: dict,
+) -> None:
+    """
+    Delete a misplaced interface record when the destination device already
+    holds a correctly-placed copy with the same name.
+
+    Called only when ``--force`` is active and the duplicate state is
+    unambiguous: ``existing`` is confirmed to be on the wrong device and
+    ``target_id`` already owns an interface with the same name.
+
+    Parameters
+    ----------
+    nb : NetBoxClient
+    existing : dict
+        The misplaced interface record (source of truth for what to delete).
+    iface_name : str
+        Interface name — used in log messages only.
+    device_name : str
+        Logical device name — used in log messages only.
+    target_id : int
+        Device ID that already has the correct interface (for log clarity).
+    summary : dict
+        Running per-device summary; ``interfaces_removed_duplicates``
+        incremented on success, ``errors`` appended on failure.
+    """
+    existing_id = existing.get("id")
+    source_dev  = _nb_id(existing.get("device"))
+    source_mod  = _nb_id(existing.get("module"))
+
+    log.info(
+        "%-30s  FORCE-REMOVE DUPLICATE %-42s  "
+        "from dev_id=%s mod_id=%s (already exists on target dev_id=%s)",
+        device_name, iface_name, source_dev, source_mod, target_id,
+    )
+    try:
+        nb.delete_interface(existing_id)
+    except NetBoxClientError as exc:
+        _sync_err_log.error(
+            "duplicate_delete_failed | device=%s iface=%s "
+            "existing_id=%s source_dev=%s error=%s",
+            device_name, iface_name, existing_id, source_dev, exc,
+        )
+        log.error(
+            "%-30s  FORCE-REMOVE DUPLICATE %r: delete failed: %s",
+            device_name, iface_name, exc,
+        )
+        summary["errors"].append(
+            f"Remove duplicate {iface_name!r} (id={existing_id}): "
+            f"delete failed: {exc}"
+        )
+        return
+
+    summary["interfaces_removed_duplicates"] = (
+        summary.get("interfaces_removed_duplicates", 0) + 1
+    )
+    log.info(
+        "%-30s  FORCE-REMOVE DUPLICATE %-42s  DONE — "
+        "source id=%s removed; target dev_id=%s is authoritative",
+        device_name, iface_name, existing_id, target_id,
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Transport selection                                                          #
 # --------------------------------------------------------------------------- #
@@ -2972,6 +3041,7 @@ def sync_device(
         "platform_updated":                0,
         "vc_members_updated":              0,
         "interfaces_relocated":                      0,
+        "interfaces_removed_duplicates":             0,
         "interfaces_relocation_skipped_dest_exists": 0,
         "interfaces_skipped_missing_vc_member":      0,
         "interfaces_skipped_missing_module":         0,
@@ -3293,13 +3363,24 @@ def sync_device(
                             )
                         )
                         if dest_occupied:
-                            log.info(
-                                "DRY-RUN  %-30s  WOULD SKIP RELOCATION "
-                                "(dest dev_id=%s already has %r)  "
-                                "existing dev_id=%s  module %s→%s",
-                                device_name, target_id, iface_name,
-                                ex_dev_id, ex_mod_id, target_module_id,
-                            )
+                            if args.force:
+                                log.info(
+                                    "DRY-RUN  %-30s  WOULD FORCE-REMOVE DUPLICATE "
+                                    "%r from dev_id=%s "
+                                    "(dest dev_id=%s already correct)  "
+                                    "module %s→%s",
+                                    device_name, iface_name, ex_dev_id,
+                                    target_id, ex_mod_id, target_module_id,
+                                )
+                            else:
+                                log.info(
+                                    "DRY-RUN  %-30s  WOULD SKIP RELOCATION "
+                                    "(dest dev_id=%s already has %r)  "
+                                    "existing dev_id=%s  module %s→%s  "
+                                    "(use --force to remove duplicate source)",
+                                    device_name, target_id, iface_name,
+                                    ex_dev_id, ex_mod_id, target_module_id,
+                                )
                         elif wrong_dev and not args.force:
                             log.info(
                                 "DRY-RUN  %-30s  WRONG VC MEMBER %-42s  "
@@ -3356,21 +3437,36 @@ def sync_device(
                         and bool(nb_ifaces_by_device.get(target_id, {}).get(iface_name))
                     )
                     if dest_has_iface:
-                        _sync_err_log.warning(
-                            "dest_exists_skip | device=%s iface=%s "
-                            "existing_dev=%s existing_mod=%s "
-                            "target_dev=%s target_mod=%s "
-                            "reason=dest_interface_exists",
-                            device_name, iface_name,
-                            ex_dev_id, ex_mod_id,
-                            target_id, target_module_id,
-                        )
-                        log.info(
-                            "%-30s  SKIP RELOCATION — dest dev_id=%s already "
-                            "has %r; existing dev_id=%s",
-                            device_name, target_id, iface_name, ex_dev_id,
-                        )
-                        summary["interfaces_relocation_skipped_dest_exists"] += 1
+                        if args.force:
+                            _remove_duplicate_source_interface(
+                                nb=nb,
+                                existing=_existing,
+                                iface_name=iface_name,
+                                device_name=device_name,
+                                target_id=target_id,
+                                summary=summary,
+                            )
+                            # Remove stale map entry so later same-name lookups
+                            # in this pass don't collide with the deleted record.
+                            if ex_dev_id in nb_ifaces_by_device:
+                                nb_ifaces_by_device[ex_dev_id].pop(iface_name, None)
+                        else:
+                            _sync_err_log.warning(
+                                "dest_exists_duplicate | device=%s iface=%s "
+                                "existing_dev=%s existing_mod=%s "
+                                "target_dev=%s target_mod=%s "
+                                "reason=dest_interface_exists_source_not_cleaned",
+                                device_name, iface_name,
+                                ex_dev_id, ex_mod_id,
+                                target_id, target_module_id,
+                            )
+                            log.warning(
+                                "%-30s  DUPLICATE %-42s  detected on dest "
+                                "dev_id=%s — skipping relocation "
+                                "(use --force to clean up source dev_id=%s)",
+                                device_name, iface_name, target_id, ex_dev_id,
+                            )
+                            summary["interfaces_relocation_skipped_dest_exists"] += 1
                         # Upsert below still runs against the correctly-placed
                         # target interface to apply any field updates.
                     elif wrong_dev and not args.force:
