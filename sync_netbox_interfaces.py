@@ -125,6 +125,7 @@ _IFACE_EXPANSIONS: List[Tuple[str, str]] = sorted(
         ("ten",                       "TenGigabitEthernet"),
         ("hun",                       "HundredGigE"),
         # 2-char abbreviations (checked after all longer prefixes)
+        ("ap",                        "AppGigabitEthernet"),   # Ap1/0/1 → AppGigabitEthernet1/0/1
         ("gi",                        "GigabitEthernet"),
         ("ge",                        "GigabitEthernet"),
         ("te",                        "TenGigabitEthernet"),
@@ -1933,6 +1934,7 @@ def _sync_interface_states(
     device_id: int,
     dry_run: bool,
     vc_member_map: Optional[Dict[int, int]] = None,
+    vc_member_module_maps: Optional[Dict[int, Dict[int, int]]] = None,
 ) -> tuple:
     """
     Stage 6 — Sync interface admin/oper state to NetBox ``enabled`` and
@@ -1942,11 +1944,16 @@ def _sync_interface_states(
     the correct VC member device based on their slot number — the same
     logic used by :func:`_sync_trunks`.
 
+    When an interface is not found in NetBox it is created on the correct
+    device and module (using *vc_member_module_maps*) before the state
+    update is retried.
+
     Returns ``(updated_count, errors)``.
     """
     updated = 0
     errors: List[str] = []
     vc_member_map = vc_member_map or {}
+    vc_member_module_maps = vc_member_module_maps or {}
 
     try:
         states = cisco.get_interface_state_inventory()
@@ -1979,12 +1986,29 @@ def _sync_interface_states(
         )
 
         if dry_run:
-            log.info(
-                "DRY-RUN  %-30s  state %-38s  dev_id=%-6s  enabled=%s  "
-                "connected=%s",
-                device_name, iface_name, target_id,
-                enabled, mark_connected,
-            )
+            try:
+                _dr_exists = nb.get_interface_by_name(target_id, iface_name) is not None
+            except NetBoxClientError:
+                _dr_exists = True  # assume exists on lookup error
+            if not _dr_exists:
+                _dr_parsed  = parse_cisco_interface(iface_name)
+                _dr_mod_id  = resolve_target_module_id(
+                    _dr_parsed["module"],
+                    vc_member_module_maps.get(target_id, {}),
+                )
+                log.info(
+                    "DRY-RUN  %-30s  WOULD CREATE (not in NetBox) %-38s  "
+                    "dev_id=%s mod_id=%s  then state=%s enabled=%s connected=%s",
+                    device_name, iface_name, target_id, _dr_mod_id,
+                    iface_state, enabled, mark_connected,
+                )
+            else:
+                log.info(
+                    "DRY-RUN  %-30s  state %-38s  dev_id=%-6s  enabled=%s  "
+                    "connected=%s",
+                    device_name, iface_name, target_id,
+                    enabled, mark_connected,
+                )
             updated += 1
             continue
 
@@ -2001,6 +2025,52 @@ def _sync_interface_states(
                     "%-30s  state updated  %-38s  enabled=%s connected=%s",
                     device_name, iface_name, enabled, mark_connected,
                 )
+            elif result.get("_action") == "not_found":
+                # ── Interface missing from NetBox — create it, then retry ──
+                _parsed    = parse_cisco_interface(iface_name)
+                _mod_id    = resolve_target_module_id(
+                    _parsed["module"],
+                    vc_member_module_maps.get(target_id, {}),
+                )
+                _nb_payload: dict = {"type": infer_netbox_interface_type(iface_name)}
+                if _mod_id is not None:
+                    _nb_payload["module"] = _mod_id
+                log.info(
+                    "%-30s  CREATE (not in NetBox) %-42s  "
+                    "dev_id=%s mod_id=%s",
+                    device_name, iface_name, target_id, _mod_id,
+                )
+                try:
+                    nb.upsert_interface(
+                        device_id=target_id,
+                        name=iface_name,
+                        payload=_nb_payload,
+                    )
+                except NetBoxClientError as exc:
+                    errors.append(
+                        f"Create missing {iface_name!r} (dev_id={target_id}): {exc}"
+                    )
+                    log.error(
+                        "%-30s  CREATE missing %r failed: %s",
+                        device_name, iface_name, exc,
+                    )
+                else:
+                    # Retry state update now that the record exists.
+                    try:
+                        _retry = nb.update_interface_admin_oper(
+                            target_id, iface_name, enabled, mark_connected
+                        )
+                        if _retry.get("_action") in ("updated", "skipped"):
+                            updated += 1
+                            log.debug(
+                                "%-30s  state set (after create) %-38s  "
+                                "enabled=%s connected=%s",
+                                device_name, iface_name, enabled, mark_connected,
+                            )
+                    except NetBoxClientError as exc:
+                        errors.append(
+                            f"State {iface_name!r} (after create): {exc}"
+                        )
         except NetBoxClientError as exc:
             errors.append(f"State {iface_name!r}: {exc}")
 
@@ -3753,6 +3823,7 @@ def sync_device(
         device_name=device_name, device_id=device_id,
         dry_run=args.dry_run,
         vc_member_map=vc_member_map,
+        vc_member_module_maps=vc_member_module_maps,
     )
     summary["interface_states_updated"] = state_updated
     summary["errors"].extend(state_errors)

@@ -2093,16 +2093,15 @@ class NetBoxClient:
             ) from exc
 
         if not existing:
-            # Interface not yet in NetBox — this can happen when the inventory
-            # stage did not create the record (e.g. unsupported interface type
-            # or a VC slot mismatch).  Log a warning and skip rather than
-            # raising, so the rest of the state sync loop continues.
+            # Interface not yet in NetBox — caller should create it first then
+            # retry.  Return a distinct action so the caller can distinguish
+            # this from "values already match" (which also returns "skipped").
             self.log.warning(
                 "update_interface_admin_oper: %r not found on device_id=%s "
-                "— state update skipped",
+                "— will attempt to create",
                 interface_name, device_id,
             )
-            return {"_action": "skipped", "name": interface_name}
+            return {"_action": "not_found", "name": interface_name}
 
         rec = existing[0]
         rec_dict = self._to_dict(rec)
