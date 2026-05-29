@@ -2742,16 +2742,56 @@ def _relocate_interface(
         )
         return
 
-    # ── c. Delete misplaced interface ─────────────────────────────────────
+    # ── c. Detach cable (if present) then delete misplaced interface ─────────
+    # NetBox rejects delete_interface when a cable is attached; the cable must
+    # be removed first.  This is safe here because we are about to recreate the
+    # interface on the correct device in step d.
+    try:
+        cable_info = nb.get_interface_cable_info(existing_id)
+    except NetBoxClientError as exc:
+        log.error(
+            "%-30s  RELOCATE %r: cable lookup failed — aborting to avoid "
+            "orphaned cable: %s", device_name, iface_name, exc,
+        )
+        summary["errors"].append(
+            f"Relocate {iface_name!r}: cable lookup failed: {exc}"
+        )
+        return
+
+    if cable_info is not None:
+        cable_id  = cable_info["cable_id"]
+        peer_ids  = cable_info.get("peer_ids", [])
+        log.info(
+            "%-30s  RELOCATE %r: cable_id=%s (peer_iface_ids=%s) — "
+            "deleting cable before interface delete",
+            device_name, iface_name, cable_id, peer_ids,
+        )
+        try:
+            nb.delete_cable(cable_id)
+        except NetBoxClientError as exc:
+            log.error(
+                "%-30s  RELOCATE %r: cable_id=%s delete failed — "
+                "aborting: %s", device_name, iface_name, cable_id, exc,
+            )
+            summary["errors"].append(
+                f"Relocate {iface_name!r}: cable delete (cable_id={cable_id}) "
+                f"failed: {exc}"
+            )
+            return
+        log.info(
+            "%-30s  RELOCATE %r: cable_id=%s deleted",
+            device_name, iface_name, cable_id,
+        )
+
     try:
         nb.delete_interface(existing_id)
     except NetBoxClientError as exc:
         log.error(
-            "%-30s  RELOCATE %r: delete failed (cable attached?) — "
+            "%-30s  RELOCATE %r: interface delete failed — "
             "aborting: %s", device_name, iface_name, exc,
         )
         summary["errors"].append(
-            f"Relocate {iface_name!r}: delete failed: {exc}"
+            f"Relocate {iface_name!r}: interface delete failed: {exc}"
         )
         return
 
@@ -2825,6 +2865,9 @@ def _remove_duplicate_source_interface(
     unambiguous: ``existing`` is confirmed to be on the wrong device and
     ``target_id`` already owns an interface with the same name.
 
+    If the interface has a cable attached, the cable is deleted first so that
+    the subsequent interface delete does not fail with a constraint error.
+
     Parameters
     ----------
     nb : NetBoxClient
@@ -2849,6 +2892,59 @@ def _remove_duplicate_source_interface(
         "from dev_id=%s mod_id=%s (already exists on target dev_id=%s)",
         device_name, iface_name, source_dev, source_mod, target_id,
     )
+
+    # ── 1. Detach cable if one is present ────────────────────────────────────
+    try:
+        cable_info = nb.get_interface_cable_info(existing_id)
+    except NetBoxClientError as exc:
+        _sync_err_log.error(
+            "duplicate_cable_lookup_failed | device=%s iface=%s "
+            "existing_id=%s source_dev=%s error=%s",
+            device_name, iface_name, existing_id, source_dev, exc,
+        )
+        log.error(
+            "%-30s  FORCE-REMOVE DUPLICATE %r: cable lookup failed — "
+            "aborting to avoid orphaned cable: %s",
+            device_name, iface_name, exc,
+        )
+        summary["errors"].append(
+            f"Remove duplicate {iface_name!r} (id={existing_id}): "
+            f"cable lookup failed: {exc}"
+        )
+        return
+
+    if cable_info is not None:
+        cable_id  = cable_info["cable_id"]
+        peer_ids  = cable_info.get("peer_ids", [])
+        log.info(
+            "%-30s  FORCE-REMOVE DUPLICATE %-42s  "
+            "cable_id=%s peer_iface_ids=%s — deleting cable first",
+            device_name, iface_name, cable_id, peer_ids,
+        )
+        try:
+            nb.delete_cable(cable_id)
+        except NetBoxClientError as exc:
+            _sync_err_log.error(
+                "duplicate_cable_delete_failed | device=%s iface=%s "
+                "existing_id=%s cable_id=%s error=%s",
+                device_name, iface_name, existing_id, cable_id, exc,
+            )
+            log.error(
+                "%-30s  FORCE-REMOVE DUPLICATE %r: cable_id=%s delete "
+                "failed — aborting: %s",
+                device_name, iface_name, cable_id, exc,
+            )
+            summary["errors"].append(
+                f"Remove duplicate {iface_name!r} (id={existing_id}): "
+                f"cable delete (cable_id={cable_id}) failed: {exc}"
+            )
+            return
+        log.info(
+            "%-30s  FORCE-REMOVE DUPLICATE %-42s  cable_id=%s deleted",
+            device_name, iface_name, cable_id,
+        )
+
+    # ── 2. Delete the misplaced interface ─────────────────────────────────────
     try:
         nb.delete_interface(existing_id)
     except NetBoxClientError as exc:
@@ -2858,12 +2954,12 @@ def _remove_duplicate_source_interface(
             device_name, iface_name, existing_id, source_dev, exc,
         )
         log.error(
-            "%-30s  FORCE-REMOVE DUPLICATE %r: delete failed: %s",
+            "%-30s  FORCE-REMOVE DUPLICATE %r: interface delete failed: %s",
             device_name, iface_name, exc,
         )
         summary["errors"].append(
             f"Remove duplicate {iface_name!r} (id={existing_id}): "
-            f"delete failed: {exc}"
+            f"interface delete failed: {exc}"
         )
         return
 
