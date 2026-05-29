@@ -102,6 +102,18 @@ _LAST_OUTPUT_RE = re.compile(
 
 log = logging.getLogger("netbox_update_State")
 
+# Virtual/logical interface prefix pattern — excluded from unused-port counting
+# and from last_input "00:00:00" overrides (physical ports only).
+_VIRTUAL_IFACE_RE = re.compile(
+    r"^(?:Vlan|Port-channel|Loopback)",
+    re.IGNORECASE,
+)
+
+# Patterns for parsing "show interfaces switchport" sections.
+_SP_NAME_RE   = re.compile(r"^Name:\s+(\S+)",                re.MULTILINE)
+_SP_SWPORT_RE = re.compile(r"Switchport:\s+(\S+)",           re.IGNORECASE)
+_SP_ADMODE_RE = re.compile(r"Administrative Mode:\s+(.+)",   re.IGNORECASE)
+
 # Patterns for convert_last_input_to_seconds().
 # Compiled once at import time; re-used per interface.
 _LI_HHMMSS_RE = re.compile(r"^(\d+):(\d{2}):(\d{2})$")
@@ -377,6 +389,71 @@ def get_interface_switch_number(interface_name: str) -> Optional[int]:
         return None
 
 
+def _is_virtual_iface(name: str) -> bool:
+    """Return True for SVIs, Port-channels, and Loopbacks."""
+    return bool(_VIRTUAL_IFACE_RE.match(name))
+
+
+def collect_switchport_modes(cisco: CiscoDeviceClient) -> Dict[str, str]:
+    """
+    Run ``show interfaces switchport`` and return the administrative mode
+    for every switched port.
+
+    Returns
+    -------
+    dict
+        ``{expanded_iface_name: "access" | "trunk" | "routed" | "unknown"}``
+
+    ``"routed"``  — ``Switchport: Disabled`` (no switchport configured)
+    ``"access"``  — Administrative Mode contains ``"access"``
+    ``"trunk"``   — Administrative Mode contains ``"trunk"``
+    ``"unknown"`` — mode line absent or not recognisable
+    """
+    try:
+        raw = cisco._cli_connection.send_command("show interfaces switchport")
+    except Exception as exc:
+        log.warning("show interfaces switchport failed: %s", exc)
+        return {}
+
+    result: Dict[str, str] = {}
+    headers = list(_SP_NAME_RE.finditer(raw))
+    for i, hdr in enumerate(headers):
+        iface_name = expand_interface_name(hdr.group(1))
+        start      = hdr.start()
+        end        = headers[i + 1].start() if i + 1 < len(headers) else len(raw)
+        section    = raw[start:end]
+
+        # Switchport disabled → routed (no switchport)
+        sw_m = _SP_SWPORT_RE.search(section)
+        if sw_m and sw_m.group(1).strip().lower() == "disabled":
+            result[iface_name] = "routed"
+            continue
+
+        mode_m = _SP_ADMODE_RE.search(section)
+        if not mode_m:
+            result[iface_name] = "unknown"
+            continue
+
+        adm = mode_m.group(1).strip().lower()
+        if "access" in adm:
+            result[iface_name] = "access"
+        elif "trunk" in adm:
+            result[iface_name] = "trunk"
+        else:
+            result[iface_name] = "unknown"
+
+    log.info(
+        "show interfaces switchport: %d entries "
+        "(access=%d  trunk=%d  routed=%d  unknown=%d)",
+        len(result),
+        sum(1 for m in result.values() if m == "access"),
+        sum(1 for m in result.values() if m == "trunk"),
+        sum(1 for m in result.values() if m == "routed"),
+        sum(1 for m in result.values() if m == "unknown"),
+    )
+    return result
+
+
 # --------------------------------------------------------------------------- #
 # Per-device worker                                                            #
 # --------------------------------------------------------------------------- #
@@ -427,6 +504,7 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
         "unused_ports":         0,
         "admin_down_ports":     0,
         "threshold_ports":      0,
+        "mode_excluded_ports":  0,
         "errors":               [],
     }
 
@@ -583,6 +661,23 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
             device_name, uptime_substituted,
         )
 
+    # ── Collect switchport access/trunk modes (IOS / IOS-XE) ─────────────
+    # Used to restrict unused-port counting to L2 access ports only.
+    switchport_modes: Dict[str, str] = {}
+    if os_type in _LAST_INPUT_SUPPORTED:
+        try:
+            switchport_modes = collect_switchport_modes(cisco)
+            log.info(
+                "%-30s  switchport modes collected for %d interface(s)",
+                device_name, len(switchport_modes),
+            )
+        except Exception as exc:
+            log.warning(
+                "%-30s  switchport mode collection failed — "
+                "unused-port count will include all DOWN interfaces: %s",
+                device_name, exc,
+            )
+
     # Compute a single timestamp for all updates in this run so the value is
     # stable within a device pass.
     now_ts          = datetime.now().astimezone().isoformat(timespec="seconds")
@@ -599,10 +694,11 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
         )
         unused_time_secs = 0
 
-    unused_ports   = 0
-    admin_down_cnt = 0
-    threshold_cnt  = 0
-    skipped_cnt    = 0   # DOWN ports excluded due to missing/unparseable last_input
+    unused_ports      = 0
+    admin_down_cnt    = 0   # informational only — no longer added to unused_ports
+    threshold_cnt     = 0
+    skipped_cnt       = 0   # DOWN ports excluded due to missing/unparseable last_input
+    mode_excluded_cnt = 0   # ports skipped because they are not L2 access
 
     # ── Build merged interface → state mapping ────────────────────────────
     # seed from show interfaces status (existing source; may have fewer entries)
@@ -636,49 +732,62 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
         # Runs unconditionally (dry-run and live) so logged totals are always
         # accurate.  Writing to NetBox happens only in live mode.
         #
-        # Rules (strict):
-        #   ADMIN DOWN              → always count
-        #   DOWN + last_input > threshold → count
-        #   UP / NO HW / SVI / other → never count
-        if iface_name.lower().startswith("vlan"):
-            pass  # SVI — logical interface, no physical switchport to count
+        # Rules (strict — only L2 access ports qualify):
+        #   virtual (SVI / Port-channel / Loopback)  → never count
+        #   not confirmed access mode                → never count
+        #   ADMIN DOWN                               → track separately, NOT unused
+        #   DOWN + last_input > threshold            → count as unused
+        #   UP / NO HW / connected                  → never count
 
-        elif iface_state == "ADMIN DOWN":
-            unused_ports   += 1
+        # Track admin-down separately for reporting regardless of mode.
+        if iface_state == "ADMIN DOWN" and not _is_virtual_iface(iface_name):
             admin_down_cnt += 1
 
+        # Exclude virtual interfaces (SVIs, Port-channels, Loopbacks).
+        if _is_virtual_iface(iface_name):
+            pass  # skip entirely for unused-port counting
+
         elif iface_state == "DOWN":
-            li_val = last_input_map.get(iface_name)
-            if li_val is None:
-                skipped_cnt += 1
+            # Only count if confirmed L2 access mode.
+            iface_mode = switchport_modes.get(iface_name)
+            if iface_mode != "access":
+                mode_excluded_cnt += 1
                 log.debug(
-                    "%-30s  %s: DOWN but no last_input data — "
-                    "excluded from unused count",
-                    device_name, iface_name,
-                )
-            elif li_val.strip().lower() == "never":
-                # "never" means the port has never received any traffic.
-                # Treat as infinite inactivity — always exceeds any threshold.
-                unused_ports  += 1
-                threshold_cnt += 1
-                log.debug(
-                    "%-30s  %s: last_input='never' — infinite inactivity, "
-                    "counted as unused",
-                    device_name, iface_name,
+                    "%-30s  %s: DOWN but mode=%r — excluded from unused count",
+                    device_name, iface_name, iface_mode,
                 )
             else:
-                li_secs = convert_last_input_to_seconds(li_val)
-                if li_secs is None:
+                li_val = last_input_map.get(iface_name)
+                if li_val is None:
                     skipped_cnt += 1
-                    log.warning(
-                        "%-30s  %s: last_input %r not parseable — "
+                    log.debug(
+                        "%-30s  %s: DOWN access port but no last_input data — "
                         "excluded from unused count",
-                        device_name, iface_name, li_val,
+                        device_name, iface_name,
                     )
-                elif li_secs > unused_time_secs:
+                elif li_val.strip().lower() == "never":
+                    # "never" means the port has never received any traffic.
+                    # Treat as infinite inactivity — always exceeds any threshold.
                     unused_ports  += 1
                     threshold_cnt += 1
-        # UP, NO HW, and any other state: do NOT increment unused_ports
+                    log.debug(
+                        "%-30s  %s: last_input='never' — infinite inactivity, "
+                        "counted as unused",
+                        device_name, iface_name,
+                    )
+                else:
+                    li_secs = convert_last_input_to_seconds(li_val)
+                    if li_secs is None:
+                        skipped_cnt += 1
+                        log.warning(
+                            "%-30s  %s: last_input %r not parseable — "
+                            "excluded from unused count",
+                            device_name, iface_name, li_val,
+                        )
+                    elif li_secs > unused_time_secs:
+                        unused_ports  += 1
+                        threshold_cnt += 1
+        # UP, ADMIN DOWN, NO HW, and any other state: do NOT increment unused_ports
 
         log.debug(
             "%-30s  Interface %s state detected as %s (dev_id=%s)",
@@ -746,15 +855,18 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
             )
 
     # ── Unused-ports summary + device CF update ──────────────────────────
-    summary["unused_ports"]     = unused_ports
-    summary["admin_down_ports"] = admin_down_cnt
-    summary["threshold_ports"]  = threshold_cnt
-    summary["skipped_ports"]    = skipped_cnt
+    summary["unused_ports"]        = unused_ports
+    summary["admin_down_ports"]    = admin_down_cnt
+    summary["threshold_ports"]     = threshold_cnt
+    summary["skipped_ports"]       = skipped_cnt
+    summary["mode_excluded_ports"] = mode_excluded_cnt
 
     log.info(
         "%-30s  unused_ports=%d  "
-        "(admin_down=%d  down_above_threshold=%d  skipped_no_data=%d)",
-        device_name, unused_ports, admin_down_cnt, threshold_cnt, skipped_cnt,
+        "(down_above_threshold=%d  skipped_no_data=%d  "
+        "mode_excluded=%d  admin_down=%d)",
+        device_name, unused_ports,
+        threshold_cnt, skipped_cnt, mode_excluded_cnt, admin_down_cnt,
     )
 
     if not args.dry_run:
@@ -777,6 +889,21 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
         log.info(
             "DRY-RUN  %-30s  would update device CF: unused_ports=%d  state_update=%s",
             device_name, unused_ports, state_update_ts,
+        )
+
+    # ── Req 1: Override last_input for connected (UP) physical ports ─────
+    # When a port is operationally UP, the effective last-input is now.
+    # Set to "00:00:00" regardless of what the CLI timer shows.
+    # Virtual interfaces (SVIs, Port-channels, Loopbacks) are excluded.
+    _up_override_cnt = 0
+    for _iface, _state in all_iface_states.items():
+        if _state == "UP" and not _is_virtual_iface(_iface):
+            last_input_map[_iface] = "00:00:00"
+            _up_override_cnt += 1
+    if _up_override_cnt:
+        log.info(
+            "%-30s  last_input overridden to '00:00:00' for %d UP interface(s)",
+            device_name, _up_override_cnt,
         )
 
     # ── Per-interface last_input update ──────────────────────────────────
