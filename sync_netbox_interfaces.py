@@ -3562,6 +3562,33 @@ def sync_device(
                                 ex_dev_id, target_id,
                                 ex_mod_id, target_module_id,
                             )
+                    else:
+                        # Interface correctly placed; scan other VC members for stale copies.
+                        for _stale_did_dr in all_vc_device_ids:
+                            if _stale_did_dr == target_id:
+                                continue
+                            _stale_rec_dr = nb_ifaces_by_device.get(
+                                _stale_did_dr, {}
+                            ).get(iface_name)
+                            if _stale_rec_dr is None:
+                                continue
+                            _stale_dev_dr = _nb_id(_stale_rec_dr.get("device"))
+                            if args.force:
+                                log.info(
+                                    "DRY-RUN  %-30s  WOULD FORCE-REMOVE STALE COPY "
+                                    "%r from dev_id=%s "
+                                    "(correct copy already on dev_id=%s)",
+                                    device_name, iface_name,
+                                    _stale_dev_dr, target_id,
+                                )
+                            else:
+                                log.info(
+                                    "DRY-RUN  %-30s  STALE COPY %r on dev_id=%s "
+                                    "(correct copy on dev_id=%s) — "
+                                    "use --force to remove",
+                                    device_name, iface_name,
+                                    _stale_dev_dr, target_id,
+                                )
                 elif not nb_ifaces_by_device.get(target_id, {}).get(iface_name):
                     log.info(
                         "DRY-RUN  %-30s  WOULD CREATE %-42s  "
@@ -3670,6 +3697,42 @@ def sync_device(
                             nb_ifaces_by_device[ex_dev_id].pop(iface_name, None)
                         nb_ifaces_by_device.setdefault(target_id, {})[iface_name] = _existing
                         # After relocation upsert below applies remaining field updates.
+                else:
+                    # Interface is already on the correct device/module.
+                    # The first-hit search may have found the correct record
+                    # while a stale copy on another VC member went undetected.
+                    # Scan every other member now and clean up stale copies.
+                    for _stale_did in all_vc_device_ids:
+                        if _stale_did == target_id:
+                            continue
+                        _stale_rec = nb_ifaces_by_device.get(_stale_did, {}).get(iface_name)
+                        if _stale_rec is None:
+                            continue
+                        _stale_dev_id = _nb_id(_stale_rec.get("device"))
+                        if args.force:
+                            _remove_duplicate_source_interface(
+                                nb=nb,
+                                existing=_stale_rec,
+                                iface_name=iface_name,
+                                device_name=device_name,
+                                target_id=target_id,
+                                summary=summary,
+                            )
+                            if _stale_did in nb_ifaces_by_device:
+                                nb_ifaces_by_device[_stale_did].pop(iface_name, None)
+                        else:
+                            _sync_err_log.warning(
+                                "stale_copy_no_force | device=%s iface=%s "
+                                "stale_dev=%s target_dev=%s",
+                                device_name, iface_name, _stale_dev_id, target_id,
+                            )
+                            log.warning(
+                                "%-30s  STALE COPY %-42s  on dev_id=%s "
+                                "(correct copy on dev_id=%s) — "
+                                "use --force to remove",
+                                device_name, iface_name, _stale_dev_id, target_id,
+                            )
+                            summary["interfaces_relocation_skipped_dest_exists"] += 1
 
         try:
             result = nb.upsert_interface(
