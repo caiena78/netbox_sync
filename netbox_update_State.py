@@ -863,12 +863,6 @@ def main() -> None:
         "Collect Cisco interface operational state and update the NetBox "
         "STATE custom field (plus state_change on transitions)."
     )
-    vault_grp = parser.add_argument_group(
-        "Vault authentication",
-        "HashiCorp Vault AppRole credentials. CLI args take precedence over env vars. "
-        "Use --use-env-only to restrict to environment variables only.",
-    )
-    add_vault_parser_args(vault_grp)
     args = parser.parse_args()
 
     _configure_logging(args.log_level, args.log_file)
