@@ -509,9 +509,11 @@ def _parse_all_routes(output: str) -> List[Dict[str, Optional[str]]]:
         return routes
 
     # ── Pattern 3: IOS-XE brief with age+interface ───────────────────────────
-    # "O 192.168.0.0/24 [110/2] via 10.0.0.2, 00:01:02, GigabitEthernet1/0/1"
+    # "O  192.168.0.0/24 [110/2] via 10.0.0.2, 00:01:02, GigabitEthernet1/0/1"
+    # "O E2 10.10.218.0/23 [110/1] via 10.254.80.6, 2w2d, TwentyFiveGigE1/1/0/47"
+    # Age can be HH:MM:SS *or* Cisco duration format (2w2d, 1d12h, 3d23h, etc.).
     for m in re.finditer(
-        r"\bvia\s+(\d+\.\d+\.\d+\.\d+),\s+([\d:]+),\s+(\S+)",
+        r"\bvia\s+(\d+\.\d+\.\d+\.\d+),\s+([^,\s]+),\s+(\S+)",
         output, re.IGNORECASE,
     ):
         routes.append(_entry(m.group(1), m.group(3).rstrip(","), age=m.group(2)))
@@ -865,33 +867,6 @@ def should_stop_trace(
     return False, ""
 
 
-def log_trace_result(
-    target_ip: str,
-    mac: Optional[str],
-    hostname: Optional[str],
-    switch_ip: str,
-    vlan: Optional[str],
-    interface: Optional[str],
-    portchannel_members: Optional[List[str]],
-    stop_reason: str,
-) -> None:
-    """Print a structured [TRACE] result block to the console."""
-    print()
-    print(f"[TRACE] Target IP:    {target_ip}")
-    if mac:
-        print(f"[TRACE] ARP MAC:      {mac_to_cisco_fmt(mac)}")
-    if hostname:
-        print(f"[TRACE] Switch:       {hostname}")
-    print(f"[TRACE] Switch IP:    {switch_ip}")
-    if vlan:
-        print(f"[TRACE] VLAN:         {vlan}")
-    if interface:
-        print(f"[TRACE] Interface:    {interface}")
-    if portchannel_members:
-        print(f"[TRACE] Po members:   {', '.join(portchannel_members)}")
-    print(f"[TRACE] Stop reason:  {stop_reason}")
-    print()
-
 
 def _log_intermediate_hop(
     hop_num: int,
@@ -927,6 +902,7 @@ def build_path_dict(
     gateway_interface: Optional[str] = None,
     dst_route: Optional[List[Dict]] = None,
     dst_ip: str = "",
+    stop_reason: str = "",
 ) -> Dict:
     """Reverse the downstream hop list to produce an upstream (device→gateway) path dict.
 
@@ -975,13 +951,14 @@ def build_path_dict(
         })
 
     return {
-        "target_ip":  target_ip,
-        "mac":        mac_to_cisco_fmt(mac) if mac else None,
-        "gateway_ip": gateway_ip,
-        "total_hops": n,
-        "path":       upstream_path,
-        "dst_route":  dst_route or {},
-        "dst_ip":     dst_ip,
+        "target_ip":   target_ip,
+        "mac":         mac_to_cisco_fmt(mac) if mac else None,
+        "gateway_ip":  gateway_ip,
+        "total_hops":  n,
+        "path":        upstream_path,
+        "dst_route":   dst_route or [],
+        "dst_ip":      dst_ip,
+        "stop_reason": stop_reason,
     }
 
 
@@ -1094,11 +1071,15 @@ def run_l3_path_trace(
         return [[gw_hop]]
 
     # Seed the BFS queue: (path_so_far, next_hop_to_visit, visited_ips_on_this_branch)
+    # Each branch gets its own copy of gw_hop stamped with the specific route it follows
+    # so print_l3_paths can label the path and show the exact egress interface.
     queue: deque = deque()
     for route in initial_routes:
         nh = route.get("next_hop")
         if nh and nh != "directly connected":
-            queue.append(([gw_hop], nh, {gateway_ip}))
+            branch_gw_hop = dict(gw_hop)
+            branch_gw_hop["selected_route"] = route   # the one route this branch follows
+            queue.append(([branch_gw_hop], nh, {gateway_ip}))
 
     if not queue:
         return [[gw_hop]]
@@ -1208,7 +1189,13 @@ def print_l3_paths(paths: List[List[Dict]], dst_ip: str) -> None:
     print(SEP)
 
     for path_num, path in enumerate(paths, 1):
-        print(f"\n  Path {path_num}:")
+        # Label the path with the specific route (next-hop + egress interface) it follows.
+        first_hop = path[0] if path else {}
+        sel = first_hop.get("selected_route", {})
+        path_nh    = sel.get("next_hop", "")
+        path_iface = sel.get("exit_interface", "")
+        path_label = f"  via {path_nh}" + (f"  [{path_iface}]" if path_iface else "")
+        print(f"\n  Path {path_num}:{path_label}")
 
         for hop_num, hop in enumerate(path, 1):
             hostname = hop.get("hostname") or hop.get("ip", "unknown")
@@ -1224,6 +1211,20 @@ def print_l3_paths(paths: List[List[Dict]], dst_ip: str) -> None:
             ifaces = hop.get("ingress_interfaces", [])
             if ifaces:
                 print(f"      Ingress : {', '.join(ifaces)}")
+
+            # For the gateway hop: show the specific egress interface this path uses.
+            sel_route = hop.get("selected_route")
+            if sel_route:
+                sel_nh    = sel_route.get("next_hop", "?")
+                sel_iface = sel_route.get("exit_interface", "")
+                sel_age   = sel_route.get("route_age", "")
+                sel_tag   = sel_route.get("route_tag", "")
+                egress_line = f"      Egress  : {sel_iface or '—'}  (→ {sel_nh})"
+                if sel_age:
+                    egress_line += f"  age:{sel_age}"
+                if sel_tag:
+                    egress_line += f"  tag:{sel_tag}"
+                print(egress_line)
 
             reached = False
             for r in hop.get("egress_routes", []):
@@ -1254,6 +1255,51 @@ def print_l3_paths(paths: List[List[Dict]], dst_ip: str) -> None:
     print()
 
 
+def print_trace_summary(result: Dict) -> None:
+    """Print the complete L2 + L3 trace summary from the combined output dict.
+
+    Called once at the very end of the trace so all output is consolidated.
+
+    *result* is the dict returned by ``run_l2_trace``::
+
+        {
+          "src_ip":     str,
+          "dst_ip":     str,
+          "gateway_ip": str,
+          "layer2":     dict | None,          # from build_path_dict
+          "layer3":     list[list[dict]] | None,  # from run_l3_path_trace
+        }
+    """
+    SEP = "=" * 70
+    print()
+    print(SEP)
+    print("  NETWORK TRACE SUMMARY")
+    print(SEP)
+    print(f"  Source      : {result.get('src_ip', '—')}")
+    print(f"  Destination : {result.get('dst_ip', '—')}")
+    print(f"  Gateway     : {result.get('gateway_ip', '—')}")
+    print(SEP)
+
+    layer2 = result.get("layer2")
+    if layer2:
+        print(f"\n  ── Layer 2 Path  (device → gateway) ──────────────────────────────")
+        stop = layer2.get("stop_reason", "")
+        if stop:
+            print(f"  L2 stop reason : {stop}")
+        print_path_summary(layer2)
+    else:
+        print("\n  [Layer 2 trace produced no path data]")
+
+    layer3 = result.get("layer3")
+    if layer3:
+        print(f"\n  ── Layer 3 Paths  (gateway → destination) ─────────────────────────")
+        print_l3_paths(layer3, result.get("dst_ip", ""))
+
+    print()
+    print(SEP)
+    print()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase 2 — L2 trace orchestration
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1267,7 +1313,7 @@ def run_l2_trace(
     source_is_ap: bool,
     device_type: Optional[str] = None,
     max_hops: int = 30,
-) -> None:
+) -> Optional[Dict]:
     """Run the hop-by-hop Layer 2 trace for *target_ip* starting at *gateway_ip*.
 
     Phase A — ARP (gateway only, once):
@@ -1301,7 +1347,7 @@ def run_l2_trace(
         client = _open_device_client(gateway_ip, device_type, creds)
     except GatewayConnectionError as exc:
         print(f"[ERROR] L2 trace — cannot connect to gateway {gateway_ip}: {exc}")
-        return
+        return None
 
     mac: Optional[str]          = None
     gw_hostname: str            = gateway_ip
@@ -1342,11 +1388,13 @@ def run_l2_trace(
 
     if not mac:
         print(f"[WARN] No ARP entry for {target_ip} on {gw_hostname}")
-        log_trace_result(
-            target_ip, None, gw_hostname, gateway_ip,
-            None, None, None, "ARP entry not found",
-        )
-        return
+        return {
+            "src_ip":     target_ip,
+            "dst_ip":     dst_ip,
+            "gateway_ip": gateway_ip,
+            "layer2":     {"stop_reason": "ARP entry not found", "path": [], "mac": None},
+            "layer3":     None,
+        }
 
     print(f"[INFO] ARP resolved: {target_ip} -> {mac_to_cisco_fmt(mac)}")
     if source_is_ap:
@@ -1368,11 +1416,7 @@ def run_l2_trace(
     current_device_type = device_type
     visited: set        = {gateway_ip}
 
-    final_hostname        : str           = gw_hostname
-    final_vlan            : Optional[str] = None
-    final_interface       : Optional[str] = None
-    final_portchannel_mbrs: List[str]     = []
-    final_stop_reason     : str           = f"Max hops ({max_hops}) reached"
+    final_stop_reason: str = f"Max hops ({max_hops}) reached"
 
     for hop_num in range(1, max_hops + 1):
         try:
@@ -1396,7 +1440,6 @@ def run_l2_trace(
             print(f"[INFO] MAC table lookup on {hostname} ({current_ip})...")
             mac_entry = mac_table_lookup(client, current_device_type, mac)
             if not mac_entry:
-                final_hostname    = hostname
                 final_stop_reason = (
                     f"MAC {mac_to_cisco_fmt(mac)} not found in table on {hostname}"
                 )
@@ -1425,12 +1468,6 @@ def run_l2_trace(
                 client._cli_disconnect()
             except Exception:
                 pass
-
-        # Snapshot final-hop state in case this is the last iteration.
-        final_hostname         = hostname
-        final_vlan             = mac_entry["vlan"]
-        final_interface        = mac_entry["interface"]
-        final_portchannel_mbrs = portchannel_mbrs
 
         # Always record this hop (downstream order) before deciding to stop/continue.
         path_hops.append({
@@ -1477,26 +1514,24 @@ def run_l2_trace(
         current_device_type = "ios"  # direct SSH — no NetBox platform lookup
         current_ip          = neighbor_ip
 
-    # ── Inline stop detail ────────────────────────────────────────────────────
-    log_trace_result(
-        target_ip           = target_ip,
-        mac                 = mac,
-        hostname            = final_hostname,
-        switch_ip           = current_ip,
-        vlan                = final_vlan,
-        interface           = final_interface,
-        portchannel_members = final_portchannel_mbrs or None,
-        stop_reason         = final_stop_reason,
-    )
-
-    # ── Full path summary (device → gateway) ─────────────────────────────────
+    # ── Build L2 path dict ────────────────────────────────────────────────────
+    layer2_dict: Optional[Dict] = None
     if path_hops:
-        path_dict = build_path_dict(target_ip, mac, gateway_ip, path_hops, gw_interface, dst_routes, dst_ip)
-        print_path_summary(path_dict)
+        layer2_dict = build_path_dict(
+            target_ip       = target_ip,
+            mac             = mac,
+            gateway_ip      = gateway_ip,
+            downstream_hops = path_hops,
+            gateway_interface = gw_interface,
+            dst_route       = dst_routes,
+            dst_ip          = dst_ip,
+            stop_reason     = final_stop_reason,
+        )
 
     # ── Phase 3: L3 path trace (gateway → destination, all ECMP paths) ────────
+    layer3_paths: List[List[Dict]] = []
     if dst_routes:
-        l3_paths = run_l3_path_trace(
+        layer3_paths = run_l3_path_trace(
             gateway_ip           = gateway_ip,
             gw_hostname          = gw_hostname,
             gw_ingress_interface = gw_interface,
@@ -1505,7 +1540,15 @@ def run_l2_trace(
             creds                = creds,
             max_hops             = max_hops,
         )
-        print_l3_paths(l3_paths, dst_ip)
+
+    # ── Return combined output dict (caller prints at the end) ────────────────
+    return {
+        "src_ip":     target_ip,
+        "dst_ip":     dst_ip,
+        "gateway_ip": gateway_ip,
+        "layer2":     layer2_dict,
+        "layer3":     layer3_paths or None,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1672,15 +1715,18 @@ def main() -> int:
         log.error("Gateway connection failed: %s", exc)
         return 1
 
-    # ── Phase 2: L2 + L3 trace ───────────────────────────────────────────────
-    run_l2_trace(
+    # ── Phase 2: L2 + L3 trace → collect all data, print once at the end ─────
+    result = run_l2_trace(
         target_ip    = src_ip,
         dst_ip       = args.dst_ip,
         gateway_ip   = gateway,
         creds        = creds,
-        source_is_ap = False,   # no NetBox AP lookup — CDP stop conditions handle endpoints
+        source_is_ap = False,   # CDP stop conditions handle endpoints
         max_hops     = args.max_hops,
     )
+
+    if result:
+        print_trace_summary(result)
 
     return 0
 
