@@ -794,6 +794,97 @@ def _log_intermediate_hop(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Phase 2 — path dict assembly and summary output
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def build_path_dict(
+    target_ip: str,
+    mac: Optional[str],
+    gateway_ip: str,
+    downstream_hops: List[Dict],
+) -> Dict:
+    """Reverse the downstream hop list to produce an upstream (device→gateway) path dict.
+
+    The downstream trace visits switches in gateway→device order.  Each hop
+    record contains:
+      local_interface   – the interface on *that* switch pointing toward the device
+                          (the MAC table result; egress in downstream, ingress in upstream)
+      portchannel_members – physical members of local_interface if it is a port-channel
+      remote_port       – "Port ID (outgoing port)" from CDP, i.e. the port on the
+                          *neighbor* switch that connects back to us.  In upstream terms
+                          this is the *egress* of the upstream hop whose d_idx is one
+                          lower.
+
+    Reversal formula (j = upstream hop index, d_idx = n-1-j):
+      ingress_interface = downstream_hops[d_idx].local_interface
+      egress_interface  = downstream_hops[d_idx-1].remote_port  (None when d_idx == 0)
+    """
+    n = len(downstream_hops)
+    upstream_path: List[Dict] = []
+
+    for j in range(n):
+        d_idx = n - 1 - j
+        d_hop = downstream_hops[d_idx]
+
+        ingress         = d_hop.get("local_interface")
+        ingress_members = d_hop.get("portchannel_members", [])
+        egress          = downstream_hops[d_idx - 1].get("remote_port") if d_idx > 0 else None
+
+        upstream_path.append({
+            "hop":                     j + 1,
+            "hostname":                d_hop.get("hostname"),
+            "switch_ip":               d_hop.get("switch_ip"),
+            "vlan":                    d_hop.get("vlan"),
+            "ingress_interface":       ingress,
+            "ingress_portchannel_members": ingress_members,
+            "egress_interface":        egress,
+        })
+
+    return {
+        "target_ip":  target_ip,
+        "mac":        mac_to_cisco_fmt(mac) if mac else None,
+        "gateway_ip": gateway_ip,
+        "total_hops": n,
+        "path":       upstream_path,
+    }
+
+
+def print_path_summary(path_dict: Dict) -> None:
+    """Print the complete device→gateway path to the console."""
+    SEP = "=" * 64
+    print()
+    print(SEP)
+    print("  PATH SUMMARY  (device --> gateway)")
+    print(SEP)
+    print(f"  Target IP  : {path_dict['target_ip']}")
+    print(f"  ARP MAC    : {path_dict['mac'] or '—'}")
+    print(f"  Gateway    : {path_dict['gateway_ip']}")
+    print(f"  Total hops : {path_dict['total_hops']}")
+    print(SEP)
+
+    for hop in path_dict["path"]:
+        hostname = hop["hostname"] or hop["switch_ip"]
+        sw_ip    = hop["switch_ip"]
+        vlan     = hop["vlan"] or "—"
+        ingress  = hop["ingress_interface"] or "—"
+        i_mbrs   = hop.get("ingress_portchannel_members", [])
+        egress   = hop["egress_interface"] or "(gateway — end of trace)"
+
+        print(f"\n  Hop {hop['hop']}: {hostname}  ({sw_ip})")
+        print(f"    VLAN    : {vlan}")
+        print(f"    Ingress : {ingress}", end="")
+        if i_mbrs:
+            print(f"  [members: {', '.join(i_mbrs)}]", end="")
+        print()
+        print(f"    Egress  : {egress}")
+
+    print()
+    print(SEP)
+    print()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Phase 2 — L2 trace orchestration
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -819,9 +910,12 @@ def run_l2_trace(
           1. MAC table lookup   → VLAN + interface
           2. Port-channel expansion (if applicable)
           3. CDP/LLDP on the resolved physical interface
-          4a. If the neighbor is an AP, VMware, or absent → stop and print result.
-          4b. If the neighbor is a switch/router → resolve its management IP,
-              log the intermediate hop, and connect to continue the trace.
+          4a. Neighbor is AP, VMware, or absent → record final hop and stop.
+          4b. Neighbor is a switch/router → record intermediate hop, resolve
+              its management IP, and connect to continue the trace.
+
+    After the loop the collected hops are reversed to produce a
+    device→gateway path dict that is printed as a summary table.
 
     Pass *device_type* to skip the NetBox platform lookup for the gateway
     (saves one API call when the caller already fetched it for Phase 1).
@@ -870,12 +964,22 @@ def run_l2_trace(
     if source_is_ap:
         print(f"[INFO] Source {target_ip} is an AP — will stop at the access switchport")
 
-    # ── Phase B: hop-by-hop MAC trace ────────────────────────────────────────
+    # ── Phase B: hop-by-hop MAC trace ─────────────────────────────────────────
+    # path_hops accumulates records in *downstream* order (gateway → device).
+    # Each record stores what is needed to later reconstruct the upstream path.
+    #
+    #   local_interface   – the MAC-table result on this switch (egress toward device)
+    #   portchannel_members – physical members of local_interface if it is a Po
+    #   remote_port       – CDP "Port ID (outgoing port)" = the port on the *next*
+    #                        switch (toward device) that connects back to us.
+    #                        This becomes the upstream egress of the *previous* hop.
+    #
+    path_hops: List[Dict] = []
+
     current_ip          = gateway_ip
     current_device_type = device_type
     visited: set        = {gateway_ip}
 
-    # These track the state of the *last completed hop* for the final printout.
     final_hostname        : str           = gw_hostname
     final_vlan            : Optional[str] = None
     final_interface       : Optional[str] = None
@@ -934,11 +1038,23 @@ def run_l2_trace(
             except Exception:
                 pass
 
-        # Capture the state of this hop before deciding what to do next.
+        # Snapshot final-hop state in case this is the last iteration.
         final_hostname         = hostname
         final_vlan             = mac_entry["vlan"]
         final_interface        = mac_entry["interface"]
         final_portchannel_mbrs = portchannel_mbrs
+
+        # Always record this hop (downstream order) before deciding to stop/continue.
+        path_hops.append({
+            "hostname":           hostname,
+            "switch_ip":          current_ip,
+            "vlan":               mac_entry["vlan"],
+            "local_interface":    mac_entry["interface"],
+            "portchannel_members": portchannel_mbrs,
+            # remote_port = CDP "outgoing port" on the next-hop switch (toward device).
+            # Left as None when this is a stop hop (endpoint / AP / VMware port).
+            "remote_port":        neighbor_info.get("remote_port") if neighbor_info else None,
+        })
 
         # Step 4 — stop-condition evaluation
         should_stop, reason = should_stop_trace(neighbor_info)
@@ -953,13 +1069,16 @@ def run_l2_trace(
                 f"Cannot resolve management IP for "
                 f"{neighbor_info.get('neighbor_id', 'unknown')} — stopping"
             )
+            # The remote_port is not useful when we cannot reach the neighbor.
+            path_hops[-1]["remote_port"] = None
             break
 
         if neighbor_ip in visited:
             final_stop_reason = f"Loop detected — already visited {neighbor_ip}"
+            path_hops[-1]["remote_port"] = None
             break
 
-        # Log this switch as an intermediate hop and advance to the next.
+        # Log this switch as an intermediate hop and advance.
         _log_intermediate_hop(
             hop_num, hostname, current_ip,
             mac_entry["vlan"], mac_entry["interface"],
@@ -971,7 +1090,7 @@ def run_l2_trace(
         current_device_type = platform_to_device_type(next_platform)
         current_ip          = neighbor_ip
 
-    # ── Final result ──────────────────────────────────────────────────────────
+    # ── Inline stop detail ────────────────────────────────────────────────────
     log_trace_result(
         target_ip           = target_ip,
         mac                 = mac,
@@ -982,6 +1101,11 @@ def run_l2_trace(
         portchannel_members = final_portchannel_mbrs or None,
         stop_reason         = final_stop_reason,
     )
+
+    # ── Full path summary (device → gateway) ─────────────────────────────────
+    if path_hops:
+        path_dict = build_path_dict(target_ip, mac, gateway_ip, path_hops)
+        print_path_summary(path_dict)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
