@@ -460,30 +460,51 @@ def get_gateway_interface(
     conn: ConnectHandler,
     gateway_ip: str,
 ) -> Optional[str]:
-    """Return the interface name on the gateway that has *gateway_ip* configured.
+    """Return the interface that carries *gateway_ip* by parsing ``show ip route <gateway_ip>``.
 
-    Runs ``show ip interface brief | include <gateway_ip>`` and parses the first
-    token (interface name) from a line whose second column exactly matches the IP
-    (with any /prefix-length stripped).  Works for IOS, IOS-XE, and NX-OS.
+    Pattern coverage (IOS / IOS-XE / NX-OS):
+
+      IOS-XE full routing-entry format:
+        * directly connected, via Vlan128
+
+      IOS-XE brief C/L route format:
+        C   10.254.28.0/24 is directly connected, Vlan128
+        L   10.254.28.1/32 is directly connected, Vlan128
+
+      NX-OS format:
+        *via 10.254.28.1, Vlan128, [0/0], 3d02h, local
     """
-    cmd = f"show ip interface brief | include {gateway_ip}"
+    cmd = f"show ip route {gateway_ip}"
     try:
         output = conn.send_command(cmd)
     except Exception as exc:
-        log.debug("Gateway interface lookup failed: %s", exc)
+        log.debug("Gateway route lookup failed: %s", exc)
         return None
 
-    for line in output.splitlines():
-        parts = line.split()
-        if len(parts) < 2:
-            continue
-        # Column 1 is the interface name; column 2 is the IP (possibly with /prefix).
-        candidate_ip = parts[1].split("/")[0]
-        if candidate_ip == gateway_ip:
-            log.debug("Gateway IP %s is on interface %s", gateway_ip, parts[0])
-            return parts[0]
+    log.debug("show ip route %s:\n%s", gateway_ip, output)
 
-    log.debug("Could not find interface for gateway IP %s", gateway_ip)
+    # IOS-XE full routing entry: "* directly connected, via Vlan128"
+    m = re.search(r"directly connected,\s+via\s+(\S+)", output, re.IGNORECASE)
+    if m:
+        iface = m.group(1).rstrip(",")
+        log.debug("Gateway %s resolved to interface %s (IOS-XE full entry)", gateway_ip, iface)
+        return iface
+
+    # IOS-XE C/L route line: "is directly connected, Vlan128"
+    m = re.search(r"is directly connected,\s+(\S+)", output, re.IGNORECASE)
+    if m:
+        iface = m.group(1).rstrip(",")
+        log.debug("Gateway %s resolved to interface %s (IOS-XE C/L route)", gateway_ip, iface)
+        return iface
+
+    # NX-OS: "*via 10.254.28.1, Vlan128, [0/0], ..."
+    m = re.search(r"\*via\s+[\d.]+,\s+([^\s,]+)", output, re.IGNORECASE)
+    if m:
+        iface = m.group(1)
+        log.debug("Gateway %s resolved to interface %s (NX-OS)", gateway_ip, iface)
+        return iface
+
+    log.debug("Could not determine gateway interface from route output for %s", gateway_ip)
     return None
 
 
