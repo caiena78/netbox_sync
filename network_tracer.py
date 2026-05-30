@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 """
-network_tracer.py — Phase 1: Gateway discovery.
+network_tracer.py — Phase 1 + 2: Gateway discovery + Layer 2 MAC trace.
 
 Given a source IP address:
-  1. Find the most specific NetBox prefix that contains it.
-  2. Calculate the first usable IP in that subnet (the expected gateway).
-  3. Attempt an SSH connection to the gateway and report the device hostname.
+  Phase 1:
+    1. Find the most specific NetBox prefix that contains it.
+    2. Calculate the first usable IP in that subnet (the expected gateway).
+    3. Attempt an SSH connection to the gateway and report the device hostname.
 
-Later phases will extend this with ARP/MAC tracing, CDP/LLDP path walking,
-routing-table analysis, ECMP parallel tracing, and full hop-by-hop output.
+  Phase 2 (L2 trace):
+    4. ARP lookup on the gateway to resolve the source IP to a MAC address.
+    5. MAC table lookup to find the VLAN and switchport.
+    6. Port-channel expansion (if applicable).
+    7. CDP/LLDP neighbor check to determine stop conditions.
+
+Later phases will extend this with routing-table analysis, ECMP parallel
+tracing, and full hop-by-hop output.
 """
 
 from __future__ import annotations
@@ -17,6 +24,7 @@ import argparse
 import ipaddress
 import logging
 import os
+import re
 import sys
 from typing import Dict, List, Optional, Tuple
 
@@ -85,17 +93,54 @@ log = logging.getLogger("network_tracer")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────────────────────
+
+# NetBox platform slug → netmiko device_type.
+_PLATFORM_MAP: Dict[str, str] = {
+    "ios":      "cisco_ios",
+    "ios-xe":   "cisco_xe",
+    "ios_xe":   "cisco_xe",
+    "iosxe":    "cisco_xe",
+    "nxos":     "cisco_nxos",
+    "nx-os":    "cisco_nxos",
+    "nx_os":    "cisco_nxos",
+    "cisco_nx": "cisco_nxos",
+}
+
+_VMWARE_KEYWORDS: Tuple[str, ...] = (
+    "vmware", "esxi", "vsphere", "vswitch", "vmnic", "esx",
+)
+
+_AP_ROLE_KEYWORDS: Tuple[str, ...] = (
+    "ap", "access-point", "wireless", "aironet",
+    "catalyst-9100", "catalyst-9105", "catalyst-9115",
+    "catalyst-9120", "catalyst-9130",
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Exceptions
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 class GatewayConnectionError(Exception):
-    """Raised when SSH to the gateway device fails."""
+    """Raised when SSH to a network device fails."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Phase 1 functions
+# NetBox helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def _get_nb_api(nb_url: str, nb_token: str, verify_ssl: bool = True):
+    """Return a configured pynetbox API instance."""
+    nb = pynetbox.api(nb_url.rstrip("/"), token=nb_token)
+    if not verify_ssl:
+        import urllib3  # noqa: PLC0415
+        urllib3.disable_warnings()
+        nb.http_session.verify = False
+    return nb
 
 
 def get_prefixes_from_netbox(
@@ -106,36 +151,80 @@ def get_prefixes_from_netbox(
 ) -> List[str]:
     """Return prefix strings from NetBox IPAM.
 
-    When *contains* is supplied, the NetBox ``contains`` filter is used so only
-    prefixes that contain that address are fetched — much faster than pulling
-    all prefixes on large instances.  Without it every prefix is returned.
+    When *contains* is supplied the NetBox ``contains`` filter is used so only
+    prefixes that contain that address are fetched.
     """
     try:
-        nb = pynetbox.api(nb_url.rstrip("/"), token=nb_token)
-        if not verify_ssl:
-            import urllib3  # noqa: PLC0415
-            urllib3.disable_warnings()
-            nb.http_session.verify = False
-
+        nb = _get_nb_api(nb_url, nb_token, verify_ssl)
         if contains:
             raw = list(nb.ipam.prefixes.filter(contains=contains))
         else:
             raw = list(nb.ipam.prefixes.all())
-
         prefixes = [str(p.prefix) for p in raw if p.prefix]
         log.debug("Fetched %d prefix(es) from NetBox (contains=%s)", len(prefixes), contains)
         return prefixes
-
     except Exception as exc:
         log.error("NetBox prefix lookup failed: %s", exc)
         return []
 
 
-def find_longest_prefix_match(ip: str, prefixes: List[str]) -> Optional[str]:
-    """Return the most specific prefix (longest prefix length) that contains *ip*.
+def get_platform_from_netbox(
+    nb_url: str,
+    nb_token: str,
+    device_ip: str,
+    verify_ssl: bool = True,
+) -> Optional[str]:
+    """Return the NetBox platform slug for the device whose primary IP is *device_ip*."""
+    try:
+        nb = _get_nb_api(nb_url, nb_token, verify_ssl)
+        candidates = list(nb.dcim.devices.filter(primary_ip4=device_ip))
+        if not candidates:
+            candidates = list(nb.dcim.devices.filter(primary_ip4=f"{device_ip}/32"))
+        if not candidates:
+            log.debug("No NetBox device found for IP %s", device_ip)
+            return None
+        device = candidates[0]
+        if device.platform:
+            slug = device.platform.slug
+            log.debug("NetBox platform for %s: %s", device_ip, slug)
+            return slug
+        return None
+    except Exception as exc:
+        log.error("NetBox platform lookup failed for %s: %s", device_ip, exc)
+        return None
 
-    Returns ``None`` when no prefix matches.
-    """
+
+def is_ap_in_netbox(
+    nb_url: str,
+    nb_token: str,
+    ip: str,
+    verify_ssl: bool = True,
+) -> bool:
+    """Return True if the NetBox device with *ip* as its primary IP is an AP."""
+    try:
+        nb = _get_nb_api(nb_url, nb_token, verify_ssl)
+        candidates = list(nb.dcim.devices.filter(primary_ip4=ip))
+        if not candidates:
+            candidates = list(nb.dcim.devices.filter(primary_ip4=f"{ip}/32"))
+        for dev in candidates:
+            role_slug  = (dev.device_role.slug  if dev.device_role  else "").lower()
+            type_model = (dev.device_type.model if dev.device_type  else "").lower()
+            if any(kw in role_slug or kw in type_model for kw in _AP_ROLE_KEYWORDS):
+                log.debug("Device %s (%s) identified as AP via NetBox", ip, dev.name)
+                return True
+        return False
+    except Exception as exc:
+        log.debug("NetBox AP check failed for %s: %s", ip, exc)
+        return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 1 — prefix / gateway helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def find_longest_prefix_match(ip: str, prefixes: List[str]) -> Optional[str]:
+    """Return the most specific prefix (longest prefix-length) containing *ip*."""
     try:
         addr = ipaddress.ip_address(ip)
     except ValueError:
@@ -143,14 +232,12 @@ def find_longest_prefix_match(ip: str, prefixes: List[str]) -> Optional[str]:
         return None
 
     best: Optional[ipaddress.IPv4Network | ipaddress.IPv6Network] = None
-
     for raw in prefixes:
         try:
             net = ipaddress.ip_network(raw, strict=False)
         except ValueError:
             log.debug("Skipping malformed prefix: %r", raw)
             continue
-
         if addr in net:
             if best is None or net.prefixlen > best.prefixlen:
                 best = net
@@ -158,7 +245,6 @@ def find_longest_prefix_match(ip: str, prefixes: List[str]) -> Optional[str]:
     if best:
         log.debug("Longest prefix match for %s: %s", ip, best)
         return str(best)
-
     log.debug("No prefix match found for %s", ip)
     return None
 
@@ -166,33 +252,40 @@ def find_longest_prefix_match(ip: str, prefixes: List[str]) -> Optional[str]:
 def calculate_first_usable_ip(prefix: str) -> Optional[str]:
     """Return the first usable host address in *prefix*.
 
-    Handling:
-      - /32 or /128 → the single address itself.
-      - /31         → the network address (RFC 3021 point-to-point links).
-      - All others  → network address + 1 (the conventional gateway slot).
+    /32 or /128 → the address itself; /31 → network address; all others → net+1.
     """
     try:
         net = ipaddress.ip_network(prefix, strict=False)
     except ValueError:
         log.error("Invalid prefix: %r", prefix)
         return None
-
     if net.num_addresses == 1:
-        return str(net.network_address)          # /32 or /128
+        return str(net.network_address)
     if net.prefixlen >= 31:
-        return str(net.network_address)          # /31 — both ends are hosts
-    return str(net.network_address + 1)          # .1 of the subnet
+        return str(net.network_address)
+    return str(net.network_address + 1)
 
 
-def connect_to_device(ip: str, credentials: Dict[str, str]) -> str:
-    """Open an SSH session to *ip* and return the device hostname.
+# ─────────────────────────────────────────────────────────────────────────────
+# SSH connection helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-    The hostname is extracted from the CLI prompt (``hostname#`` →
-    ``hostname``).  Raises :exc:`GatewayConnectionError` on any failure so
-    the caller can produce a clean ``[ERROR]`` line without a traceback.
-    """
+
+def platform_to_device_type(platform_slug: Optional[str]) -> str:
+    """Map a NetBox platform slug to a netmiko device_type. Defaults to cisco_ios."""
+    if not platform_slug:
+        return "cisco_ios"
+    return _PLATFORM_MAP.get(platform_slug.lower(), "cisco_ios")
+
+
+def open_connection(
+    ip: str,
+    device_type: str,
+    credentials: Dict[str, str],
+) -> ConnectHandler:
+    """Open and return a live SSH session. Caller must call disconnect()."""
     params: Dict = {
-        "device_type":  "cisco_ios",
+        "device_type":  device_type,
         "host":         ip,
         "username":     credentials.get("username", ""),
         "password":     credentials.get("password", ""),
@@ -201,9 +294,8 @@ def connect_to_device(ip: str, credentials: Dict[str, str]) -> str:
         "conn_timeout": int(credentials.get("timeout", 30)),
         "fast_cli":     False,
     }
-
     try:
-        conn = ConnectHandler(**params)
+        return ConnectHandler(**params)
     except NetmikoAuthenticationException as exc:
         raise GatewayConnectionError(f"authentication failed for {ip}: {exc}") from exc
     except NetmikoTimeoutException as exc:
@@ -211,8 +303,20 @@ def connect_to_device(ip: str, credentials: Dict[str, str]) -> str:
     except Exception as exc:
         raise GatewayConnectionError(f"SSH error for {ip}: {exc}") from exc
 
+
+def connect_to_device(
+    ip: str,
+    credentials: Dict[str, str],
+    device_type: str = "cisco_ios",
+) -> str:
+    """Open an SSH session to *ip*, retrieve the hostname prompt, then disconnect.
+
+    Returns the hostname string (falls back to *ip*).
+    Raises :exc:`GatewayConnectionError` on any failure.
+    """
+    conn = open_connection(ip, device_type, credentials)
     try:
-        prompt = conn.find_prompt()
+        prompt   = conn.find_prompt()
         hostname = prompt.rstrip("#>").strip()
         log.debug("Connected to %s — prompt: %r", ip, prompt)
         return hostname or ip
@@ -223,6 +327,503 @@ def connect_to_device(ip: str, credentials: Dict[str, str]) -> str:
             conn.disconnect()
         except Exception:
             pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 2 — MAC address normalization
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def normalize_mac(raw: str) -> Optional[str]:
+    """Normalize any common MAC format to xx:xx:xx:xx:xx:xx (lowercase).
+
+    Accepts colon, dash, Cisco-dot, or no-delimiter inputs.
+    Returns None when the input is not a valid 48-bit MAC.
+    """
+    digits = re.sub(r"[:\-\.]", "", raw.strip()).lower()
+    if len(digits) != 12 or not re.fullmatch(r"[0-9a-f]{12}", digits):
+        return None
+    return ":".join(digits[i : i + 2] for i in range(0, 12, 2))
+
+
+def mac_to_cisco_fmt(mac: str) -> str:
+    """Convert a normalized xx:xx:xx:xx:xx:xx MAC to Cisco xxxx.xxxx.xxxx notation."""
+    digits = mac.replace(":", "")
+    return f"{digits[0:4]}.{digits[4:8]}.{digits[8:12]}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 2 — ARP lookup
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def arp_lookup(
+    conn: ConnectHandler,
+    device_type: str,  # noqa: ARG001 — reserved for future platform-specific ARP variants
+    target_ip: str,
+) -> Optional[str]:
+    """Run ``show ip arp <target_ip>`` and return the normalized MAC, or None."""
+    cmd = f"show ip arp {target_ip}"
+    try:
+        output = conn.send_command(cmd)
+    except Exception as exc:
+        log.error("ARP command failed (%s): %s", cmd, exc)
+        return None
+
+    log.debug("ARP output for %s:\n%s", target_ip, output)
+
+    # Cisco dotted: xxxx.xxxx.xxxx
+    m = re.search(r"([0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4})", output)
+    if m:
+        return normalize_mac(m.group(1))
+
+    # Colon-separated: xx:xx:xx:xx:xx:xx
+    m = re.search(
+        r"([0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}"
+        r":[0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2})",
+        output,
+    )
+    if m:
+        return normalize_mac(m.group(1))
+
+    log.debug("No MAC found in ARP output for %s", target_ip)
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 2 — MAC table lookup
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Matches the start of any Cisco/NX-OS interface abbreviation.
+_IFACE_RE = re.compile(
+    r"^(Gi|Fa|Te|Fo|Hu|Twe|Po|Eth|GigabitEthernet|FastEthernet"
+    r"|TenGigabitEthernet|Port-channel|port-channel|ae|bundle)",
+    re.IGNORECASE,
+)
+
+
+def _parse_mac_table_output(output: str, mac: str) -> Optional[Dict[str, str]]:
+    """Parse ``show mac address-table`` output and return {vlan, interface, mac}."""
+    search_mac = mac_to_cisco_fmt(mac).lower()
+
+    for line in output.splitlines():
+        if search_mac not in line.lower():
+            continue
+
+        # Strip NX-OS leading flag characters (* G R C ~ +) and whitespace.
+        clean = re.sub(r"^\s*[*GRC~+\s]+", "", line).strip()
+        parts = clean.split()
+        if len(parts) < 3:
+            continue
+
+        vlan      : Optional[str] = None
+        interface : Optional[str] = None
+
+        # VLAN — first token that is purely numeric.
+        if parts[0].isdigit():
+            vlan = parts[0]
+
+        # Interface — rightmost token that looks like a network interface.
+        for token in reversed(parts):
+            if _IFACE_RE.match(token):
+                interface = token
+                break
+
+        if vlan and interface:
+            log.debug("MAC table: VLAN=%s, interface=%s", vlan, interface)
+            return {"vlan": vlan, "interface": interface, "mac": mac}
+
+    log.debug("Could not parse MAC table output:\n%s", output)
+    return None
+
+
+def mac_table_lookup(
+    conn: ConnectHandler,
+    device_type: str,  # noqa: ARG001 — reserved for future platform-specific MAC table commands
+    mac: str,
+) -> Optional[Dict[str, str]]:
+    """Look up *mac* in the forwarding table and return {vlan, interface, mac}."""
+    cisco_mac = mac_to_cisco_fmt(mac)
+    cmd = f"show mac address-table address {cisco_mac}"
+    try:
+        output = conn.send_command(cmd)
+    except Exception as exc:
+        log.error("MAC table command failed (%s): %s", cmd, exc)
+        return None
+    log.debug("MAC table output:\n%s", output)
+    return _parse_mac_table_output(output, mac)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 2 — port-channel member lookup
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def is_portchannel(interface: str) -> bool:
+    """Return True when *interface* is a LAG/port-channel logical interface."""
+    return bool(
+        re.match(r"^(port-?channel|Po|ae|bundle-?ether)\d+", interface, re.IGNORECASE)
+    )
+
+
+def _parse_ios_portchannel_members(output: str, po_num: str) -> List[str]:
+    """Extract physical members of Port-channel *po_num* from IOS/IOS-XE etherchannel summary.
+
+    Typical line format:
+        1    Po1(SU)    LACP    Gi1/0/47(P) Gi2/0/47(P)
+    """
+    members: List[str] = []
+    capturing = False
+
+    for line in output.splitlines():
+        if re.search(rf"\bPo{po_num}\b", line, re.IGNORECASE):
+            capturing = True
+        elif capturing and re.search(r"\bPo\d+\b", line):
+            break  # start of next group
+
+        if not capturing:
+            continue
+
+        for raw in re.findall(r"((?:Gi|Fa|Te|Fo|Hu|Twe)\d[\d/\.]*)", line):
+            clean = re.sub(r"\([^)]*\)", "", raw).strip()
+            if clean and clean not in members:
+                members.append(clean)
+
+    return members
+
+
+def _parse_nxos_portchannel_members(output: str, po_num: str) -> List[str]:
+    """Extract physical members of Po *po_num* from NX-OS port-channel summary.
+
+    Typical line format:
+        1    Po1(SU)    Eth    LACP    Eth1/1(P) Eth1/2(P)
+    """
+    members: List[str] = []
+    capturing = False
+
+    for line in output.splitlines():
+        if re.search(rf"\bPo{po_num}\b", line, re.IGNORECASE):
+            capturing = True
+        elif capturing and re.search(r"\bPo\d+\b", line):
+            break
+
+        if not capturing:
+            continue
+
+        for raw in re.findall(r"(Eth\d+/\d+(?:/\d+)?)", line):
+            clean = re.sub(r"\([^)]*\)", "", raw).strip()
+            if clean and clean not in members:
+                members.append(clean)
+
+    return members
+
+
+def get_portchannel_members(
+    conn: ConnectHandler,
+    device_type: str,
+    interface: str,
+) -> List[str]:
+    """Return the physical member interfaces of the given port-channel.
+
+    Uses platform-appropriate commands:
+      IOS/IOS-XE: ``show etherchannel summary``
+      NX-OS:      ``show port-channel summary``
+    """
+    m = re.search(r"\d+", interface)
+    if not m:
+        log.debug("Cannot extract port-channel number from %r", interface)
+        return []
+
+    po_num = m.group(0)
+    try:
+        if "nxos" in device_type:
+            output  = conn.send_command("show port-channel summary")
+            members = _parse_nxos_portchannel_members(output, po_num)
+        else:
+            output  = conn.send_command("show etherchannel summary")
+            members = _parse_ios_portchannel_members(output, po_num)
+    except Exception as exc:
+        log.error("Port-channel member lookup failed: %s", exc)
+        return []
+
+    log.debug("Port-channel %s members: %s", interface, members)
+    return members
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 2 — CDP / LLDP neighbor lookup
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _get_cdp_neighbor(
+    conn: ConnectHandler,
+    device_type: str,
+    interface: str,
+) -> Optional[Dict[str, str]]:
+    """Return a CDP neighbor detail dict for *interface*, or None."""
+    if "nxos" in device_type:
+        cmd = f"show cdp neighbors interface {interface} detail"
+    else:
+        cmd = f"show cdp neighbors {interface} detail"
+
+    try:
+        output = conn.send_command(cmd)
+    except Exception as exc:
+        log.debug("CDP command failed on %s: %s", interface, exc)
+        return None
+
+    if not output or "device id" not in output.lower():
+        return None
+
+    info: Dict[str, str] = {"protocol": "CDP"}
+
+    m = re.search(r"Device ID:\s*(\S+)", output, re.IGNORECASE)
+    if m:
+        info["neighbor_id"] = m.group(1)
+
+    m = re.search(r"Platform:\s*([^,\r\n]+)", output, re.IGNORECASE)
+    if m:
+        info["platform"] = m.group(1).strip()
+
+    m = re.search(r"IP [Aa]ddress:\s*(\S+)", output, re.IGNORECASE)
+    if m:
+        info["neighbor_ip"] = m.group(1)
+
+    m = re.search(r"Port ID \(outgoing port\):\s*(\S+)", output, re.IGNORECASE)
+    if m:
+        info["remote_port"] = m.group(1)
+
+    return info if "neighbor_id" in info else None
+
+
+def _get_lldp_neighbor(
+    conn: ConnectHandler,
+    device_type: str,
+    interface: str,
+) -> Optional[Dict[str, str]]:
+    """Return an LLDP neighbor detail dict for *interface*, or None."""
+    if "nxos" in device_type:
+        cmd = f"show lldp neighbors interface {interface} detail"
+    else:
+        cmd = f"show lldp neighbors {interface} detail"
+
+    try:
+        output = conn.send_command(cmd)
+    except Exception as exc:
+        log.debug("LLDP command failed on %s: %s", interface, exc)
+        return None
+
+    if not output or "chassis id" not in output.lower():
+        return None
+
+    info: Dict[str, str] = {"protocol": "LLDP"}
+
+    m = re.search(r"System Name:\s*(\S+)", output, re.IGNORECASE)
+    if m:
+        info["neighbor_id"] = m.group(1)
+
+    m = re.search(r"System Description:\s*(.+)", output, re.IGNORECASE)
+    if m:
+        info["platform"] = m.group(1).strip()[:80]
+
+    m = re.search(r"Management Address:\s*(\S+)", output, re.IGNORECASE)
+    if m:
+        info["neighbor_ip"] = m.group(1)
+
+    m = re.search(r"Port ID:\s*(\S+)", output, re.IGNORECASE)
+    if m:
+        info["remote_port"] = m.group(1)
+
+    return info if "neighbor_id" in info else None
+
+
+def get_neighbor_info(
+    conn: ConnectHandler,
+    device_type: str,
+    interface: str,
+) -> Optional[Dict[str, str]]:
+    """Return CDP or LLDP neighbor info for *interface*, preferring CDP. Returns None if none found."""
+    cdp = _get_cdp_neighbor(conn, device_type, interface)
+    if cdp:
+        return cdp
+    return _get_lldp_neighbor(conn, device_type, interface)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 2 — stop-condition evaluation and result output
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def should_stop_trace(
+    neighbor_info: Optional[Dict[str, str]],
+    source_is_ap: bool,
+) -> Tuple[bool, str]:
+    """Return (stop, reason) based on neighbor info and whether the source is an AP."""
+    if source_is_ap:
+        return True, "Source device is an AP — stopping at closest switchport"
+
+    if not neighbor_info:
+        return True, "No CDP/LLDP neighbor on this port — closest switchport"
+
+    combined = (
+        neighbor_info.get("neighbor_id", "") + " " + neighbor_info.get("platform", "")
+    ).lower()
+
+    if any(kw in combined for kw in _VMWARE_KEYWORDS):
+        return True, f"Neighbor is VMware ({neighbor_info.get('neighbor_id', 'unknown')})"
+
+    if any(kw in combined for kw in _AP_ROLE_KEYWORDS):
+        return True, f"Neighbor is an AP ({neighbor_info.get('neighbor_id', 'unknown')})"
+
+    return False, ""
+
+
+def log_trace_result(
+    target_ip: str,
+    mac: Optional[str],
+    hostname: Optional[str],
+    switch_ip: str,
+    vlan: Optional[str],
+    interface: Optional[str],
+    portchannel_members: Optional[List[str]],
+    stop_reason: str,
+) -> None:
+    """Print a structured [TRACE] result block to the console."""
+    print()
+    print(f"[TRACE] Target IP:    {target_ip}")
+    if mac:
+        print(f"[TRACE] ARP MAC:      {mac_to_cisco_fmt(mac)}")
+    if hostname:
+        print(f"[TRACE] Switch:       {hostname}")
+    print(f"[TRACE] Switch IP:    {switch_ip}")
+    if vlan:
+        print(f"[TRACE] VLAN:         {vlan}")
+    if interface:
+        print(f"[TRACE] Interface:    {interface}")
+    if portchannel_members:
+        print(f"[TRACE] Po members:   {', '.join(portchannel_members)}")
+    print(f"[TRACE] Stop reason:  {stop_reason}")
+    print()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 2 — L2 trace orchestration
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def run_l2_trace(
+    target_ip: str,
+    gateway_ip: str,
+    nb_url: str,
+    nb_token: str,
+    creds: Dict[str, str],
+    verify_ssl: bool,
+    source_is_ap: bool,
+    device_type: Optional[str] = None,
+) -> None:
+    """Run the Layer 2 trace from *gateway_ip* for *target_ip*.
+
+    Steps: ARP → MAC table → port-channel expansion → CDP/LLDP stop check.
+    Pass *device_type* to skip the NetBox platform re-lookup (saves one API call
+    when the caller already fetched the platform for Phase 1).
+    """
+    if device_type is None:
+        platform_slug = get_platform_from_netbox(nb_url, nb_token, gateway_ip, verify_ssl)
+        device_type   = platform_to_device_type(platform_slug)
+        log.info(
+            "L2 trace: gateway=%s  platform=%s  device_type=%s",
+            gateway_ip, platform_slug or "unknown", device_type,
+        )
+
+    try:
+        conn = open_connection(gateway_ip, device_type, creds)
+    except GatewayConnectionError as exc:
+        print(f"[ERROR] L2 trace — cannot connect to {gateway_ip}: {exc}")
+        return
+
+    hostname         : Optional[str]  = None
+    mac              : Optional[str]  = None
+    mac_entry        : Optional[Dict] = None
+    portchannel_mbrs : List[str]      = []
+    neighbor_info    : Optional[Dict] = None
+    stop_reason      : str            = "Closest switchport found"
+
+    try:
+        try:
+            hostname = conn.find_prompt().rstrip("#>").strip() or gateway_ip
+        except Exception:
+            hostname = gateway_ip
+
+        # ── Step 1: ARP lookup ────────────────────────────────────────────────
+        print(f"[INFO] ARP lookup for {target_ip} on {hostname} ({gateway_ip})...")
+        mac = arp_lookup(conn, device_type, target_ip)
+        if not mac:
+            print(f"[WARN] No ARP entry for {target_ip} on {hostname}")
+            log_trace_result(
+                target_ip, None, hostname, gateway_ip,
+                None, None, None, "ARP entry not found",
+            )
+            return
+
+        print(f"[INFO] ARP resolved: {target_ip} -> {mac_to_cisco_fmt(mac)}")
+
+        # ── Step 2: MAC table lookup ──────────────────────────────────────────
+        print(f"[INFO] MAC table lookup for {mac_to_cisco_fmt(mac)}...")
+        mac_entry = mac_table_lookup(conn, device_type, mac)
+        if not mac_entry:
+            print(f"[WARN] MAC {mac_to_cisco_fmt(mac)} not found in table on {hostname}")
+            log_trace_result(
+                target_ip, mac, hostname, gateway_ip,
+                None, None, None, "MAC not found in address table",
+            )
+            return
+
+        vlan      = mac_entry["vlan"]
+        interface = mac_entry["interface"]
+        print(f"[INFO] MAC table: VLAN={vlan}  Interface={interface}")
+
+        # ── Step 3: port-channel expansion ───────────────────────────────────
+        if is_portchannel(interface):
+            print(f"[INFO] {interface} is a port-channel — resolving members...")
+            portchannel_mbrs = get_portchannel_members(conn, device_type, interface)
+            if portchannel_mbrs:
+                print(f"[INFO] Port-channel members: {', '.join(portchannel_mbrs)}")
+            else:
+                print(f"[WARN] No members resolved for {interface}")
+
+        # ── Step 4: CDP/LLDP stop-condition check ─────────────────────────────
+        if not source_is_ap:
+            check_iface = portchannel_mbrs[0] if portchannel_mbrs else interface
+            print(f"[INFO] Checking CDP/LLDP on {check_iface}...")
+            neighbor_info = get_neighbor_info(conn, device_type, check_iface)
+
+        _, reason = should_stop_trace(neighbor_info, source_is_ap)
+        stop_reason = reason if reason else "Closest switchport found"
+
+    finally:
+        try:
+            conn.disconnect()
+        except Exception:
+            pass
+
+    # ── Structured output ─────────────────────────────────────────────────────
+    log_trace_result(
+        target_ip           = target_ip,
+        mac                 = mac,
+        hostname            = hostname,
+        switch_ip           = gateway_ip,
+        vlan                = mac_entry["vlan"]      if mac_entry else None,
+        interface           = mac_entry["interface"] if mac_entry else None,
+        portchannel_members = portchannel_mbrs or None,
+        stop_reason         = stop_reason,
+    )
+
+    if neighbor_info:
+        nid    = neighbor_info.get("neighbor_id", "unknown")
+        nip    = neighbor_info.get("neighbor_ip", "")
+        suffix = f" ({nip})" if nip else ""
+        print(f"[TRACE] Neighbor:     {nid}{suffix}")
+        print()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -265,44 +866,19 @@ Examples:
     p.add_argument("dst_ip", help="Destination IP address (IPv4 or IPv6)")
 
     nb = p.add_argument_group("NetBox (ignored when Vault is configured)")
-    nb.add_argument(
-        "--netbox-url",
-        default=None,
-        help="NetBox base URL (env: NETBOX_URL)",
-    )
-    nb.add_argument(
-        "--netbox-token",
-        default=None,
-        help="NetBox API token (env: NETBOX_TOKEN)",
-    )
-    nb.add_argument(
-        "--no-ssl-verify",
-        action="store_true",
-        help="Disable TLS verification for NetBox",
-    )
+    nb.add_argument("--netbox-url",   default=None, help="NetBox base URL (env: NETBOX_URL)")
+    nb.add_argument("--netbox-token", default=None, help="NetBox API token (env: NETBOX_TOKEN)")
+    nb.add_argument("--no-ssl-verify", action="store_true", help="Disable TLS verification for NetBox")
 
     dev = p.add_argument_group("Device credentials (ignored when Vault is configured)")
-    dev.add_argument(
-        "--username",
-        default=None,
-        help="SSH username (env: DEVICE_USER)",
-    )
-    dev.add_argument(
-        "--password",
-        default=None,
-        help="SSH password (env: DEVICE_PASS)",
-    )
+    dev.add_argument("--username", default=None, help="SSH username (env: DEVICE_USER)")
+    dev.add_argument("--password", default=None, help="SSH password (env: DEVICE_PASS)")
     dev.add_argument(
         "--secret",
         default=os.environ.get("DEVICE_SECRET", ""),
         help="Enable secret (env: DEVICE_SECRET)",
     )
-    dev.add_argument(
-        "--timeout",
-        type=int,
-        default=30,
-        help="SSH timeout in seconds (default: 30)",
-    )
+    dev.add_argument("--timeout", type=int, default=30, help="SSH timeout in seconds (default: 30)")
 
     if _VAULT_AVAILABLE:
         vault_grp = p.add_argument_group(
@@ -311,32 +887,11 @@ Examples:
         add_vault_parser_args(vault_grp)
 
     tr = p.add_argument_group("Trace options")
-    tr.add_argument(
-        "--reverse",
-        action="store_true",
-        help="Also run reverse trace (dst → src)",
-    )
-    tr.add_argument(
-        "--ecmp",
-        action="store_true",
-        help="Trace all ECMP paths in parallel (one SSH session per path)",
-    )
-    tr.add_argument(
-        "--max-hops",
-        type=int,
-        default=30,
-        help="Max hops before stopping (default: 30)",
-    )
-    tr.add_argument(
-        "--out-dir",
-        default=".",
-        help="Output directory for JSON/CSV (default: current dir)",
-    )
-    tr.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Enable DEBUG logging",
-    )
+    tr.add_argument("--reverse",  action="store_true", help="Also run reverse trace (dst -> src)")
+    tr.add_argument("--ecmp",     action="store_true", help="Trace all ECMP paths in parallel")
+    tr.add_argument("--max-hops", type=int, default=30, help="Max hops before stopping (default: 30)")
+    tr.add_argument("--out-dir",  default=".",         help="Output directory for JSON/CSV (default: current dir)")
+    tr.add_argument("--verbose",  action="store_true", help="Enable DEBUG logging")
 
     return p
 
@@ -405,16 +960,12 @@ def main() -> int:
 
     print(f"[INFO] Source IP: {src_ip}")
 
-    # 1. Fetch only the prefixes that contain the source IP (efficient).
-    prefixes = get_prefixes_from_netbox(
-        netbox_url, netbox_token, verify_ssl, contains=src_ip
-    )
+    prefixes = get_prefixes_from_netbox(netbox_url, netbox_token, verify_ssl, contains=src_ip)
     if not prefixes:
         print(f"[ERROR] No matching subnet found for {src_ip} in NetBox")
         log.error("No NetBox prefix contains %s", src_ip)
         return 1
 
-    # 2. Longest prefix match among the candidates.
     matched = find_longest_prefix_match(src_ip, prefixes)
     if not matched:
         print(f"[ERROR] No matching subnet found for {src_ip} in NetBox")
@@ -423,7 +974,6 @@ def main() -> int:
 
     print(f"[INFO] Matched subnet: {matched}")
 
-    # 3. First usable IP in the matched subnet → expected gateway.
     gateway = calculate_first_usable_ip(matched)
     if not gateway:
         print(f"[ERROR] Could not determine gateway for subnet {matched}")
@@ -431,16 +981,37 @@ def main() -> int:
         return 1
 
     print(f"[INFO] Gateway IP (first usable): {gateway}")
-    print("[INFO] Attempting connection to gateway...")
+    print("[INFO] Fetching gateway platform from NetBox...")
 
-    # 4. Verify SSH connectivity and retrieve the device hostname.
+    gw_platform    = get_platform_from_netbox(netbox_url, netbox_token, gateway, verify_ssl)
+    gw_device_type = platform_to_device_type(gw_platform)
+    log.info("Gateway platform: %s -> device_type: %s", gw_platform or "unknown", gw_device_type)
+
+    print("[INFO] Attempting connection to gateway...")
     try:
-        hostname = connect_to_device(gateway, creds)
+        hostname = connect_to_device(gateway, creds, device_type=gw_device_type)
         print(f"[SUCCESS] Connected to {hostname}")
     except GatewayConnectionError as exc:
         print(f"[ERROR] Failed to connect: {exc}")
         log.error("Gateway connection failed: %s", exc)
         return 1
+
+    # ── Phase 2: L2 trace (ARP -> MAC table -> port-channel -> CDP/LLDP) ─────
+
+    source_is_ap = is_ap_in_netbox(netbox_url, netbox_token, src_ip, verify_ssl)
+    if source_is_ap:
+        print(f"[INFO] Source {src_ip} is an AP in NetBox — will stop at first switchport")
+
+    run_l2_trace(
+        target_ip    = src_ip,
+        gateway_ip   = gateway,
+        nb_url       = netbox_url,
+        nb_token     = netbox_token,
+        creds        = creds,
+        verify_ssl   = verify_ssl,
+        source_is_ap = source_is_ap,
+        device_type  = gw_device_type,  # reuse — avoids a second NetBox platform call
+    )
 
     return 0
 
