@@ -10,9 +10,13 @@ Given a source IP address:
 
   Phase 2 (L2 trace):
     4. ARP lookup on the gateway to resolve the source IP to a MAC address.
-    5. MAC table lookup to find the VLAN and switchport.
-    6. Port-channel expansion (if applicable).
-    7. CDP/LLDP neighbor check to determine stop conditions.
+    5. Hop-by-hop MAC table lookup starting at the gateway:
+         a. Find the VLAN and switchport for the MAC.
+         b. Expand port-channels to their physical members.
+         c. Check CDP/LLDP on the resolved interface.
+         d. If the neighbor is a switch or router, connect to it and repeat.
+         e. Stop at APs, VMware hosts, endpoints (no CDP/LLDP), or when
+            the neighbor IP cannot be resolved.
 
 Later phases will extend this with routing-table analysis, ECMP parallel
 tracing, and full hop-by-hop output.
@@ -216,6 +220,63 @@ def is_ap_in_netbox(
     except Exception as exc:
         log.debug("NetBox AP check failed for %s: %s", ip, exc)
         return False
+
+
+def _get_device_primary_ip_from_netbox(
+    nb_url: str,
+    nb_token: str,
+    device_name: str,
+    verify_ssl: bool = True,
+) -> Optional[str]:
+    """Return the primary IPv4 address (no prefix-length) for *device_name* in NetBox.
+
+    Falls back to a short-hostname match when CDP reports an FQDN.
+    """
+    try:
+        nb = _get_nb_api(nb_url, nb_token, verify_ssl)
+        candidates = list(nb.dcim.devices.filter(name=device_name))
+        if not candidates:
+            short = device_name.split(".")[0]
+            candidates = list(nb.dcim.devices.filter(name=short))
+        if not candidates:
+            log.debug("No NetBox device found for name %r", device_name)
+            return None
+        dev = candidates[0]
+        if dev.primary_ip4:
+            return str(dev.primary_ip4).split("/")[0]
+        return None
+    except Exception as exc:
+        log.debug("NetBox device IP lookup failed for %r: %s", device_name, exc)
+        return None
+
+
+def resolve_neighbor_ip(
+    neighbor_info: Dict[str, str],
+    nb_url: str,
+    nb_token: str,
+    verify_ssl: bool = True,
+) -> Optional[str]:
+    """Resolve the management IP for a CDP/LLDP neighbor.
+
+    Preference order:
+      1. NetBox primary IP for the device named in ``neighbor_id``
+         (authoritative management address, avoids transit/interface IPs).
+      2. IP address reported directly by CDP/LLDP as a fallback.
+    """
+    neighbor_id = neighbor_info.get("neighbor_id", "")
+    if neighbor_id:
+        nb_ip = _get_device_primary_ip_from_netbox(nb_url, nb_token, neighbor_id, verify_ssl)
+        if nb_ip:
+            log.debug("Resolved neighbor %s -> %s (via NetBox)", neighbor_id, nb_ip)
+            return nb_ip
+
+    cdp_ip = neighbor_info.get("neighbor_ip")
+    if cdp_ip:
+        log.debug("Resolved neighbor %s -> %s (via CDP/LLDP)", neighbor_id, cdp_ip)
+        return cdp_ip
+
+    log.debug("Cannot resolve management IP for neighbor %r", neighbor_id)
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -656,12 +717,17 @@ def get_neighbor_info(
 
 def should_stop_trace(
     neighbor_info: Optional[Dict[str, str]],
-    source_is_ap: bool,
 ) -> Tuple[bool, str]:
-    """Return (stop, reason) based on neighbor info and whether the source is an AP."""
-    if source_is_ap:
-        return True, "Source device is an AP — stopping at closest switchport"
+    """Return (stop, reason) based on CDP/LLDP neighbor information.
 
+    Returns (True, reason) when the trace should end at the current switchport:
+      - No CDP/LLDP neighbor found (endpoint-facing port).
+      - Neighbor is a VMware host (ESXi/vSwitch).
+      - Neighbor is an access point.
+
+    Returns (False, "") when the neighbor is a routable network device
+    (switch or router) and the trace should continue to that device.
+    """
     if not neighbor_info:
         return True, "No CDP/LLDP neighbor on this port — closest switchport"
 
@@ -706,6 +772,27 @@ def log_trace_result(
     print()
 
 
+def _log_intermediate_hop(
+    hop_num: int,
+    hostname: str,
+    switch_ip: str,
+    vlan: str,
+    interface: str,
+    portchannel_members: List[str],
+    neighbor_info: Dict[str, str],
+    neighbor_ip: str,
+) -> None:
+    """Print a single [HOP] line for an intermediate switch during the trace."""
+    po_detail   = f" (members: {', '.join(portchannel_members)})" if portchannel_members else ""
+    neighbor_id = neighbor_info.get("neighbor_id", "unknown")
+    protocol    = neighbor_info.get("protocol", "CDP")
+    print(
+        f"[HOP {hop_num:>2}] {hostname} ({switch_ip})  "
+        f"VLAN={vlan}  iface={interface}{po_detail}  "
+        f"--{protocol}-->  {neighbor_id} ({neighbor_ip})"
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase 2 — L2 trace orchestration
 # ─────────────────────────────────────────────────────────────────────────────
@@ -720,110 +807,181 @@ def run_l2_trace(
     verify_ssl: bool,
     source_is_ap: bool,
     device_type: Optional[str] = None,
+    max_hops: int = 30,
 ) -> None:
-    """Run the Layer 2 trace from *gateway_ip* for *target_ip*.
+    """Run the hop-by-hop Layer 2 trace for *target_ip* starting at *gateway_ip*.
 
-    Steps: ARP → MAC table → port-channel expansion → CDP/LLDP stop check.
-    Pass *device_type* to skip the NetBox platform re-lookup (saves one API call
-    when the caller already fetched the platform for Phase 1).
+    Phase A — ARP (gateway only, once):
+        Resolves *target_ip* to a MAC address.
+
+    Phase B — hop loop (up to *max_hops* switches):
+        On each switch:
+          1. MAC table lookup   → VLAN + interface
+          2. Port-channel expansion (if applicable)
+          3. CDP/LLDP on the resolved physical interface
+          4a. If the neighbor is an AP, VMware, or absent → stop and print result.
+          4b. If the neighbor is a switch/router → resolve its management IP,
+              log the intermediate hop, and connect to continue the trace.
+
+    Pass *device_type* to skip the NetBox platform lookup for the gateway
+    (saves one API call when the caller already fetched it for Phase 1).
     """
+    # ── Phase A: ARP lookup on the gateway (done exactly once) ───────────────
     if device_type is None:
         platform_slug = get_platform_from_netbox(nb_url, nb_token, gateway_ip, verify_ssl)
         device_type   = platform_to_device_type(platform_slug)
-        log.info(
-            "L2 trace: gateway=%s  platform=%s  device_type=%s",
-            gateway_ip, platform_slug or "unknown", device_type,
-        )
+
+    log.info(
+        "L2 trace start: target=%s  gateway=%s  device_type=%s",
+        target_ip, gateway_ip, device_type,
+    )
 
     try:
         conn = open_connection(gateway_ip, device_type, creds)
     except GatewayConnectionError as exc:
-        print(f"[ERROR] L2 trace — cannot connect to {gateway_ip}: {exc}")
+        print(f"[ERROR] L2 trace — cannot connect to gateway {gateway_ip}: {exc}")
         return
 
-    hostname         : Optional[str]  = None
-    mac              : Optional[str]  = None
-    mac_entry        : Optional[Dict] = None
-    portchannel_mbrs : List[str]      = []
-    neighbor_info    : Optional[Dict] = None
-    stop_reason      : str            = "Closest switchport found"
+    mac: Optional[str] = None
+    gw_hostname: str   = gateway_ip
 
     try:
         try:
-            hostname = conn.find_prompt().rstrip("#>").strip() or gateway_ip
+            gw_hostname = conn.find_prompt().rstrip("#>").strip() or gateway_ip
         except Exception:
-            hostname = gateway_ip
-
-        # ── Step 1: ARP lookup ────────────────────────────────────────────────
-        print(f"[INFO] ARP lookup for {target_ip} on {hostname} ({gateway_ip})...")
+            pass
+        print(f"[INFO] ARP lookup for {target_ip} on {gw_hostname} ({gateway_ip})...")
         mac = arp_lookup(conn, device_type, target_ip)
-        if not mac:
-            print(f"[WARN] No ARP entry for {target_ip} on {hostname}")
-            log_trace_result(
-                target_ip, None, hostname, gateway_ip,
-                None, None, None, "ARP entry not found",
-            )
-            return
-
-        print(f"[INFO] ARP resolved: {target_ip} -> {mac_to_cisco_fmt(mac)}")
-
-        # ── Step 2: MAC table lookup ──────────────────────────────────────────
-        print(f"[INFO] MAC table lookup for {mac_to_cisco_fmt(mac)}...")
-        mac_entry = mac_table_lookup(conn, device_type, mac)
-        if not mac_entry:
-            print(f"[WARN] MAC {mac_to_cisco_fmt(mac)} not found in table on {hostname}")
-            log_trace_result(
-                target_ip, mac, hostname, gateway_ip,
-                None, None, None, "MAC not found in address table",
-            )
-            return
-
-        vlan      = mac_entry["vlan"]
-        interface = mac_entry["interface"]
-        print(f"[INFO] MAC table: VLAN={vlan}  Interface={interface}")
-
-        # ── Step 3: port-channel expansion ───────────────────────────────────
-        if is_portchannel(interface):
-            print(f"[INFO] {interface} is a port-channel — resolving members...")
-            portchannel_mbrs = get_portchannel_members(conn, device_type, interface)
-            if portchannel_mbrs:
-                print(f"[INFO] Port-channel members: {', '.join(portchannel_mbrs)}")
-            else:
-                print(f"[WARN] No members resolved for {interface}")
-
-        # ── Step 4: CDP/LLDP stop-condition check ─────────────────────────────
-        if not source_is_ap:
-            check_iface = portchannel_mbrs[0] if portchannel_mbrs else interface
-            print(f"[INFO] Checking CDP/LLDP on {check_iface}...")
-            neighbor_info = get_neighbor_info(conn, device_type, check_iface)
-
-        _, reason = should_stop_trace(neighbor_info, source_is_ap)
-        stop_reason = reason if reason else "Closest switchport found"
-
     finally:
         try:
             conn.disconnect()
         except Exception:
             pass
 
-    # ── Structured output ─────────────────────────────────────────────────────
+    if not mac:
+        print(f"[WARN] No ARP entry for {target_ip} on {gw_hostname}")
+        log_trace_result(
+            target_ip, None, gw_hostname, gateway_ip,
+            None, None, None, "ARP entry not found",
+        )
+        return
+
+    print(f"[INFO] ARP resolved: {target_ip} -> {mac_to_cisco_fmt(mac)}")
+    if source_is_ap:
+        print(f"[INFO] Source {target_ip} is an AP — will stop at the access switchport")
+
+    # ── Phase B: hop-by-hop MAC trace ────────────────────────────────────────
+    current_ip          = gateway_ip
+    current_device_type = device_type
+    visited: set        = {gateway_ip}
+
+    # These track the state of the *last completed hop* for the final printout.
+    final_hostname        : str           = gw_hostname
+    final_vlan            : Optional[str] = None
+    final_interface       : Optional[str] = None
+    final_portchannel_mbrs: List[str]     = []
+    final_stop_reason     : str           = f"Max hops ({max_hops}) reached"
+
+    for hop_num in range(1, max_hops + 1):
+        try:
+            conn = open_connection(current_ip, current_device_type, creds)
+        except GatewayConnectionError as exc:
+            final_stop_reason = f"Cannot connect to {current_ip}: {exc}"
+            break
+
+        hostname        : str            = current_ip
+        mac_entry       : Optional[Dict] = None
+        portchannel_mbrs: List[str]      = []
+        neighbor_info   : Optional[Dict] = None
+
+        try:
+            try:
+                hostname = conn.find_prompt().rstrip("#>").strip() or current_ip
+            except Exception:
+                pass
+
+            # Step 1 — MAC table lookup
+            print(f"[INFO] MAC table lookup on {hostname} ({current_ip})...")
+            mac_entry = mac_table_lookup(conn, current_device_type, mac)
+            if not mac_entry:
+                final_hostname    = hostname
+                final_stop_reason = (
+                    f"MAC {mac_to_cisco_fmt(mac)} not found in table on {hostname}"
+                )
+                break
+
+            vlan      = mac_entry["vlan"]
+            interface = mac_entry["interface"]
+            print(f"[INFO] MAC table: VLAN={vlan}  Interface={interface}")
+
+            # Step 2 — port-channel expansion
+            if is_portchannel(interface):
+                print(f"[INFO] {interface} is a port-channel — resolving members...")
+                portchannel_mbrs = get_portchannel_members(conn, current_device_type, interface)
+                if portchannel_mbrs:
+                    print(f"[INFO] Port-channel members: {', '.join(portchannel_mbrs)}")
+                else:
+                    print(f"[WARN] No members resolved for {interface}")
+
+            # Step 3 — CDP/LLDP on the resolved physical interface
+            check_iface = portchannel_mbrs[0] if portchannel_mbrs else interface
+            print(f"[INFO] Checking CDP/LLDP on {check_iface}...")
+            neighbor_info = get_neighbor_info(conn, current_device_type, check_iface)
+
+        finally:
+            try:
+                conn.disconnect()
+            except Exception:
+                pass
+
+        # Capture the state of this hop before deciding what to do next.
+        final_hostname         = hostname
+        final_vlan             = mac_entry["vlan"]
+        final_interface        = mac_entry["interface"]
+        final_portchannel_mbrs = portchannel_mbrs
+
+        # Step 4 — stop-condition evaluation
+        should_stop, reason = should_stop_trace(neighbor_info)
+        if should_stop:
+            final_stop_reason = reason or "Closest switchport found"
+            break
+
+        # Neighbor is a network device — resolve its management IP and continue.
+        neighbor_ip = resolve_neighbor_ip(neighbor_info, nb_url, nb_token, verify_ssl)
+        if not neighbor_ip:
+            final_stop_reason = (
+                f"Cannot resolve management IP for "
+                f"{neighbor_info.get('neighbor_id', 'unknown')} — stopping"
+            )
+            break
+
+        if neighbor_ip in visited:
+            final_stop_reason = f"Loop detected — already visited {neighbor_ip}"
+            break
+
+        # Log this switch as an intermediate hop and advance to the next.
+        _log_intermediate_hop(
+            hop_num, hostname, current_ip,
+            mac_entry["vlan"], mac_entry["interface"],
+            portchannel_mbrs, neighbor_info, neighbor_ip,
+        )
+
+        visited.add(neighbor_ip)
+        next_platform       = get_platform_from_netbox(nb_url, nb_token, neighbor_ip, verify_ssl)
+        current_device_type = platform_to_device_type(next_platform)
+        current_ip          = neighbor_ip
+
+    # ── Final result ──────────────────────────────────────────────────────────
     log_trace_result(
         target_ip           = target_ip,
         mac                 = mac,
-        hostname            = hostname,
-        switch_ip           = gateway_ip,
-        vlan                = mac_entry["vlan"]      if mac_entry else None,
-        interface           = mac_entry["interface"] if mac_entry else None,
-        portchannel_members = portchannel_mbrs or None,
-        stop_reason         = stop_reason,
+        hostname            = final_hostname,
+        switch_ip           = current_ip,
+        vlan                = final_vlan,
+        interface           = final_interface,
+        portchannel_members = final_portchannel_mbrs or None,
+        stop_reason         = final_stop_reason,
     )
-
-    if neighbor_info:
-        nid    = neighbor_info.get("neighbor_id", "unknown")
-        nip    = neighbor_info.get("neighbor_ip", "")
-        suffix = f" ({nip})" if nip else ""
-        print(f"[TRACE] Neighbor:     {nid}{suffix}")
-        print()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1011,6 +1169,7 @@ def main() -> int:
         verify_ssl   = verify_ssl,
         source_is_ap = source_is_ap,
         device_type  = gw_device_type,  # reuse — avoids a second NetBox platform call
+        max_hops     = args.max_hops,
     )
 
     return 0
