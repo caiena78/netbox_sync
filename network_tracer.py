@@ -508,6 +508,140 @@ def get_gateway_interface(
     return None
 
 
+def get_route_for_destination(
+    conn: ConnectHandler,
+    dst_ip: str,
+) -> Dict[str, Optional[str]]:
+    """Return L3 routing info for *dst_ip* by parsing ``show ip route <dst_ip>``.
+
+    Returns a dict with keys:
+      prefix         – matched route (e.g. "192.168.100.0/24")
+      next_hop       – next-hop IP, or "directly connected"
+      exit_interface – outgoing interface toward the destination
+      route_source   – routing protocol / source (e.g. "ospf 1", "static", "connected")
+
+    Pattern coverage:
+
+      IOS-XE full routing entry (OSPF/EIGRP/BGP/static with next-hop):
+        * 10.0.0.2, from 10.0.0.2, 00:01:02 ago, via GigabitEthernet1/0/1
+
+      IOS-XE full routing entry (directly connected):
+        * directly connected, via Vlan200
+
+      IOS-XE brief C/L route line:
+        C   192.168.100.0/24 is directly connected, Vlan200
+        O   192.168.100.0/24 [110/2] via 10.0.0.2, 00:01:02, GigabitEthernet1/0/1
+
+      IOS-XE interface fallback (when descriptor omits interface):
+        Last update from 10.0.0.2 on GigabitEthernet1/0/1, 00:01:02 ago
+
+      NX-OS:
+        *via 10.0.0.2, Eth1/1, [110/2], 00:01:02, ospf-1, intra
+    """
+    empty: Dict[str, Optional[str]] = {
+        "prefix":         None,
+        "next_hop":       None,
+        "exit_interface": None,
+        "route_source":   None,
+    }
+
+    try:
+        output = conn.send_command(f"show ip route {dst_ip}")
+    except Exception as exc:
+        log.error("Route lookup for %s failed: %s", dst_ip, exc)
+        return empty
+
+    log.debug("show ip route %s:\n%s", dst_ip, output)
+
+    result: Dict[str, Optional[str]] = dict(empty)
+
+    # ── Prefix ────────────────────────────────────────────────────────────────
+    m = re.search(r"Routing entry for\s+(\S+)", output, re.IGNORECASE)
+    if m:
+        result["prefix"] = m.group(1)
+
+    if not result["prefix"]:
+        # NX-OS: "192.168.100.0/24, ubest/mbest: ..."
+        m = re.search(r"^(\d+\.\d+\.\d+\.\d+/\d+),\s+ubest", output, re.MULTILINE)
+        if m:
+            result["prefix"] = m.group(1)
+
+    # ── Route source ──────────────────────────────────────────────────────────
+    # IOS-XE: Known via "ospf 1"
+    m = re.search(r'Known via\s+"([^"]+)"', output, re.IGNORECASE)
+    if m:
+        result["route_source"] = m.group(1)
+
+    # ── Next-hop + exit interface ─────────────────────────────────────────────
+
+    # IOS-XE routing descriptor with a next-hop IP:
+    # "  * 10.0.0.2, from 10.0.0.2, 00:01:02 ago, via GigabitEthernet1/0/1"
+    # "  * 10.0.0.2, via GigabitEthernet1/0/1"   (static)
+    m = re.search(
+        r"^\s*\*\s+(\d+\.\d+\.\d+\.\d+),.*?via\s+(\S+)",
+        output, re.IGNORECASE | re.MULTILINE,
+    )
+    if m:
+        result["next_hop"]       = m.group(1)
+        result["exit_interface"] = m.group(2).rstrip(",")
+
+    # IOS-XE routing descriptor directly connected:
+    # "  * directly connected, via Vlan200"
+    elif re.search(r"^\s*\*\s+directly connected", output, re.IGNORECASE | re.MULTILINE):
+        m = re.search(r"\*\s+directly connected,\s+via\s+(\S+)", output, re.IGNORECASE)
+        if m:
+            result["next_hop"]       = "directly connected"
+            result["exit_interface"] = m.group(1).rstrip(",")
+            result["route_source"]   = result["route_source"] or "connected"
+
+    # NX-OS: "*via 10.0.0.2, Eth1/1, [110/2], ..."
+    elif re.search(r"^\s*\*via\s+\d+\.\d+\.\d+\.\d+", output, re.IGNORECASE | re.MULTILINE):
+        m = re.search(r"\*via\s+(\d+\.\d+\.\d+\.\d+),\s+([^\s,]+)", output, re.IGNORECASE)
+        if m:
+            result["next_hop"]       = m.group(1)
+            result["exit_interface"] = m.group(2)
+
+    # IOS-XE brief with interface: "O X/Y [d/m] via 10.0.0.2, 00:01:02, GigabitEthernet1/0/1"
+    elif re.search(r"\bvia\s+\d+\.\d+\.\d+\.\d+,\s+[\d:]+,\s+\S+", output, re.IGNORECASE):
+        m = re.search(
+            r"\bvia\s+(\d+\.\d+\.\d+\.\d+),\s+[\d:]+,\s+(\S+)",
+            output, re.IGNORECASE,
+        )
+        if m:
+            result["next_hop"]       = m.group(1)
+            result["exit_interface"] = m.group(2).rstrip(",")
+
+    # IOS-XE brief directly connected: "C/L  X/Y is directly connected, Vlan200"
+    elif re.search(r"is directly connected,", output, re.IGNORECASE):
+        m = re.search(r"is directly connected,\s+(\S+)", output, re.IGNORECASE)
+        if m:
+            result["next_hop"]       = "directly connected"
+            result["exit_interface"] = m.group(1).rstrip(",")
+            result["route_source"]   = result["route_source"] or "connected"
+
+    # Fallback: any "via <ip>" gives us at least the next-hop
+    else:
+        m = re.search(r"\bvia\s+(\d+\.\d+\.\d+\.\d+)", output, re.IGNORECASE)
+        if m:
+            result["next_hop"] = m.group(1)
+
+    # ── Interface fallback ────────────────────────────────────────────────────
+    # "Last update from 10.0.0.2 on GigabitEthernet1/0/1, 00:01:02 ago"
+    # Fills in exit_interface for entries where the routing descriptor omits it.
+    if not result["exit_interface"]:
+        m = re.search(r"Last update from\s+\S+\s+on\s+(\S+),", output, re.IGNORECASE)
+        if m:
+            result["exit_interface"] = m.group(1).rstrip(",")
+
+    log.debug(
+        "Route for %s: prefix=%s next_hop=%s iface=%s source=%s",
+        dst_ip,
+        result["prefix"], result["next_hop"],
+        result["exit_interface"], result["route_source"],
+    )
+    return result
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase 2 — MAC table lookup
 # ─────────────────────────────────────────────────────────────────────────────
@@ -861,6 +995,8 @@ def build_path_dict(
     gateway_ip: str,
     downstream_hops: List[Dict],
     gateway_interface: Optional[str] = None,
+    dst_route: Optional[Dict] = None,
+    dst_ip: str = "",
 ) -> Dict:
     """Reverse the downstream hop list to produce an upstream (device→gateway) path dict.
 
@@ -914,6 +1050,8 @@ def build_path_dict(
         "gateway_ip": gateway_ip,
         "total_hops": n,
         "path":       upstream_path,
+        "dst_route":  dst_route or {},
+        "dst_ip":     dst_ip,
     }
 
 
@@ -952,6 +1090,18 @@ def print_path_summary(path_dict: Dict) -> None:
         print()
         print(f"    Egress  : {egress}")
 
+    dst = path_dict.get("dst_route", {})
+    if dst.get("prefix") or dst.get("next_hop"):
+        print(f"\n  Destination Route  ({path_dict.get('dst_ip', 'dst')})")
+        if dst.get("prefix"):
+            print(f"    Prefix    : {dst['prefix']}")
+        if dst.get("next_hop"):
+            print(f"    Next-hop  : {dst['next_hop']}")
+        if dst.get("exit_interface"):
+            print(f"    Interface : {dst['exit_interface']}")
+        if dst.get("route_source"):
+            print(f"    Source    : {dst['route_source']}")
+
     print()
     print(SEP)
     print()
@@ -964,6 +1114,7 @@ def print_path_summary(path_dict: Dict) -> None:
 
 def run_l2_trace(
     target_ip: str,
+    dst_ip: str,
     gateway_ip: str,
     nb_url: str,
     nb_token: str,
@@ -1009,20 +1160,35 @@ def run_l2_trace(
         print(f"[ERROR] L2 trace — cannot connect to gateway {gateway_ip}: {exc}")
         return
 
-    mac: Optional[str]          = None
-    gw_hostname: str            = gateway_ip
-    gw_interface: Optional[str] = None
+    mac: Optional[str]                   = None
+    gw_hostname: str                     = gateway_ip
+    gw_interface: Optional[str]          = None
+    dst_route: Dict[str, Optional[str]]  = {}
 
     try:
         try:
             gw_hostname = conn.find_prompt().rstrip("#>").strip() or gateway_ip
         except Exception:
             pass
+
         print(f"[INFO] ARP lookup for {target_ip} on {gw_hostname} ({gateway_ip})...")
         mac = arp_lookup(conn, device_type, target_ip)
+
         gw_interface = get_gateway_interface(conn, gateway_ip)
         if gw_interface:
             print(f"[INFO] Gateway IP {gateway_ip} is on interface {gw_interface}")
+
+        print(f"[INFO] Route lookup for destination {dst_ip} on {gw_hostname}...")
+        dst_route = get_route_for_destination(conn, dst_ip)
+        if dst_route.get("next_hop"):
+            print(
+                f"[INFO] Route to {dst_ip}: "
+                f"{dst_route.get('prefix') or dst_ip} "
+                f"via {dst_route['next_hop']}"
+                + (f" ({dst_route['exit_interface']})" if dst_route.get("exit_interface") else "")
+            )
+        else:
+            print(f"[WARN] No route found for {dst_ip} on {gw_hostname}")
     finally:
         try:
             conn.disconnect()
@@ -1181,7 +1347,7 @@ def run_l2_trace(
 
     # ── Full path summary (device → gateway) ─────────────────────────────────
     if path_hops:
-        path_dict = build_path_dict(target_ip, mac, gateway_ip, path_hops, gw_interface)
+        path_dict = build_path_dict(target_ip, mac, gateway_ip, path_hops, gw_interface, dst_route, dst_ip)
         print_path_summary(path_dict)
 
 
@@ -1363,6 +1529,7 @@ def main() -> int:
 
     run_l2_trace(
         target_ip    = src_ip,
+        dst_ip       = args.dst_ip,
         gateway_ip   = gateway,
         nb_url       = netbox_url,
         nb_token     = netbox_token,
