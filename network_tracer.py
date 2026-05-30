@@ -1174,6 +1174,35 @@ _BLOCKED_ROLE_SLUGS: frozenset = frozenset({
     "workstation", "server", "ups",
 })
 
+# Detects a wireless access point from CDP/LLDP platform or capabilities strings.
+# Covers: Cisco Aironet (AIR-*), Catalyst Wi-Fi (C9105/9115/9117/9120/9130/9136),
+# and LLDP "Wlan-Access-Point" capability.
+_AP_PLATFORM_RE = re.compile(
+    r"\bAIR-[A-Z]"            # AIR-AP*, AIR-CAP*, AIR-LAP*
+    r"|\bAIRONET\b"           # "Aironet" standalone word
+    r"|\bC9(?:105|115|117|120|130|136)[A-Z]"  # Catalyst Wi-Fi AX models
+    r"|\bCisco\s+AP\b",       # LLDP system description: "Cisco AP ..."
+    re.IGNORECASE,
+)
+
+
+def _neighbor_is_access_point(disc: "CdpNeighbor") -> bool:
+    """Return True if a CDP/LLDP neighbor is a wireless access point.
+
+    Checks platform string first (most reliable), then capabilities:
+    - CDP APs advertise "Trans-Bridge" and NOT Router/Switch capabilities.
+    - LLDP APs may advertise "wlan-access-point" capability.
+    """
+    if _AP_PLATFORM_RE.search(disc.platform):
+        return True
+    caps = disc.capabilities.lower()
+    if "wlan-access-point" in caps:
+        return True
+    # Trans-Bridge without Router or Switch → classic CDP AP fingerprint
+    if "trans-bridge" in caps and "router" not in caps and "switch" not in caps:
+        return True
+    return False
+
 
 class TraceEngine:
     """Orchestrates forward/reverse path trace with loop detection, IPv6, and ECMP."""
@@ -1220,6 +1249,16 @@ class TraceEngine:
         self._visited = set()
         self.log.info("Forward trace: %s → %s", src_ip, dst_ip)
         print(f"\n[TRACE] {src_ip}  →  {dst_ip}\n")
+
+        # If the source is a non-traceable device (AP, phone, etc.), locate it
+        # via its subnet gateway then start routing from the access switch.
+        src_rec = self._nb.get_device_by_ip(src_ip)
+        if src_rec:
+            ok, _ = self._is_cisco_network_device(src_rec.get("name", src_ip), src_ip)
+            if not ok:
+                self._trace_from_end_device(src_ip, dst_ip)
+                return self._hops
+
         name, mgmt = self._resolve_start_device(src_ip)
         self._step(name, mgmt, dst_ip, ingress="", vrf="global", hop_num=1)
         return self._hops
@@ -1232,6 +1271,145 @@ class TraceEngine:
         name, mgmt = self._resolve_start_device(dst_ip)
         self._step(name, mgmt, src_ip, ingress="", vrf="global", hop_num=1)
         return self._hops
+
+    # ── End-device source handling ────────────────────────────────────────────
+
+    def _find_gateway_for_ip(self, ip: str) -> Optional[str]:
+        """Return the first host address of the most-specific NetBox prefix for ip."""
+        prefix_rec = self._nb.lookup_prefix(ip)
+        if not prefix_rec:
+            return None
+        try:
+            net = ipaddress.ip_network(prefix_rec.get("prefix", ""), strict=False)
+            hosts = list(net.hosts())
+            return str(hosts[0]) if hosts else None
+        except ValueError:
+            return None
+
+    def _trace_from_end_device(self, end_ip: str, dst_ip: str) -> None:
+        """Source is a non-traceable end device (AP, phone, etc.).
+
+        1. Find the gateway for the end device's subnet prefix.
+        2. Connect to the gateway; do ARP→MAC→CDP/LLDP to walk toward the
+           access port where end_ip is directly attached.
+        3. Once the access port is found, start the normal routing trace from
+           that device toward dst_ip.
+        """
+        gateway_ip = self._find_gateway_for_ip(end_ip)
+        if not gateway_ip:
+            self.log.error("No NetBox prefix found for %s — cannot determine gateway", end_ip)
+            print(f"   ERROR: No prefix found for {end_ip} in NetBox — cannot trace")
+            return
+
+        gw_name, gw_mgmt = self._resolve_start_device(gateway_ip)
+        print(f"   Source {end_ip} is a non-traceable end device")
+        print(f"   Locating via gateway {gw_name} ({gateway_ip}) ...\n")
+
+        is_v6 = is_ipv6_addr(end_ip)
+        cur_name, cur_mgmt = gw_name, gw_mgmt
+        hop_num = 1
+        location_visited: set = set()   # separate from routing visited; avoids poisoning _visited
+
+        while hop_num <= self._max_hops:
+            lk = cur_name.lower()
+            if lk in location_visited:
+                self.log.warning("Location loop detected at %s — stopping", cur_name)
+                break
+            location_visited.add(lk)
+
+            ok, reason = self._is_cisco_network_device(cur_name, cur_mgmt)
+            if not ok:
+                self.log.warning("Non-traceable device %s in location path: %s", cur_name, reason)
+                break
+
+            sess = self._session(cur_mgmt, cur_name)
+            if not sess:
+                self.log.error("Cannot connect to %s (%s) while locating %s",
+                               cur_name, cur_mgmt, end_ip)
+                break
+
+            l2 = Layer2Resolver(sess, self._nb)
+            print(f"  Hop {hop_num:>2}:  {cur_name:<30} ({cur_mgmt})  [locating {end_ip}]")
+
+            # ARP (v4) or NDP (v6) lookup for the end device
+            if is_v6:
+                nbr = l2.get_ndp_entry(end_ip, vrf="global")
+            else:
+                nbr = l2.get_arp_entry(end_ip, vrf="global")
+                if not nbr:
+                    for vrf_name in l2.get_vrfs():
+                        nbr = l2.get_arp_entry(end_ip, vrf=vrf_name)
+                        if nbr:
+                            break
+
+            if not nbr:
+                self.log.warning("%s has no ARP/NDP entry for %s", cur_name, end_ip)
+                print(f"         ✗ No ARP/NDP entry for {end_ip} — stopping location walk")
+                break
+
+            hop = HopResult(
+                hop_number=hop_num, device_name=cur_name, device_ip=cur_mgmt,
+                ingress_interface="", egress_interface="",
+                vrf=nbr.vrf, next_hop_ip=end_ip, next_device_name="",
+                method="arp", arp_entry=nbr, branch=0, ecmp_total=1,
+            )
+
+            vlan = l2.get_access_vlan(nbr.interface)
+            mac_e = l2.find_mac_port(nbr.mac, hint_vlan=vlan)
+
+            if mac_e:
+                hop.mac_entry = mac_e
+                mac_phys = l2.resolve_port_channel(mac_e.interface)
+                hop.egress_interface = mac_phys
+                disc = l2.discovery_neighbor_for_interface(mac_phys)
+
+                if disc:
+                    # End device is behind another switch — keep walking
+                    next_ip = (disc.neighbor_ip
+                               or self._nb.get_primary_ip(disc.neighbor_device) or "")
+                    hop.cdp_neighbor     = disc
+                    hop.next_device_name = disc.neighbor_device
+                    hop.next_hop_ip      = next_ip
+                    hop.method           = disc.protocol.lower()
+                    hop.notes.append(
+                        f"{end_ip} reachable via {disc.protocol} neighbor "
+                        f"{disc.neighbor_device} on {mac_phys}"
+                    )
+                    print(f"         → {disc.protocol}: {end_ip} is behind "
+                          f"{disc.neighbor_device} via {mac_phys} — following")
+                    with self._hops_lock:
+                        self._hops.append(hop)
+                    cur_name = disc.neighbor_device
+                    cur_mgmt = next_ip
+                    hop_num += 1
+                    continue  # walk to next switch
+
+                # No CDP/LLDP — end device is directly on this port
+                hop.method = "mac"
+                hop.notes.append(
+                    f"End device {end_ip} (MAC {nbr.mac}) directly on port {mac_phys}"
+                )
+                print(f"         ✓ {end_ip} is on port {mac_phys} of {cur_name} (access port)")
+
+            else:
+                # MAC not in table — ARP only, treat as directly attached
+                phys = l2.resolve_port_channel(nbr.interface)
+                hop.egress_interface = phys
+                hop.method = "arp"
+                hop.notes.append(f"ARP for {end_ip} on {phys}; MAC not in table")
+                print(f"         → ARP only: {end_ip} on {phys} — no MAC table entry")
+
+            with self._hops_lock:
+                self._hops.append(hop)
+
+            # Access port found — begin routing trace toward dst_ip from here
+            print(f"\n   Routing from {cur_name} toward {dst_ip} ...\n")
+            self._step(cur_name, cur_mgmt, dst_ip, ingress="", vrf="global",
+                       hop_num=hop_num + 1)
+            return
+
+        self.log.error("Could not locate end device %s on the network", end_ip)
+        print(f"   ERROR: Could not locate {end_ip} — trace incomplete")
 
     # ── Device eligibility check ──────────────────────────────────────────────
 
@@ -1404,6 +1582,20 @@ class TraceEngine:
                     hop.next_device_name = disc.neighbor_device
                     hop.next_hop_ip      = (disc.neighbor_ip
                                             or self._nb.get_primary_ip(disc.neighbor_device) or "")
+
+                    if _neighbor_is_access_point(disc):
+                        # Target is a wireless client — stop at the AP, do not SSH into it
+                        hop.method = "wireless"
+                        hop.notes.append(
+                            f"Wireless client — connected to AP {disc.neighbor_device}"
+                            f" ({disc.platform}) via {mac_phys}"
+                        )
+                        print(f"         ✓ WIRELESS: {target} is a wireless client on"
+                              f" AP {disc.neighbor_device} via {mac_phys}")
+                        with self._hops_lock:
+                            self._hops.append(hop)
+                        return
+
                     hop.method = disc.protocol.lower()  # "cdp" or "lldp"
                     print(f"         → {disc.protocol}: {disc.neighbor_device} via {mac_phys}")
                     with self._hops_lock:
