@@ -1160,6 +1160,20 @@ class FHRPResolver:
 
 _MAX_HOPS = 30
 
+# Platforms we are willing to SSH into and run show commands on.
+_ALLOWED_PLATFORM_SLUGS: frozenset = frozenset({
+    "ios", "cisco-ios", "cisco_ios",
+    "iosxe", "ios-xe", "ios_xe", "cisco-iosxe",
+    "nxos", "nx-os", "nx_os", "cisco-nxos",
+})
+
+# Device-role slugs that are never switches or routers — skip without SSH.
+_BLOCKED_ROLE_SLUGS: frozenset = frozenset({
+    "access-point", "access_point", "ap", "wireless-ap", "wireless_ap",
+    "ip-phone", "ip_phone", "phone", "printer", "camera", "iot",
+    "workstation", "server", "ups",
+})
+
 
 class TraceEngine:
     """Orchestrates forward/reverse path trace with loop detection, IPv6, and ECMP."""
@@ -1218,6 +1232,45 @@ class TraceEngine:
         name, mgmt = self._resolve_start_device(dst_ip)
         self._step(name, mgmt, src_ip, ingress="", vrf="global", hop_num=1)
         return self._hops
+
+    # ── Device eligibility check ──────────────────────────────────────────────
+
+    def _is_cisco_network_device(self, dev_name: str, dev_ip: str) -> Tuple[bool, str]:
+        """Return (True, "") if safe to SSH into; (False, reason) to skip.
+
+        Rules (applied only when the device is found in NetBox):
+          - Must have a platform whose slug is in _ALLOWED_PLATFORM_SLUGS
+          - Must NOT have a device role whose slug is in _BLOCKED_ROLE_SLUGS
+        Devices not in NetBox are allowed through so CDP/LLDP-discovered
+        next-hops can still be traced.
+        """
+        nb_rec = None
+        if dev_ip and dev_ip != dev_name:
+            nb_rec = self._nb.get_device_by_ip(dev_ip)
+        if not nb_rec and dev_name and dev_name != dev_ip:
+            nb_rec = self._nb.get_device_by_name(dev_name)
+
+        if not nb_rec:
+            return True, ""
+
+        display = nb_rec.get("name") or dev_name
+
+        # Platform must be set and must be a known Cisco OS slug.
+        platform = nb_rec.get("platform")
+        if not platform:
+            return False, f"{display}: no platform set in NetBox — skipping"
+        plat_slug = (platform.get("slug", "") if isinstance(platform, dict) else str(platform)).lower()
+        if plat_slug not in _ALLOWED_PLATFORM_SLUGS:
+            return False, f"{display}: platform '{plat_slug}' is not a supported Cisco OS — skipping"
+
+        # Device role must not be a known non-switch/router type.
+        role = nb_rec.get("device_role") or nb_rec.get("role")
+        if role:
+            role_slug = (role.get("slug", "") if isinstance(role, dict) else str(role)).lower()
+            if role_slug in _BLOCKED_ROLE_SLUGS:
+                return False, f"{display}: device role '{role_slug}' is not a switch or router — skipping"
+
+        return True, ""
 
     # ── Device resolution ─────────────────────────────────────────────────────
 
@@ -1282,6 +1335,16 @@ class TraceEngine:
             vrf=vrf, next_hop_ip="", next_device_name="",
             method="unknown", branch=branch, ecmp_total=ecmp_total,
         )
+
+        ok, reason = self._is_cisco_network_device(dev_name, dev_ip)
+        if not ok:
+            self.log.info("Skipping %s: %s", dev_name, reason)
+            print(f"         ↷ SKIPPED  {reason}")
+            hop.method = "skipped"
+            hop.notes.append(reason)
+            with self._hops_lock:
+                self._hops.append(hop)
+            return
 
         sess = self._session(dev_ip, dev_name)
         if not sess:
