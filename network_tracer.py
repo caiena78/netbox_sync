@@ -33,15 +33,19 @@ import sys
 from typing import Dict, List, Optional, Tuple
 
 try:
-    from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
+    from cisco_device_client import (
+        CiscoDeviceClient,
+        AuthenticationError as DeviceAuthError,
+        TransportError    as DeviceTransportError,
+    )
 except ImportError:
-    print("ERROR: netmiko is required — pip install netmiko", file=sys.stderr)
+    print("ERROR: cisco_device_client.py is required in the same directory", file=sys.stderr)
     sys.exit(1)
 
 try:
-    import pynetbox
+    from netbox_client import NetBoxClient, NetBoxClientError
 except ImportError:
-    print("ERROR: pynetbox is required — pip install pynetbox", file=sys.stderr)
+    print("ERROR: netbox_client.py is required in the same directory", file=sys.stderr)
     sys.exit(1)
 
 # Vault is optional — gracefully degrade when vault_client.py is absent.
@@ -100,16 +104,16 @@ log = logging.getLogger("network_tracer")
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-# NetBox platform slug → netmiko device_type.
+# NetBox platform slug → CiscoDeviceClient os_type.
 _PLATFORM_MAP: Dict[str, str] = {
-    "ios":      "cisco_ios",
-    "ios-xe":   "cisco_xe",
-    "ios_xe":   "cisco_xe",
-    "iosxe":    "cisco_xe",
-    "nxos":     "cisco_nxos",
-    "nx-os":    "cisco_nxos",
-    "nx_os":    "cisco_nxos",
-    "cisco_nx": "cisco_nxos",
+    "ios":      "ios",
+    "ios-xe":   "iosxe",
+    "ios_xe":   "iosxe",
+    "iosxe":    "iosxe",
+    "nxos":     "nxos",
+    "nx-os":    "nxos",
+    "nx_os":    "nxos",
+    "cisco_nx": "nxos",
 }
 
 _VMWARE_KEYWORDS: Tuple[str, ...] = (
@@ -137,14 +141,9 @@ class GatewayConnectionError(Exception):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _get_nb_api(nb_url: str, nb_token: str, verify_ssl: bool = True):
-    """Return a configured pynetbox API instance."""
-    nb = pynetbox.api(nb_url.rstrip("/"), token=nb_token)
-    if not verify_ssl:
-        import urllib3  # noqa: PLC0415
-        urllib3.disable_warnings()
-        nb.http_session.verify = False
-    return nb
+def _get_nb_client(nb_url: str, nb_token: str, verify_ssl: bool = True) -> NetBoxClient:
+    """Return a configured NetBoxClient instance."""
+    return NetBoxClient(nb_url, nb_token, verify_ssl=verify_ssl)
 
 
 def get_prefixes_from_netbox(
@@ -159,16 +158,19 @@ def get_prefixes_from_netbox(
     prefixes that contain that address are fetched.
     """
     try:
-        nb = _get_nb_api(nb_url, nb_token, verify_ssl)
+        nb = _get_nb_client(nb_url, nb_token, verify_ssl)
         if contains:
-            raw = list(nb.ipam.prefixes.filter(contains=contains))
+            raw = list(nb.nb.ipam.prefixes.filter(contains=contains))
         else:
-            raw = list(nb.ipam.prefixes.all())
+            raw = list(nb.nb.ipam.prefixes.all())
         prefixes = [str(p.prefix) for p in raw if p.prefix]
         log.debug("Fetched %d prefix(es) from NetBox (contains=%s)", len(prefixes), contains)
         return prefixes
-    except Exception as exc:
+    except NetBoxClientError as exc:
         log.error("NetBox prefix lookup failed: %s", exc)
+        return []
+    except Exception as exc:
+        log.error("NetBox prefix lookup unexpected error: %s", exc)
         return []
 
 
@@ -180,21 +182,23 @@ def get_platform_from_netbox(
 ) -> Optional[str]:
     """Return the NetBox platform slug for the device whose primary IP is *device_ip*."""
     try:
-        nb = _get_nb_api(nb_url, nb_token, verify_ssl)
-        candidates = list(nb.dcim.devices.filter(primary_ip4=device_ip))
-        if not candidates:
-            candidates = list(nb.dcim.devices.filter(primary_ip4=f"{device_ip}/32"))
-        if not candidates:
+        nb = _get_nb_client(nb_url, nb_token, verify_ssl)
+        devices = nb.get_devices({"primary_ip4": device_ip})
+        if not devices:
+            devices = nb.get_devices({"primary_ip4": f"{device_ip}/32"})
+        if not devices:
             log.debug("No NetBox device found for IP %s", device_ip)
             return None
-        device = candidates[0]
-        if device.platform:
-            slug = device.platform.slug
+        platform = devices[0].get("platform") or {}
+        slug = platform.get("slug") if isinstance(platform, dict) else None
+        if slug:
             log.debug("NetBox platform for %s: %s", device_ip, slug)
-            return slug
+        return slug
+    except NetBoxClientError as exc:
+        log.error("NetBox platform lookup failed for %s: %s", device_ip, exc)
         return None
     except Exception as exc:
-        log.error("NetBox platform lookup failed for %s: %s", device_ip, exc)
+        log.error("NetBox platform lookup unexpected error for %s: %s", device_ip, exc)
         return None
 
 
@@ -206,15 +210,17 @@ def is_ap_in_netbox(
 ) -> bool:
     """Return True if the NetBox device with *ip* as its primary IP is an AP."""
     try:
-        nb = _get_nb_api(nb_url, nb_token, verify_ssl)
-        candidates = list(nb.dcim.devices.filter(primary_ip4=ip))
-        if not candidates:
-            candidates = list(nb.dcim.devices.filter(primary_ip4=f"{ip}/32"))
-        for dev in candidates:
-            role_slug  = (dev.device_role.slug  if dev.device_role  else "").lower()
-            type_model = (dev.device_type.model if dev.device_type  else "").lower()
+        nb = _get_nb_client(nb_url, nb_token, verify_ssl)
+        devices = nb.get_devices({"primary_ip4": ip})
+        if not devices:
+            devices = nb.get_devices({"primary_ip4": f"{ip}/32"})
+        for dev in devices:
+            role  = dev.get("device_role") or {}
+            dtype = dev.get("device_type")  or {}
+            role_slug  = (role.get("slug",  "") if isinstance(role,  dict) else "").lower()
+            type_model = (dtype.get("model", "") if isinstance(dtype, dict) else "").lower()
             if any(kw in role_slug or kw in type_model for kw in _AP_ROLE_KEYWORDS):
-                log.debug("Device %s (%s) identified as AP via NetBox", ip, dev.name)
+                log.debug("Device %s identified as AP via NetBox", ip)
                 return True
         return False
     except Exception as exc:
@@ -233,18 +239,15 @@ def _get_device_primary_ip_from_netbox(
     Falls back to a short-hostname match when CDP reports an FQDN.
     """
     try:
-        nb = _get_nb_api(nb_url, nb_token, verify_ssl)
-        candidates = list(nb.dcim.devices.filter(name=device_name))
-        if not candidates:
+        nb = _get_nb_client(nb_url, nb_token, verify_ssl)
+        devices = nb.get_devices({"name": device_name})
+        if not devices:
             short = device_name.split(".")[0]
-            candidates = list(nb.dcim.devices.filter(name=short))
-        if not candidates:
+            devices = nb.get_devices({"name": short})
+        if not devices:
             log.debug("No NetBox device found for name %r", device_name)
             return None
-        dev = candidates[0]
-        if dev.primary_ip4:
-            return str(dev.primary_ip4).split("/")[0]
-        return None
+        return nb.get_device_mgmt_ip(devices[0])
     except Exception as exc:
         log.debug("NetBox device IP lookup failed for %r: %s", device_name, exc)
         return None
@@ -332,62 +335,71 @@ def calculate_first_usable_ip(prefix: str) -> Optional[str]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def platform_to_device_type(platform_slug: Optional[str]) -> str:
-    """Map a NetBox platform slug to a netmiko device_type. Defaults to cisco_ios."""
+def platform_to_os_type(platform_slug: Optional[str]) -> str:
+    """Map a NetBox platform slug to a CiscoDeviceClient os_type. Defaults to 'ios'."""
     if not platform_slug:
-        return "cisco_ios"
-    return _PLATFORM_MAP.get(platform_slug.lower(), "cisco_ios")
+        return "ios"
+    return _PLATFORM_MAP.get(platform_slug.lower(), "ios")
 
 
-def open_connection(
+def _open_device_client(
     ip: str,
-    device_type: str,
+    os_type: str,
     credentials: Dict[str, str],
-) -> ConnectHandler:
-    """Open and return a live SSH session. Caller must call disconnect()."""
-    params: Dict = {
-        "device_type":  device_type,
-        "host":         ip,
-        "username":     credentials.get("username", ""),
-        "password":     credentials.get("password", ""),
-        "secret":       credentials.get("secret", ""),
-        "timeout":      int(credentials.get("timeout", 30)),
-        "conn_timeout": int(credentials.get("timeout", 30)),
-        "fast_cli":     False,
-    }
+) -> CiscoDeviceClient:
+    """Create a CiscoDeviceClient and open its CLI connection.
+
+    The caller is responsible for calling ``client._cli_disconnect()`` when done.
+    Raises :exc:`GatewayConnectionError` on any connection failure.
+    """
     try:
-        return ConnectHandler(**params)
-    except NetmikoAuthenticationException as exc:
+        client = CiscoDeviceClient(
+            host          = ip,
+            username      = credentials.get("username", ""),
+            password      = credentials.get("password", ""),
+            os_type       = os_type,
+            enable_secret = credentials.get("secret") or None,
+            timeout       = int(credentials.get("timeout", 30)),
+        )
+        client._cli_connect()
+        return client
+    except DeviceAuthError as exc:
         raise GatewayConnectionError(f"authentication failed for {ip}: {exc}") from exc
-    except NetmikoTimeoutException as exc:
-        raise GatewayConnectionError(f"connection timed out for {ip}") from exc
+    except DeviceTransportError as exc:
+        raise GatewayConnectionError(f"connection failed for {ip}: {exc}") from exc
     except Exception as exc:
         raise GatewayConnectionError(f"SSH error for {ip}: {exc}") from exc
+
+
+def _send_cmd(client: CiscoDeviceClient, cmd: str) -> str:
+    """Send a CLI command via *client* and return the raw text output."""
+    try:
+        raw, _, _ = client._cli_run_command(cmd, parse=False)
+        return raw
+    except DeviceTransportError as exc:
+        raise GatewayConnectionError(f"Command {cmd!r} failed: {exc}") from exc
 
 
 def connect_to_device(
     ip: str,
     credentials: Dict[str, str],
-    device_type: str = "cisco_ios",
+    device_type: str = "ios",
 ) -> str:
     """Open an SSH session to *ip*, retrieve the hostname prompt, then disconnect.
 
     Returns the hostname string (falls back to *ip*).
     Raises :exc:`GatewayConnectionError` on any failure.
     """
-    conn = open_connection(ip, device_type, credentials)
+    client = _open_device_client(ip, device_type, credentials)
     try:
-        prompt   = conn.find_prompt()
+        prompt   = client._cli_connection.find_prompt()
         hostname = prompt.rstrip("#>").strip()
         log.debug("Connected to %s — prompt: %r", ip, prompt)
         return hostname or ip
     except Exception as exc:
         raise GatewayConnectionError(f"prompt detection failed for {ip}: {exc}") from exc
     finally:
-        try:
-            conn.disconnect()
-        except Exception:
-            pass
+        client._cli_disconnect()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -419,14 +431,14 @@ def mac_to_cisco_fmt(mac: str) -> str:
 
 
 def arp_lookup(
-    conn: ConnectHandler,
+    client: CiscoDeviceClient,
     device_type: str,  # noqa: ARG001 — reserved for future platform-specific ARP variants
     target_ip: str,
 ) -> Optional[str]:
     """Run ``show ip arp <target_ip>`` and return the normalized MAC, or None."""
     cmd = f"show ip arp {target_ip}"
     try:
-        output = conn.send_command(cmd)
+        output = _send_cmd(client, cmd)
     except Exception as exc:
         log.error("ARP command failed (%s): %s", cmd, exc)
         return None
@@ -456,190 +468,218 @@ def arp_lookup(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def get_gateway_interface(
-    conn: ConnectHandler,
-    gateway_ip: str,
-) -> Optional[str]:
-    """Return the interface that carries *gateway_ip* by parsing ``show ip route <gateway_ip>``.
+def _parse_all_routes(output: str) -> List[Dict[str, Optional[str]]]:
+    """Parse every ECMP route entry from ``show ip route <ip>`` output.
 
-    Pattern coverage (IOS / IOS-XE / NX-OS):
+    Returns a list — one dict per next-hop — so callers get all ECMP paths.
+    Each dict has keys: prefix, next_hop, exit_interface, route_source,
+    route_tag, route_age.
 
-      IOS-XE full routing-entry format:
-        * directly connected, via Vlan128
+    Age / uptime handling:
+      - IOS-XE descriptor: "10.0.0.2, from X, 2w2d ago, via Gi1/0/1"
+        → age extracted per-entry from the "<age> ago" token on that line.
+      - NX-OS *via:        "*via 10.0.0.2, Eth1/1, [110/2], 00:01:02, …"
+        → age is the token after [metric].
+      - IOS-XE brief:      "via 10.0.0.2, 00:01:02, GigabitEthernet1/0/1"
+        → age is the second comma-separated token.
+      - Fallback:          "Last update from X on Gi1/0/1, 2w2d ago"
+        → age applied to all entries that lack a per-entry age.
 
-      IOS-XE brief C/L route format:
-        C   10.254.28.0/24 is directly connected, Vlan128
-        L   10.254.28.1/32 is directly connected, Vlan128
+    Tag handling:
+      - IOS-XE route-level:   "Tag 91, type extern 2, …"  → applied to all entries
+      - IOS-XE per-descriptor: "Route tag 91"              → applied to that ECMP entry
+      - NX-OS inline:          "*via …, tag 91"            → applied to that *via line
 
-      NX-OS format:
-        *via 10.254.28.1, Vlan128, [0/0], 3d02h, local
+    Patterns tried in priority order (first group that yields ≥1 result wins):
+
+      1. IOS-XE routing descriptor block – line-by-line parse to associate
+         per-entry "Route tag X" and "<age> ago" with the correct ECMP entry.
+
+      2. NX-OS *via lines:
+           *via 10.0.0.2, Eth1/1, [110/2], 00:01:02, ospf-1, intra, tag 91
+
+      3. IOS-XE brief with age+interface:
+           O 192.168.0.0/24 [110/2] via 10.0.0.2, 00:01:02, GigabitEthernet1/0/1
+
+      4. IOS-XE brief C/L directly connected:
+           C 192.168.0.0/24 is directly connected, Vlan200
+
+      5. Fallback: any "via <ip>" (interface unknown)
     """
-    cmd = f"show ip route {gateway_ip}"
+    routes: List[Dict[str, Optional[str]]] = []
+
+    # ── Common fields ─────────────────────────────────────────────────────────
+    prefix:     Optional[str] = None
+    source:     Optional[str] = None
+    global_tag: Optional[str] = None
+    global_age: Optional[str] = None
+
+    m = re.search(r"Routing entry for\s+(\S+)", output, re.IGNORECASE)
+    if m:
+        prefix = m.group(1)
+    if not prefix:
+        m = re.search(r"^(\d+\.\d+\.\d+\.\d+/\d+),\s+ubest", output, re.MULTILINE)
+        if m:
+            prefix = m.group(1)
+
+    m = re.search(r'Known via\s+"([^"]+)"', output, re.IGNORECASE)
+    if m:
+        source = m.group(1)
+
+    # IOS-XE route-level tag: "  Tag 91, type extern 2, forward metric 1"
+    m = re.search(r"^\s+Tag\s+(\d+)", output, re.IGNORECASE | re.MULTILINE)
+    if m:
+        global_tag = m.group(1)
+
+    # Global age fallback from "Last update from X on Interface, 2w2d ago"
+    m = re.search(r"Last update from\s+\S+\s+on\s+\S+,\s+(\S+)\s+ago", output, re.IGNORECASE)
+    if m:
+        global_age = m.group(1)
+
+    def _entry(
+        nh: str,
+        iface: Optional[str],
+        src:  Optional[str] = None,
+        tag:  Optional[str] = None,
+        age:  Optional[str] = None,
+    ) -> Dict[str, Optional[str]]:
+        return {
+            "prefix":        prefix,
+            "next_hop":      nh,
+            "exit_interface": iface,
+            "route_source":  src or source,
+            "route_tag":     tag if tag is not None else global_tag,
+            "route_age":     age if age is not None else global_age,
+        }
+
+    # ── Pattern 1: IOS-XE routing descriptor block (line-by-line) ────────────
+    # Descriptor entry (next-hop IP):
+    #   "  * 10.0.0.2, from 198.18.x.x, 2w2d ago, via GigabitEthernet1/0/1"
+    #   "    10.0.0.6, from 198.18.x.x, 2w2d ago, via GigabitEthernet1/0/2"
+    # Descriptor entry (directly connected):
+    #   "  * directly connected, via Vlan128"
+    # Per-entry tag:  "      Route tag 91"
+    # Age pattern on descriptor lines: "<token> ago," e.g. "2w2d ago,"
+    #
+    _DESC_IP  = re.compile(r"^\s+\*?\s*(\d+\.\d+\.\d+\.\d+),.*?via\s+(\S+)", re.IGNORECASE)
+    _DESC_DC  = re.compile(r"^\s+\*?\s*directly connected,\s+via\s+(\S+)",     re.IGNORECASE)
+    _RTAG_PER = re.compile(r"^\s+Route tag\s+(\d+)",                           re.IGNORECASE)
+    _RAGE_PER = re.compile(r"\b(\S+)\s+ago[,\s]",                              re.IGNORECASE)
+
+    pending: Optional[Dict[str, Optional[str]]] = None
+
+    for line in output.splitlines():
+        m = _DESC_IP.search(line)
+        if m:
+            if pending is not None:
+                routes.append(pending)
+            age_m = _RAGE_PER.search(line)
+            pending = _entry(
+                m.group(1),
+                m.group(2).rstrip(","),
+                age=age_m.group(1) if age_m else None,
+            )
+            continue
+
+        m = _DESC_DC.search(line)
+        if m:
+            if pending is not None:
+                routes.append(pending)
+            pending = _entry("directly connected", m.group(1).rstrip(","), "connected")
+            continue
+
+        m = _RTAG_PER.search(line)
+        if m and pending is not None:
+            pending["route_tag"] = m.group(1)
+
+    if pending is not None:
+        routes.append(pending)
+
+    if routes:
+        # Interface fallback: "Last update from X on GigabitEthernet1/0/1"
+        fb = re.search(r"Last update from\s+\S+\s+on\s+(\S+),", output, re.IGNORECASE)
+        for r in routes:
+            if not r["exit_interface"] and fb:
+                r["exit_interface"] = fb.group(1).rstrip(",")
+        return routes
+
+    # ── Pattern 2: NX-OS *via lines (age is 4th field, after [metric]) ───────
+    # "*via 10.0.0.2, Eth1/1, [110/2], 00:01:02, ospf-1, intra, tag 91"
+    for m in re.finditer(
+        r"^\s*\*via\s+(\d+\.\d+\.\d+\.\d+),\s+([^\s,]+)"
+        r"(?:,\s+\[[^\]]+\],\s+([^,]+))?"     # optional: [metric], age
+        r"(?:.*?\btag\s+(\d+))?",
+        output, re.IGNORECASE | re.MULTILINE,
+    ):
+        tag = m.group(4) or global_tag
+        age = m.group(3).strip() if m.group(3) else None
+        routes.append(_entry(m.group(1), m.group(2), tag=tag, age=age))
+
+    if routes:
+        return routes
+
+    # ── Pattern 3: IOS-XE brief with age+interface ───────────────────────────
+    # "O 192.168.0.0/24 [110/2] via 10.0.0.2, 00:01:02, GigabitEthernet1/0/1"
+    for m in re.finditer(
+        r"\bvia\s+(\d+\.\d+\.\d+\.\d+),\s+([\d:]+),\s+(\S+)",
+        output, re.IGNORECASE,
+    ):
+        routes.append(_entry(m.group(1), m.group(3).rstrip(","), age=m.group(2)))
+
+    if routes:
+        return routes
+
+    # ── Pattern 4: IOS-XE brief directly connected ───────────────────────────
+    for m in re.finditer(r"is directly connected,\s+(\S+)", output, re.IGNORECASE):
+        routes.append(_entry("directly connected", m.group(1).rstrip(","), "connected"))
+
+    if routes:
+        return routes
+
+    # ── Pattern 5: any "via <ip>" (no interface) ─────────────────────────────
+    for m in re.finditer(r"\bvia\s+(\d+\.\d+\.\d+\.\d+)", output, re.IGNORECASE):
+        routes.append(_entry(m.group(1), None))
+
+    return routes
+
+
+def get_routes_for_ip(client: CiscoDeviceClient, ip: str) -> List[Dict[str, Optional[str]]]:
+    """Run ``show ip route <ip>`` and return all matching ECMP routes."""
     try:
-        output = conn.send_command(cmd)
+        output = _send_cmd(client, f"show ip route {ip}")
     except Exception as exc:
-        log.debug("Gateway route lookup failed: %s", exc)
-        return None
+        log.error("Route lookup for %s failed: %s", ip, exc)
+        return []
+    log.debug("show ip route %s:\n%s", ip, output)
+    return _parse_all_routes(output)
 
-    log.debug("show ip route %s:\n%s", gateway_ip, output)
 
-    # IOS-XE full routing entry: "* directly connected, via Vlan128"
-    m = re.search(r"directly connected,\s+via\s+(\S+)", output, re.IGNORECASE)
-    if m:
-        iface = m.group(1).rstrip(",")
-        log.debug("Gateway %s resolved to interface %s (IOS-XE full entry)", gateway_ip, iface)
-        return iface
+def get_gateway_interface(client: CiscoDeviceClient, gateway_ip: str) -> Optional[str]:
+    """Return the interface on the gateway that carries *gateway_ip*.
 
-    # IOS-XE C/L route line: "is directly connected, Vlan128"
-    m = re.search(r"is directly connected,\s+(\S+)", output, re.IGNORECASE)
-    if m:
-        iface = m.group(1).rstrip(",")
-        log.debug("Gateway %s resolved to interface %s (IOS-XE C/L route)", gateway_ip, iface)
-        return iface
-
-    # NX-OS: "*via 10.254.28.1, Vlan128, [0/0], ..."
-    m = re.search(r"\*via\s+[\d.]+,\s+([^\s,]+)", output, re.IGNORECASE)
-    if m:
-        iface = m.group(1)
-        log.debug("Gateway %s resolved to interface %s (NX-OS)", gateway_ip, iface)
-        return iface
-
-    log.debug("Could not determine gateway interface from route output for %s", gateway_ip)
+    Delegates to ``get_routes_for_ip`` and returns the exit_interface of the
+    first matching route (the gateway's own IP is always directly connected).
+    """
+    for route in get_routes_for_ip(client, gateway_ip):
+        if route.get("exit_interface"):
+            log.debug("Gateway %s is on interface %s", gateway_ip, route["exit_interface"])
+            return route["exit_interface"]
+    log.debug("Could not resolve gateway interface for %s", gateway_ip)
     return None
 
 
 def get_route_for_destination(
-    conn: ConnectHandler,
+    client: CiscoDeviceClient,
     dst_ip: str,
-) -> Dict[str, Optional[str]]:
-    """Return L3 routing info for *dst_ip* by parsing ``show ip route <dst_ip>``.
+) -> List[Dict[str, Optional[str]]]:
+    """Return all ECMP routes for *dst_ip* from ``show ip route <dst_ip>``.
 
-    Returns a dict with keys:
-      prefix         – matched route (e.g. "192.168.100.0/24")
-      next_hop       – next-hop IP, or "directly connected"
-      exit_interface – outgoing interface toward the destination
-      route_source   – routing protocol / source (e.g. "ospf 1", "static", "connected")
-
-    Pattern coverage:
-
-      IOS-XE full routing entry (OSPF/EIGRP/BGP/static with next-hop):
-        * 10.0.0.2, from 10.0.0.2, 00:01:02 ago, via GigabitEthernet1/0/1
-
-      IOS-XE full routing entry (directly connected):
-        * directly connected, via Vlan200
-
-      IOS-XE brief C/L route line:
-        C   192.168.100.0/24 is directly connected, Vlan200
-        O   192.168.100.0/24 [110/2] via 10.0.0.2, 00:01:02, GigabitEthernet1/0/1
-
-      IOS-XE interface fallback (when descriptor omits interface):
-        Last update from 10.0.0.2 on GigabitEthernet1/0/1, 00:01:02 ago
-
-      NX-OS:
-        *via 10.0.0.2, Eth1/1, [110/2], 00:01:02, ospf-1, intra
+    Returns a list (one entry per ECMP path).  Each entry has:
+      prefix, next_hop, exit_interface, route_source.
     """
-    empty: Dict[str, Optional[str]] = {
-        "prefix":         None,
-        "next_hop":       None,
-        "exit_interface": None,
-        "route_source":   None,
-    }
-
-    try:
-        output = conn.send_command(f"show ip route {dst_ip}")
-    except Exception as exc:
-        log.error("Route lookup for %s failed: %s", dst_ip, exc)
-        return empty
-
-    log.debug("show ip route %s:\n%s", dst_ip, output)
-
-    result: Dict[str, Optional[str]] = dict(empty)
-
-    # ── Prefix ────────────────────────────────────────────────────────────────
-    m = re.search(r"Routing entry for\s+(\S+)", output, re.IGNORECASE)
-    if m:
-        result["prefix"] = m.group(1)
-
-    if not result["prefix"]:
-        # NX-OS: "192.168.100.0/24, ubest/mbest: ..."
-        m = re.search(r"^(\d+\.\d+\.\d+\.\d+/\d+),\s+ubest", output, re.MULTILINE)
-        if m:
-            result["prefix"] = m.group(1)
-
-    # ── Route source ──────────────────────────────────────────────────────────
-    # IOS-XE: Known via "ospf 1"
-    m = re.search(r'Known via\s+"([^"]+)"', output, re.IGNORECASE)
-    if m:
-        result["route_source"] = m.group(1)
-
-    # ── Next-hop + exit interface ─────────────────────────────────────────────
-
-    # IOS-XE routing descriptor with a next-hop IP:
-    # "  * 10.0.0.2, from 10.0.0.2, 00:01:02 ago, via GigabitEthernet1/0/1"
-    # "  * 10.0.0.2, via GigabitEthernet1/0/1"   (static)
-    m = re.search(
-        r"^\s*\*\s+(\d+\.\d+\.\d+\.\d+),.*?via\s+(\S+)",
-        output, re.IGNORECASE | re.MULTILINE,
-    )
-    if m:
-        result["next_hop"]       = m.group(1)
-        result["exit_interface"] = m.group(2).rstrip(",")
-
-    # IOS-XE routing descriptor directly connected:
-    # "  * directly connected, via Vlan200"
-    elif re.search(r"^\s*\*\s+directly connected", output, re.IGNORECASE | re.MULTILINE):
-        m = re.search(r"\*\s+directly connected,\s+via\s+(\S+)", output, re.IGNORECASE)
-        if m:
-            result["next_hop"]       = "directly connected"
-            result["exit_interface"] = m.group(1).rstrip(",")
-            result["route_source"]   = result["route_source"] or "connected"
-
-    # NX-OS: "*via 10.0.0.2, Eth1/1, [110/2], ..."
-    elif re.search(r"^\s*\*via\s+\d+\.\d+\.\d+\.\d+", output, re.IGNORECASE | re.MULTILINE):
-        m = re.search(r"\*via\s+(\d+\.\d+\.\d+\.\d+),\s+([^\s,]+)", output, re.IGNORECASE)
-        if m:
-            result["next_hop"]       = m.group(1)
-            result["exit_interface"] = m.group(2)
-
-    # IOS-XE brief with interface: "O X/Y [d/m] via 10.0.0.2, 00:01:02, GigabitEthernet1/0/1"
-    elif re.search(r"\bvia\s+\d+\.\d+\.\d+\.\d+,\s+[\d:]+,\s+\S+", output, re.IGNORECASE):
-        m = re.search(
-            r"\bvia\s+(\d+\.\d+\.\d+\.\d+),\s+[\d:]+,\s+(\S+)",
-            output, re.IGNORECASE,
-        )
-        if m:
-            result["next_hop"]       = m.group(1)
-            result["exit_interface"] = m.group(2).rstrip(",")
-
-    # IOS-XE brief directly connected: "C/L  X/Y is directly connected, Vlan200"
-    elif re.search(r"is directly connected,", output, re.IGNORECASE):
-        m = re.search(r"is directly connected,\s+(\S+)", output, re.IGNORECASE)
-        if m:
-            result["next_hop"]       = "directly connected"
-            result["exit_interface"] = m.group(1).rstrip(",")
-            result["route_source"]   = result["route_source"] or "connected"
-
-    # Fallback: any "via <ip>" gives us at least the next-hop
-    else:
-        m = re.search(r"\bvia\s+(\d+\.\d+\.\d+\.\d+)", output, re.IGNORECASE)
-        if m:
-            result["next_hop"] = m.group(1)
-
-    # ── Interface fallback ────────────────────────────────────────────────────
-    # "Last update from 10.0.0.2 on GigabitEthernet1/0/1, 00:01:02 ago"
-    # Fills in exit_interface for entries where the routing descriptor omits it.
-    if not result["exit_interface"]:
-        m = re.search(r"Last update from\s+\S+\s+on\s+(\S+),", output, re.IGNORECASE)
-        if m:
-            result["exit_interface"] = m.group(1).rstrip(",")
-
-    log.debug(
-        "Route for %s: prefix=%s next_hop=%s iface=%s source=%s",
-        dst_ip,
-        result["prefix"], result["next_hop"],
-        result["exit_interface"], result["route_source"],
-    )
-    return result
+    routes = get_routes_for_ip(client, dst_ip)
+    log.debug("Routes for %s: %s", dst_ip, routes)
+    return routes
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -690,7 +730,7 @@ def _parse_mac_table_output(output: str, mac: str) -> Optional[Dict[str, str]]:
 
 
 def mac_table_lookup(
-    conn: ConnectHandler,
+    client: CiscoDeviceClient,
     device_type: str,  # noqa: ARG001 — reserved for future platform-specific MAC table commands
     mac: str,
 ) -> Optional[Dict[str, str]]:
@@ -698,7 +738,7 @@ def mac_table_lookup(
     cisco_mac = mac_to_cisco_fmt(mac)
     cmd = f"show mac address-table address {cisco_mac}"
     try:
-        output = conn.send_command(cmd)
+        output = _send_cmd(client, cmd)
     except Exception as exc:
         log.error("MAC table command failed (%s): %s", cmd, exc)
         return None
@@ -771,7 +811,7 @@ def _parse_nxos_portchannel_members(output: str, po_num: str) -> List[str]:
 
 
 def get_portchannel_members(
-    conn: ConnectHandler,
+    client: CiscoDeviceClient,
     device_type: str,
     interface: str,
 ) -> List[str]:
@@ -789,10 +829,10 @@ def get_portchannel_members(
     po_num = m.group(0)
     try:
         if "nxos" in device_type:
-            output  = conn.send_command("show port-channel summary")
+            output  = _send_cmd(client, "show port-channel summary")
             members = _parse_nxos_portchannel_members(output, po_num)
         else:
-            output  = conn.send_command("show etherchannel summary")
+            output  = _send_cmd(client, "show etherchannel summary")
             members = _parse_ios_portchannel_members(output, po_num)
     except Exception as exc:
         log.error("Port-channel member lookup failed: %s", exc)
@@ -808,7 +848,7 @@ def get_portchannel_members(
 
 
 def _get_cdp_neighbor(
-    conn: ConnectHandler,
+    client: CiscoDeviceClient,
     device_type: str,
     interface: str,
 ) -> Optional[Dict[str, str]]:
@@ -819,7 +859,7 @@ def _get_cdp_neighbor(
         cmd = f"show cdp neighbors {interface} detail"
 
     try:
-        output = conn.send_command(cmd)
+        output = _send_cmd(client, cmd)
     except Exception as exc:
         log.debug("CDP command failed on %s: %s", interface, exc)
         return None
@@ -849,7 +889,7 @@ def _get_cdp_neighbor(
 
 
 def _get_lldp_neighbor(
-    conn: ConnectHandler,
+    client: CiscoDeviceClient,
     device_type: str,
     interface: str,
 ) -> Optional[Dict[str, str]]:
@@ -860,7 +900,7 @@ def _get_lldp_neighbor(
         cmd = f"show lldp neighbors {interface} detail"
 
     try:
-        output = conn.send_command(cmd)
+        output = _send_cmd(client, cmd)
     except Exception as exc:
         log.debug("LLDP command failed on %s: %s", interface, exc)
         return None
@@ -890,15 +930,15 @@ def _get_lldp_neighbor(
 
 
 def get_neighbor_info(
-    conn: ConnectHandler,
+    client: CiscoDeviceClient,
     device_type: str,
     interface: str,
 ) -> Optional[Dict[str, str]]:
     """Return CDP or LLDP neighbor info for *interface*, preferring CDP. Returns None if none found."""
-    cdp = _get_cdp_neighbor(conn, device_type, interface)
+    cdp = _get_cdp_neighbor(client, device_type, interface)
     if cdp:
         return cdp
-    return _get_lldp_neighbor(conn, device_type, interface)
+    return _get_lldp_neighbor(client, device_type, interface)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -995,7 +1035,7 @@ def build_path_dict(
     gateway_ip: str,
     downstream_hops: List[Dict],
     gateway_interface: Optional[str] = None,
-    dst_route: Optional[Dict] = None,
+    dst_route: Optional[List[Dict]] = None,
     dst_ip: str = "",
 ) -> Dict:
     """Reverse the downstream hop list to produce an upstream (device→gateway) path dict.
@@ -1090,17 +1130,237 @@ def print_path_summary(path_dict: Dict) -> None:
         print()
         print(f"    Egress  : {egress}")
 
-    dst = path_dict.get("dst_route", {})
-    if dst.get("prefix") or dst.get("next_hop"):
-        print(f"\n  Destination Route  ({path_dict.get('dst_ip', 'dst')})")
-        if dst.get("prefix"):
-            print(f"    Prefix    : {dst['prefix']}")
-        if dst.get("next_hop"):
-            print(f"    Next-hop  : {dst['next_hop']}")
-        if dst.get("exit_interface"):
-            print(f"    Interface : {dst['exit_interface']}")
-        if dst.get("route_source"):
-            print(f"    Source    : {dst['route_source']}")
+    dst_routes = path_dict.get("dst_route", [])
+    if dst_routes:
+        queried = path_dict.get("dst_ip", "")
+        print(f"\n  Destination Routes  ({queried})")
+        for idx, r in enumerate(dst_routes, 1):
+            prefix = r.get("prefix") or queried
+            nh     = r.get("next_hop") or "?"
+            iface  = r.get("exit_interface", "")
+            src    = r.get("route_source", "")
+            tag    = r.get("route_tag", "")
+            age    = r.get("route_age", "")
+            line   = f"    {idx}. {prefix}  via {nh}"
+            if iface:
+                line += f"  [{iface}]"
+            if src:
+                line += f"  [{src}]"
+            if tag:
+                line += f"  tag:{tag}"
+            if age:
+                line += f"  age:{age}"
+            print(line)
+
+    print()
+    print(SEP)
+    print()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 3 — L3 path trace (gateway → destination, all ECMP paths)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def run_l3_path_trace(
+    gateway_ip: str,
+    gw_hostname: str,
+    gw_ingress_interface: Optional[str],
+    dst_ip: str,
+    initial_routes: List[Dict],
+    nb_url: str,
+    nb_token: str,
+    creds: Dict[str, str],
+    verify_ssl: bool,
+    max_hops: int = 15,
+) -> List[List[Dict]]:
+    """BFS traversal of all ECMP L3 paths from *gateway_ip* toward *dst_ip*.
+
+    At every hop:
+      - ``show ip route <prev_ip>``  → ingress interfaces (how traffic arrived)
+      - ``show ip route <dst_ip>``   → egress routes (all ECMP next-hops onward)
+
+    Each unique next-hop spawns a new path branch.  Returns a list of
+    complete paths, each path being an ordered list of hop dicts.
+
+    Stop conditions per branch:
+      - Destination is directly connected on the current device.
+      - No route found for dst_ip.
+      - Cannot connect to next-hop.
+      - Loop detected (IP already visited on this branch).
+      - max_hops reached.
+    """
+    from collections import deque  # noqa: PLC0415
+
+    complete_paths: List[List[Dict]] = []
+
+    gw_hop: Dict = {
+        "hostname":           gw_hostname,
+        "ip":                 gateway_ip,
+        "ingress_interfaces": [gw_ingress_interface] if gw_ingress_interface else [],
+        "egress_routes":      initial_routes,
+        "note":               "",
+    }
+
+    # If the destination is already directly reachable from the gateway, done.
+    if any(r.get("next_hop") == "directly connected" for r in initial_routes):
+        return [[gw_hop]]
+
+    # Seed the BFS queue: (path_so_far, next_hop_to_visit, visited_ips_on_this_branch)
+    queue: deque = deque()
+    for route in initial_routes:
+        nh = route.get("next_hop")
+        if nh and nh != "directly connected":
+            queue.append(([gw_hop], nh, {gateway_ip}))
+
+    if not queue:
+        return [[gw_hop]]
+
+    while queue:
+        path_so_far, current_ip, visited = queue.popleft()
+
+        if current_ip in visited:
+            complete_paths.append(
+                path_so_far + [{"hostname": current_ip, "ip": current_ip,
+                                "note": f"Loop detected at {current_ip}",
+                                "ingress_interfaces": [], "egress_routes": []}]
+            )
+            continue
+
+        if len(path_so_far) >= max_hops:
+            complete_paths.append(
+                path_so_far + [{"hostname": current_ip, "ip": current_ip,
+                                "note": f"Max hops ({max_hops}) reached",
+                                "ingress_interfaces": [], "egress_routes": []}]
+            )
+            continue
+
+        print(f"[L3] Hop {len(path_so_far) + 1}: connecting to {current_ip}...")
+
+        platform_slug   = get_platform_from_netbox(nb_url, nb_token, current_ip, verify_ssl)
+        current_dtype   = platform_to_os_type(platform_slug)
+
+        try:
+            client = _open_device_client(current_ip, current_dtype, creds)
+        except GatewayConnectionError as exc:
+            complete_paths.append(
+                path_so_far + [{"hostname": current_ip, "ip": current_ip,
+                                "note": f"Cannot connect: {exc}",
+                                "ingress_interfaces": [], "egress_routes": []}]
+            )
+            continue
+
+        hostname        = current_ip
+        ingress_ifaces: List[str]         = []
+        egress_routes:  List[Dict]        = []
+
+        try:
+            try:
+                hostname = client._cli_connection.find_prompt().rstrip("#>").strip() or current_ip
+            except Exception:
+                pass
+
+            prev_ip = path_so_far[-1]["ip"]
+            print(f"[L3]   show ip route {prev_ip} → ingress interfaces")
+            for r in get_routes_for_ip(client, prev_ip):
+                if r.get("exit_interface") and r["exit_interface"] not in ingress_ifaces:
+                    ingress_ifaces.append(r["exit_interface"])
+
+            print(f"[L3]   show ip route {dst_ip} → egress routes")
+            egress_routes = get_routes_for_ip(client, dst_ip)
+
+        finally:
+            try:
+                client._cli_disconnect()
+            except Exception:
+                pass
+
+        current_hop: Dict = {
+            "hostname":           hostname,
+            "ip":                 current_ip,
+            "ingress_interfaces": ingress_ifaces,
+            "egress_routes":      egress_routes,
+            "note":               "",
+        }
+        new_path    = path_so_far + [current_hop]
+        new_visited = visited | {current_ip}
+
+        if not egress_routes:
+            current_hop["note"] = "No route to destination"
+            complete_paths.append(new_path)
+            continue
+
+        if any(r.get("next_hop") == "directly connected" for r in egress_routes):
+            complete_paths.append(new_path)
+            continue
+
+        # Expand ECMP — each unique next-hop spawns a new branch.
+        next_hops: List[str] = []
+        for r in egress_routes:
+            nh = r.get("next_hop")
+            if nh and nh != "directly connected" and nh not in next_hops:
+                next_hops.append(nh)
+
+        if not next_hops:
+            current_hop["note"] = "No reachable next-hop"
+            complete_paths.append(new_path)
+            continue
+
+        for nh in next_hops:
+            queue.append((new_path, nh, new_visited))
+
+    return complete_paths
+
+
+def print_l3_paths(paths: List[List[Dict]], dst_ip: str) -> None:
+    """Print all L3 ECMP paths (gateway → destination) to the console."""
+    if not paths:
+        return
+
+    SEP = "=" * 64
+    print()
+    print(SEP)
+    print(f"  L3 PATH TRACE  (gateway --> {dst_ip})")
+    print(SEP)
+
+    for path_num, path in enumerate(paths, 1):
+        print(f"\n  Path {path_num}:")
+
+        for hop_num, hop in enumerate(path, 1):
+            hostname = hop.get("hostname") or hop.get("ip", "unknown")
+            ip       = hop.get("ip", "")
+            note     = hop.get("note", "")
+
+            print(f"\n    Hop {hop_num}: {hostname}  ({ip})")
+
+            if note:
+                print(f"      [{note}]")
+                continue
+
+            ifaces = hop.get("ingress_interfaces", [])
+            if ifaces:
+                print(f"      Ingress : {', '.join(ifaces)}")
+
+            reached = False
+            for r in hop.get("egress_routes", []):
+                prefix = r.get("prefix") or dst_ip
+                nh     = r.get("next_hop") or "?"
+                iface  = r.get("exit_interface", "")
+                src    = r.get("route_source", "")
+                tag    = r.get("route_tag", "")
+                line   = f"      Route   : {prefix}  via {nh}"
+                if iface:
+                    line += f"  [{iface}]"
+                if src:
+                    line += f"  [{src}]"
+                if tag:
+                    line += f"  tag:{tag}"
+                print(line)
+                if nh == "directly connected":
+                    reached = True
+
+            if reached:
+                print(f"      [DESTINATION REACHED]")
 
     print()
     print(SEP)
@@ -1147,7 +1407,7 @@ def run_l2_trace(
     # ── Phase A: ARP lookup on the gateway (done exactly once) ───────────────
     if device_type is None:
         platform_slug = get_platform_from_netbox(nb_url, nb_token, gateway_ip, verify_ssl)
-        device_type   = platform_to_device_type(platform_slug)
+        device_type   = platform_to_os_type(platform_slug)
 
     log.info(
         "L2 trace start: target=%s  gateway=%s  device_type=%s",
@@ -1155,43 +1415,45 @@ def run_l2_trace(
     )
 
     try:
-        conn = open_connection(gateway_ip, device_type, creds)
+        client = _open_device_client(gateway_ip, device_type, creds)
     except GatewayConnectionError as exc:
         print(f"[ERROR] L2 trace — cannot connect to gateway {gateway_ip}: {exc}")
         return
 
-    mac: Optional[str]                   = None
-    gw_hostname: str                     = gateway_ip
-    gw_interface: Optional[str]          = None
-    dst_route: Dict[str, Optional[str]]  = {}
+    mac: Optional[str]          = None
+    gw_hostname: str            = gateway_ip
+    gw_interface: Optional[str] = None
+    dst_routes: List[Dict]      = []
 
     try:
         try:
-            gw_hostname = conn.find_prompt().rstrip("#>").strip() or gateway_ip
+            gw_hostname = client._cli_connection.find_prompt().rstrip("#>").strip() or gateway_ip
         except Exception:
             pass
 
         print(f"[INFO] ARP lookup for {target_ip} on {gw_hostname} ({gateway_ip})...")
-        mac = arp_lookup(conn, device_type, target_ip)
+        mac = arp_lookup(client, device_type, target_ip)
 
-        gw_interface = get_gateway_interface(conn, gateway_ip)
+        gw_interface = get_gateway_interface(client, gateway_ip)
         if gw_interface:
             print(f"[INFO] Gateway IP {gateway_ip} is on interface {gw_interface}")
 
         print(f"[INFO] Route lookup for destination {dst_ip} on {gw_hostname}...")
-        dst_route = get_route_for_destination(conn, dst_ip)
-        if dst_route.get("next_hop"):
-            print(
-                f"[INFO] Route to {dst_ip}: "
-                f"{dst_route.get('prefix') or dst_ip} "
-                f"via {dst_route['next_hop']}"
-                + (f" ({dst_route['exit_interface']})" if dst_route.get("exit_interface") else "")
-            )
+        dst_routes = get_route_for_destination(client, dst_ip)
+        if dst_routes:
+            for r in dst_routes:
+                nh    = r.get("next_hop", "?")
+                iface = r.get("exit_interface", "")
+                print(
+                    f"[INFO] Route to {dst_ip}: "
+                    f"{r.get('prefix') or dst_ip}  via {nh}"
+                    + (f"  [{iface}]" if iface else "")
+                )
         else:
             print(f"[WARN] No route found for {dst_ip} on {gw_hostname}")
     finally:
         try:
-            conn.disconnect()
+            client._cli_disconnect()
         except Exception:
             pass
 
@@ -1231,7 +1493,7 @@ def run_l2_trace(
 
     for hop_num in range(1, max_hops + 1):
         try:
-            conn = open_connection(current_ip, current_device_type, creds)
+            client = _open_device_client(current_ip, current_device_type, creds)
         except GatewayConnectionError as exc:
             final_stop_reason = f"Cannot connect to {current_ip}: {exc}"
             break
@@ -1243,13 +1505,13 @@ def run_l2_trace(
 
         try:
             try:
-                hostname = conn.find_prompt().rstrip("#>").strip() or current_ip
+                hostname = client._cli_connection.find_prompt().rstrip("#>").strip() or current_ip
             except Exception:
                 pass
 
             # Step 1 — MAC table lookup
             print(f"[INFO] MAC table lookup on {hostname} ({current_ip})...")
-            mac_entry = mac_table_lookup(conn, current_device_type, mac)
+            mac_entry = mac_table_lookup(client, current_device_type, mac)
             if not mac_entry:
                 final_hostname    = hostname
                 final_stop_reason = (
@@ -1264,7 +1526,7 @@ def run_l2_trace(
             # Step 2 — port-channel expansion
             if is_portchannel(interface):
                 print(f"[INFO] {interface} is a port-channel — resolving members...")
-                portchannel_mbrs = get_portchannel_members(conn, current_device_type, interface)
+                portchannel_mbrs = get_portchannel_members(client, current_device_type, interface)
                 if portchannel_mbrs:
                     print(f"[INFO] Port-channel members: {', '.join(portchannel_mbrs)}")
                 else:
@@ -1273,11 +1535,11 @@ def run_l2_trace(
             # Step 3 — CDP/LLDP on the resolved physical interface
             check_iface = portchannel_mbrs[0] if portchannel_mbrs else interface
             print(f"[INFO] Checking CDP/LLDP on {check_iface}...")
-            neighbor_info = get_neighbor_info(conn, current_device_type, check_iface)
+            neighbor_info = get_neighbor_info(client, current_device_type, check_iface)
 
         finally:
             try:
-                conn.disconnect()
+                client._cli_disconnect()
             except Exception:
                 pass
 
@@ -1330,7 +1592,7 @@ def run_l2_trace(
 
         visited.add(neighbor_ip)
         next_platform       = get_platform_from_netbox(nb_url, nb_token, neighbor_ip, verify_ssl)
-        current_device_type = platform_to_device_type(next_platform)
+        current_device_type = platform_to_os_type(next_platform)
         current_ip          = neighbor_ip
 
     # ── Inline stop detail ────────────────────────────────────────────────────
@@ -1347,8 +1609,24 @@ def run_l2_trace(
 
     # ── Full path summary (device → gateway) ─────────────────────────────────
     if path_hops:
-        path_dict = build_path_dict(target_ip, mac, gateway_ip, path_hops, gw_interface, dst_route, dst_ip)
+        path_dict = build_path_dict(target_ip, mac, gateway_ip, path_hops, gw_interface, dst_routes, dst_ip)
         print_path_summary(path_dict)
+
+    # ── Phase 3: L3 path trace (gateway → destination, all ECMP paths) ────────
+    if dst_routes:
+        l3_paths = run_l3_path_trace(
+            gateway_ip           = gateway_ip,
+            gw_hostname          = gw_hostname,
+            gw_ingress_interface = gw_interface,
+            dst_ip               = dst_ip,
+            initial_routes       = dst_routes,
+            nb_url               = nb_url,
+            nb_token             = nb_token,
+            creds                = creds,
+            verify_ssl           = verify_ssl,
+            max_hops             = max_hops,
+        )
+        print_l3_paths(l3_paths, dst_ip)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1509,7 +1787,7 @@ def main() -> int:
     print("[INFO] Fetching gateway platform from NetBox...")
 
     gw_platform    = get_platform_from_netbox(netbox_url, netbox_token, gateway, verify_ssl)
-    gw_device_type = platform_to_device_type(gw_platform)
+    gw_device_type = platform_to_os_type(gw_platform)
     log.info("Gateway platform: %s -> device_type: %s", gw_platform or "unknown", gw_device_type)
 
     print("[INFO] Attempting connection to gateway...")
