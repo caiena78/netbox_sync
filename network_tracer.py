@@ -452,6 +452,42 @@ def arp_lookup(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Phase 2 — gateway SVI / routed-interface lookup
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def get_gateway_interface(
+    conn: ConnectHandler,
+    gateway_ip: str,
+) -> Optional[str]:
+    """Return the interface name on the gateway that has *gateway_ip* configured.
+
+    Runs ``show ip interface brief | include <gateway_ip>`` and parses the first
+    token (interface name) from a line whose second column exactly matches the IP
+    (with any /prefix-length stripped).  Works for IOS, IOS-XE, and NX-OS.
+    """
+    cmd = f"show ip interface brief | include {gateway_ip}"
+    try:
+        output = conn.send_command(cmd)
+    except Exception as exc:
+        log.debug("Gateway interface lookup failed: %s", exc)
+        return None
+
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        # Column 1 is the interface name; column 2 is the IP (possibly with /prefix).
+        candidate_ip = parts[1].split("/")[0]
+        if candidate_ip == gateway_ip:
+            log.debug("Gateway IP %s is on interface %s", gateway_ip, parts[0])
+            return parts[0]
+
+    log.debug("Could not find interface for gateway IP %s", gateway_ip)
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Phase 2 — MAC table lookup
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -803,6 +839,7 @@ def build_path_dict(
     mac: Optional[str],
     gateway_ip: str,
     downstream_hops: List[Dict],
+    gateway_interface: Optional[str] = None,
 ) -> Dict:
     """Reverse the downstream hop list to produce an upstream (device→gateway) path dict.
 
@@ -819,6 +856,9 @@ def build_path_dict(
     Reversal formula (j = upstream hop index, d_idx = n-1-j):
       ingress_interface = downstream_hops[d_idx].local_interface
       egress_interface  = downstream_hops[d_idx-1].remote_port  (None when d_idx == 0)
+
+    For the last upstream hop (the gateway, d_idx == 0), egress_interface is set
+    to *gateway_interface* — the SVI or routed interface that carries *gateway_ip*.
     """
     n = len(downstream_hops)
     upstream_path: List[Dict] = []
@@ -829,16 +869,22 @@ def build_path_dict(
 
         ingress         = d_hop.get("local_interface")
         ingress_members = d_hop.get("portchannel_members", [])
-        egress          = downstream_hops[d_idx - 1].get("remote_port") if d_idx > 0 else None
+
+        if d_idx == 0:
+            # This is the gateway — egress is the SVI / routed port with the gateway IP.
+            egress = gateway_interface
+        else:
+            egress = downstream_hops[d_idx - 1].get("remote_port")
 
         upstream_path.append({
-            "hop":                     j + 1,
-            "hostname":                d_hop.get("hostname"),
-            "switch_ip":               d_hop.get("switch_ip"),
-            "vlan":                    d_hop.get("vlan"),
-            "ingress_interface":       ingress,
+            "hop":                         j + 1,
+            "hostname":                    d_hop.get("hostname"),
+            "switch_ip":                   d_hop.get("switch_ip"),
+            "vlan":                        d_hop.get("vlan"),
+            "ingress_interface":           ingress,
             "ingress_portchannel_members": ingress_members,
-            "egress_interface":        egress,
+            "egress_interface":            egress,
+            "is_gateway":                  d_idx == 0,
         })
 
     return {
@@ -864,12 +910,18 @@ def print_path_summary(path_dict: Dict) -> None:
     print(SEP)
 
     for hop in path_dict["path"]:
-        hostname = hop["hostname"] or hop["switch_ip"]
-        sw_ip    = hop["switch_ip"]
-        vlan     = hop["vlan"] or "—"
-        ingress  = hop["ingress_interface"] or "—"
-        i_mbrs   = hop.get("ingress_portchannel_members", [])
-        egress   = hop["egress_interface"] or "(gateway — end of trace)"
+        hostname   = hop["hostname"] or hop["switch_ip"]
+        sw_ip      = hop["switch_ip"]
+        vlan       = hop["vlan"] or "—"
+        ingress    = hop["ingress_interface"] or "—"
+        i_mbrs     = hop.get("ingress_portchannel_members", [])
+        is_gateway = hop.get("is_gateway", False)
+
+        if is_gateway:
+            gw_iface = hop["egress_interface"]
+            egress   = f"{gw_iface}  ({path_dict['gateway_ip']})" if gw_iface else "(gateway — interface not resolved)"
+        else:
+            egress = hop["egress_interface"] or "—"
 
         print(f"\n  Hop {hop['hop']}: {hostname}  ({sw_ip})")
         print(f"    VLAN    : {vlan}")
@@ -936,8 +988,9 @@ def run_l2_trace(
         print(f"[ERROR] L2 trace — cannot connect to gateway {gateway_ip}: {exc}")
         return
 
-    mac: Optional[str] = None
-    gw_hostname: str   = gateway_ip
+    mac: Optional[str]          = None
+    gw_hostname: str            = gateway_ip
+    gw_interface: Optional[str] = None
 
     try:
         try:
@@ -946,6 +999,9 @@ def run_l2_trace(
             pass
         print(f"[INFO] ARP lookup for {target_ip} on {gw_hostname} ({gateway_ip})...")
         mac = arp_lookup(conn, device_type, target_ip)
+        gw_interface = get_gateway_interface(conn, gateway_ip)
+        if gw_interface:
+            print(f"[INFO] Gateway IP {gateway_ip} is on interface {gw_interface}")
     finally:
         try:
             conn.disconnect()
@@ -1104,7 +1160,7 @@ def run_l2_trace(
 
     # ── Full path summary (device → gateway) ─────────────────────────────────
     if path_hops:
-        path_dict = build_path_dict(target_ip, mac, gateway_ip, path_hops)
+        path_dict = build_path_dict(target_ip, mac, gateway_ip, path_hops, gw_interface)
         print_path_summary(path_dict)
 
 
