@@ -162,6 +162,78 @@ def get_prefixes_from_netbox(
         return []
 
 
+def _resolve_mgmt_ip_from_netbox(
+    nb_url: str,
+    nb_token: str,
+    any_ip: str,
+    verify_ssl: bool = True,
+) -> Optional[str]:
+    """Return the primary management IP of the NetBox device that owns *any_ip*.
+
+    Used as a fallback when a direct SSH connection to a routing next-hop IP
+    fails — the next-hop may be a transit or interface IP rather than the
+    management IP of the device.
+
+    Lookup strategy:
+      1. Check whether *any_ip* is itself the primary_ip4 of any device.
+      2. If not, search the IPAM ip_addresses table by address, follow the
+         assignment to the device interface, then return the device primary IP.
+    """
+    try:
+        nb = _get_nb_client(nb_url, nb_token, verify_ssl)
+
+        # Fast path: *any_ip* may already be the primary management IP.
+        for search in (any_ip, f"{any_ip}/32"):
+            devs = nb.get_devices({"primary_ip4": search})
+            if devs:
+                mgmt = nb.get_device_mgmt_ip(devs[0])
+                log.debug("NetBox: %s is primary IP of %s", any_ip, devs[0].get("name", "?"))
+                return mgmt
+
+        # Slow path: find the IP address record and follow assignment → device.
+        ip_recs: list = []
+        for search in (f"{any_ip}/32", any_ip):
+            ip_recs = list(nb.nb.ipam.ip_addresses.filter(address=search))
+            if ip_recs:
+                break
+
+        if not ip_recs:
+            log.debug("NetBox: no IP record found for %s", any_ip)
+            return None
+
+        rec        = ip_recs[0]
+        obj_type   = str(getattr(rec, "assigned_object_type", "") or "")
+        obj_id     = getattr(rec, "assigned_object_id", None)
+
+        if not obj_id:
+            log.debug("NetBox: IP %s is not assigned to any interface", any_ip)
+            return None
+
+        device_id: Optional[int] = None
+        if "dcim.interface" in obj_type:
+            iface = nb.nb.dcim.interfaces.get(obj_id)
+            if iface and iface.device:
+                device_id = int(iface.device.id)
+        # Virtual-machine interfaces are skipped (not SSH-able devices here).
+
+        if not device_id:
+            log.debug("NetBox: cannot determine device for IP %s (obj_type=%s)", any_ip, obj_type)
+            return None
+
+        devs = nb.get_devices({"id": device_id})
+        if devs:
+            mgmt = nb.get_device_mgmt_ip(devs[0])
+            log.debug(
+                "NetBox: resolved interface IP %s → device %s primary IP %s",
+                any_ip, devs[0].get("name", "?"), mgmt,
+            )
+            return mgmt
+
+        return None
+
+    except Exception as exc:
+        log.debug("NetBox IP resolution for %s failed: %s", any_ip, exc)
+        return None
 
 
 
@@ -1053,6 +1125,9 @@ def run_l3_path_trace(
     dst_ip: str,
     initial_routes: List[Dict],
     creds: Dict[str, str],
+    nb_url: str = "",
+    nb_token: str = "",
+    verify_ssl: bool = True,
     max_hops: int = 15,
 ) -> List[List[Dict]]:
     """BFS traversal of all ECMP L3 paths from *gateway_ip* toward *dst_ip*.
@@ -1122,12 +1197,40 @@ def run_l3_path_trace(
 
         print(f"[L3] Hop {len(path_so_far) + 1}: connecting to {current_ip}...")
 
+        # ── Connection with NetBox primary-IP fallback ────────────────────────
+        connect_ip = current_ip
+        client     = None
+        connect_err: str = ""
+
         try:
-            client = _open_device_client(current_ip, "ios", creds)
+            client = _open_device_client(connect_ip, "ios", creds)
         except GatewayConnectionError as exc:
+            connect_err = str(exc)
+            log.debug("Direct connect to %s failed: %s", connect_ip, exc)
+
+            if nb_url and nb_token:
+                print(f"[L3]   Cannot reach {current_ip} — querying NetBox for management IP...")
+                mgmt_ip = _resolve_mgmt_ip_from_netbox(nb_url, nb_token, current_ip, verify_ssl)
+                if mgmt_ip and mgmt_ip != current_ip:
+                    print(f"[L3]   NetBox resolved {current_ip} → {mgmt_ip} — retrying...")
+                    connect_ip = mgmt_ip
+                    try:
+                        client = _open_device_client(connect_ip, "ios", creds)
+                        connect_err = ""
+                    except GatewayConnectionError as exc2:
+                        connect_err = str(exc2)
+                        log.debug("NetBox fallback connect to %s also failed: %s", connect_ip, exc2)
+
+        if client is None:
+            note = f"Cannot connect to {current_ip}"
+            if connect_ip != current_ip:
+                note += f" (also tried NetBox primary {connect_ip})"
+            if connect_err:
+                note += f": {connect_err}"
             complete_paths.append(
                 path_so_far + [{"hostname": current_ip, "ip": current_ip,
-                                "note": f"Cannot connect: {exc}",
+                                "connect_ip": connect_ip,
+                                "note": note,
                                 "ingress_interfaces": [], "egress_routes": []}]
             )
             continue
@@ -1160,12 +1263,13 @@ def run_l3_path_trace(
         current_hop: Dict = {
             "hostname":           hostname,
             "ip":                 current_ip,
+            "connect_ip":         connect_ip,   # may differ from ip when NetBox fallback was used
             "ingress_interfaces": ingress_ifaces,
             "egress_routes":      egress_routes,
             "note":               "",
         }
         new_path    = path_so_far + [current_hop]
-        new_visited = visited | {current_ip}
+        new_visited = visited | {current_ip, connect_ip}  # prevent re-visiting either IP
 
         if not egress_routes:
             current_hop["note"] = "No route to destination"
@@ -1219,7 +1323,9 @@ def print_l3_paths(paths: List[List[Dict]], dst_ip: str) -> None:
             ip       = hop.get("ip", "")
             note     = hop.get("note", "")
 
-            print(f"\n    Hop {hop_num}: {hostname}  ({ip})")
+            connect_ip = hop.get("connect_ip", ip)
+            ip_label   = f"({ip})" if connect_ip == ip else f"({ip})  [connected via {connect_ip}]"
+            print(f"\n    Hop {hop_num}: {hostname}  {ip_label}")
 
             if note:
                 print(f"      [{note}]")
@@ -1330,6 +1436,9 @@ def run_l2_trace(
     source_is_ap: bool,
     device_type: Optional[str] = None,
     max_hops: int = 30,
+    nb_url: str = "",
+    nb_token: str = "",
+    verify_ssl: bool = True,
 ) -> Optional[Dict]:
     """Run the hop-by-hop Layer 2 trace for *target_ip* starting at *gateway_ip*.
 
@@ -1555,6 +1664,9 @@ def run_l2_trace(
             dst_ip               = dst_ip,
             initial_routes       = dst_routes,
             creds                = creds,
+            nb_url               = nb_url,
+            nb_token             = nb_token,
+            verify_ssl           = verify_ssl,
             max_hops             = max_hops,
         )
 
@@ -1740,6 +1852,9 @@ def main() -> int:
         creds        = creds,
         source_is_ap = False,   # CDP stop conditions handle endpoints
         max_hops     = args.max_hops,
+        nb_url       = netbox_url,
+        nb_token     = netbox_token,
+        verify_ssl   = verify_ssl,
     )
 
     if result:
