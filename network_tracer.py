@@ -421,8 +421,14 @@ def _parse_all_routes(output: str) -> List[Dict[str, Optional[str]]]:
     if m:
         global_tag = m.group(1)
 
-    # Global age fallback from "Last update from X on Interface, 2w2d ago"
-    m = re.search(r"Last update from\s+\S+\s+on\s+\S+,\s+(\S+)\s+ago", output, re.IGNORECASE)
+    # Global age fallback from Last update line.
+    # Handles both:
+    #   OSPF/Static: "Last update from X on TwentyFiveGigE1/5/0/3, 2w2d ago"
+    #   BGP:         "Last update from 198.18.255.93 2w4d ago"   (no "on Interface")
+    m = re.search(
+        r"Last update from\s+\S+(?:\s+on\s+\S+,)?\s+(\S+)\s+ago",
+        output, re.IGNORECASE,
+    )
     if m:
         global_age = m.group(1)
 
@@ -443,18 +449,27 @@ def _parse_all_routes(output: str) -> List[Dict[str, Optional[str]]]:
         }
 
     # ── Pattern 1: IOS-XE routing descriptor block (line-by-line) ────────────
-    # Descriptor entry (next-hop IP):
+    #
+    # OSPF / Static descriptor (interface present):
     #   "  * 10.0.0.2, from 198.18.x.x, 2w2d ago, via GigabitEthernet1/0/1"
     #   "    10.0.0.6, from 198.18.x.x, 2w2d ago, via GigabitEthernet1/0/2"
-    # Descriptor entry (directly connected):
-    #   "  * directly connected, via Vlan128"
-    # Per-entry tag:  "      Route tag 91"
-    # Age pattern on descriptor lines: "<token> ago," e.g. "2w2d ago,"
     #
-    _DESC_IP  = re.compile(r"^\s+\*?\s*(\d+\.\d+\.\d+\.\d+),.*?via\s+(\S+)", re.IGNORECASE)
-    _DESC_DC  = re.compile(r"^\s+\*?\s*directly connected,\s+via\s+(\S+)",     re.IGNORECASE)
-    _RTAG_PER = re.compile(r"^\s+Route tag\s+(\d+)",                           re.IGNORECASE)
-    _RAGE_PER = re.compile(r"\b(\S+)\s+ago[,\s]",                              re.IGNORECASE)
+    # BGP internal descriptor (NO interface — recursive next-hop):
+    #   "  * 198.18.255.93, from 198.18.255.93, 2w4d ago"
+    #
+    # Directly connected:
+    #   "  * directly connected, via Vlan128"
+    #
+    # _DESC_IP captures group(1)=next-hop IP, group(2)=interface or None (BGP).
+    # _RAGE_PER uses \b...\b so it matches "2w4d" even at end-of-line.
+    #
+    _DESC_IP  = re.compile(
+        r"^\s+\*?\s*(\d+\.\d+\.\d+\.\d+),(?:.*?via\s+(\S+))?",
+        re.IGNORECASE,
+    )
+    _DESC_DC  = re.compile(r"^\s+\*?\s*directly connected,\s+via\s+(\S+)",  re.IGNORECASE)
+    _RTAG_PER = re.compile(r"^\s+Route tag\s+(\d+)",                        re.IGNORECASE)
+    _RAGE_PER = re.compile(r"\b(\S+)\s+ago\b",                              re.IGNORECASE)
 
     pending: Optional[Dict[str, Optional[str]]] = None
 
@@ -464,9 +479,10 @@ def _parse_all_routes(output: str) -> List[Dict[str, Optional[str]]]:
             if pending is not None:
                 routes.append(pending)
             age_m = _RAGE_PER.search(line)
+            iface = m.group(2).rstrip(",") if m.group(2) else None
             pending = _entry(
                 m.group(1),
-                m.group(2).rstrip(","),
+                iface,
                 age=age_m.group(1) if age_m else None,
             )
             continue
@@ -486,7 +502,8 @@ def _parse_all_routes(output: str) -> List[Dict[str, Optional[str]]]:
         routes.append(pending)
 
     if routes:
-        # Interface fallback: "Last update from X on GigabitEthernet1/0/1"
+        # Interface fallback for entries that have a next-hop but no interface.
+        # Handles OSPF: "Last update from X on TwentyFiveGigE1/5/0/3, 2w2d ago"
         fb = re.search(r"Last update from\s+\S+\s+on\s+(\S+),", output, re.IGNORECASE)
         for r in routes:
             if not r["exit_interface"] and fb:
