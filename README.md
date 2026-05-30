@@ -19,6 +19,7 @@ classes (`CiscoDeviceClient`, `NetBoxClient`) and two runnable programs.
 | `netbox_ap.py` | CDP-based Cisco Access Point discovery — creates/updates AP devices, interfaces, IPs, and `software_version` in NetBox |
 | `netbox_shoretel.py` | LLDP-based ShoreTel and Mitel IP phone discovery — creates/updates phone devices, interfaces, IPs, cables, and `software_version` / `last_seen` in NetBox |
 | `netbox_device_modules.py` | Hardware module inventory sync — reads `show inventory` from Cisco devices and creates/updates linecards, supervisors, and power supplies in NetBox |
+| `network_tracer.py` | Network path tracer — reconstructs the hop-by-hop path between two IPs using NetBox, ARP/NDP, MAC tables, CDP/LLDP, VRFs, FHRP, and routing tables; IPv4 + IPv6; parallel ECMP |
 | `example_usage.py` | Short usage examples for both classes |
 | `requirements.txt` | Python package dependencies |
 
@@ -2245,4 +2246,364 @@ python netbox_device_modules.py --site-slug dc1
 
 # Legacy shorthand (equivalent to --device-filter)
 python netbox_device_modules.py --site dc1 --role distribution --limit 10
+```
+
+---
+
+## Running `network_tracer.py`
+
+`network_tracer.py` reconstructs the hop-by-hop path between two IP addresses
+by walking the live network via SSH.  At each hop it collects:
+
+- **Routing table** — best and ECMP routes (`show ip route` / `show ipv6 route`)
+- **ARP / NDP** — layer-3 to MAC resolution (`show ip arp` / `show ipv6 neighbors`)
+- **MAC address table** — port-level end-host location
+- **Port-channel members** — resolves LAGs to physical interfaces
+- **CDP / LLDP** — identifies the next device on each egress port
+- **VRF awareness** — follows routes across VRF boundaries
+- **FHRP detection** — recognises HSRP / VRRP / GLBP virtual gateways (IPv4)
+- **ECMP** — parallel tracing of all equal-cost paths
+
+Supports Cisco IOS, IOS-XE, and NX-OS.  Supports both IPv4 and IPv6.
+
+**Output files** (written to `--out-dir`, default: current directory):
+
+| File | Contents |
+|---|---|
+| `trace_<src>_to_<dst>_<timestamp>.json` | Full hop-by-hop detail (all fields) |
+| `trace_<src>_to_<dst>_<timestamp>.csv` | Summary table — one row per hop |
+| `network_tracer.log` | Full debug / info log (appended across runs) |
+
+Logs also go to **stderr**; a console summary table is printed to **stdout**.
+
+---
+
+### Prerequisites
+
+```bash
+pip install netmiko pynetbox
+```
+
+NetBox must have the source or destination device (or the first-hop router)
+registered with a management IP so `network_tracer.py` can open the first SSH
+session.  Subsequent hops are resolved via ARP/NDP and CDP/LLDP and do not
+require NetBox entries, though entries improve accuracy.
+
+---
+
+### Quickstart — credentials from Vault environment variables
+
+**Linux / macOS (bash/zsh):**
+```bash
+export VAULT_ADDR=https://vault.example.org
+export VAULT_ROLE_ID=your-role-id
+export VAULT_SECRET_ID=your-secret-id
+
+python network_tracer.py 10.1.10.5 10.2.20.100
+```
+
+**Windows PowerShell:**
+```powershell
+$env:VAULT_ADDR      = "https://vault.example.org"
+$env:VAULT_ROLE_ID   = "your-role-id"
+$env:VAULT_SECRET_ID = "your-secret-id"
+
+python network_tracer.py 10.1.10.5 10.2.20.100
+```
+
+### Quickstart — direct CLI credentials
+
+```bash
+python network_tracer.py \
+    --netbox-url   https://netbox.example.org \
+    --netbox-token your-api-token \
+    --username     svc-netauto \
+    --password     s3cr3t \
+    10.1.10.5 10.2.20.100
+```
+
+Or use environment variables (no flags needed on repeated runs):
+
+```bash
+export NETBOX_URL=https://netbox.example.org
+export NETBOX_TOKEN=your-api-token
+export DEVICE_USER=svc-netauto
+export DEVICE_PASS=s3cr3t
+
+python network_tracer.py 10.1.10.5 10.2.20.100
+```
+
+---
+
+### IPv4 trace
+
+```bash
+python network_tracer.py 10.1.10.5 10.2.20.100
+```
+
+### IPv6 trace
+
+IPv4 and IPv6 addresses are detected automatically — just pass an IPv6 address:
+
+```bash
+python network_tracer.py 2001:db8:1::5 2001:db8:2::100
+```
+
+IPv6 hops use `show ipv6 neighbors` (NDP) instead of ARP and `show ipv6 route`
+for routing lookups.  FHRP detection is skipped for IPv6 (FHRP is IPv4-only).
+
+### Reverse trace
+
+Run the forward trace and then automatically repeat in the opposite direction
+(`dst → src`):
+
+```bash
+python network_tracer.py \
+    10.1.10.5 10.2.20.100 \
+    --reverse
+```
+
+Both traces are written to separate output files and printed as separate console
+tables.
+
+### Parallel ECMP tracing
+
+When a router has multiple equal-cost routes to the destination, `--ecmp` opens
+a parallel SSH session per path and traces all branches simultaneously:
+
+```bash
+python network_tracer.py \
+    10.1.10.5 10.2.20.100 \
+    --ecmp
+```
+
+Each ECMP branch is labelled in the console table (`branch` column) and in the
+JSON/CSV output.  Without `--ecmp` the tracer follows only the first route
+returned by the device.
+
+### Custom output directory
+
+```bash
+python network_tracer.py \
+    10.1.10.5 10.2.20.100 \
+    --out-dir /var/log/netauto/traces
+```
+
+### Increase max hops
+
+The default limit is 30 hops.  Increase it for large or multi-region networks:
+
+```bash
+python network_tracer.py \
+    10.1.10.5 10.2.20.100 \
+    --max-hops 60
+```
+
+### Enable debug logging
+
+```bash
+python network_tracer.py \
+    10.1.10.5 10.2.20.100 \
+    --verbose
+```
+
+### SSH enable secret
+
+Required on IOS devices that demand an enable password before running `show`
+commands:
+
+```bash
+python network_tracer.py \
+    --secret en4bl3s3cr3t \
+    10.1.10.5 10.2.20.100
+```
+
+Or set the environment variable `DEVICE_SECRET`.
+
+### Disable TLS verification for NetBox
+
+```bash
+python network_tracer.py \
+    --no-ssl-verify \
+    10.1.10.5 10.2.20.100
+```
+
+---
+
+### Console output example
+
+```
+Tracing 10.1.10.5  →  10.2.20.100
+───────────────────────────────────────────────────────────────────────────────────────────────
+Hop  Device            IP            Ingress          Egress           VRF      Next-hop         Next-device       Method  Branch  Notes
+───────────────────────────────────────────────────────────────────────────────────────────────
+  1  core-rtr-01       10.0.0.1      Vlan10           GigabitEthernet0/1  global   10.0.1.2         dist-sw-01        cdp     0
+  2  dist-sw-01        10.0.1.1      GigabitEthernet0/0  GigabitEthernet0/2  global   10.0.2.2         acc-sw-01         cdp     0
+  3  acc-sw-01         10.0.2.1      GigabitEthernet1/0/1  GigabitEthernet1/0/24  global   10.2.20.100      —                 mac     0
+───────────────────────────────────────────────────────────────────────────────────────────────
+Trace complete: 3 hops  (elapsed: 4.21 s)
+Output: trace_10.1.10.5_to_10.2.20.100_20260530T141523.json
+        trace_10.1.10.5_to_10.2.20.100_20260530T141523.csv
+```
+
+**ECMP console example** (two equal-cost paths through `dist-sw-01` and
+`dist-sw-02`):
+
+```
+Hop  Device            Egress                Next-hop         Next-device       Method  Branch
+  1  core-rtr-01       GigabitEthernet0/1    10.0.1.2         dist-sw-01        cdp     1
+  1  core-rtr-01       GigabitEthernet0/2    10.0.2.2         dist-sw-02        cdp     2
+  2  dist-sw-01        GigabitEthernet0/2    10.0.3.1         acc-sw-01         cdp     1
+  2  dist-sw-02        GigabitEthernet0/2    10.0.3.1         acc-sw-01         cdp     2
+  3  acc-sw-01         GigabitEthernet1/0/24 10.2.20.100      —                 mac     1
+  3  acc-sw-01         GigabitEthernet1/0/24 10.2.20.100      —                 mac     2
+```
+
+---
+
+### JSON output example
+
+```json
+{
+  "src_ip": "10.1.10.5",
+  "dst_ip": "10.2.20.100",
+  "timestamp": "2026-05-30T14:15:23Z",
+  "elapsed_seconds": 4.21,
+  "hops": [
+    {
+      "hop_number": 1,
+      "device_name": "core-rtr-01",
+      "device_ip": "10.0.0.1",
+      "ingress_interface": "Vlan10",
+      "egress_interface": "GigabitEthernet0/1",
+      "vrf": "global",
+      "next_hop_ip": "10.0.1.2",
+      "next_device_name": "dist-sw-01",
+      "method": "cdp",
+      "branch": 0,
+      "ecmp_total": 1,
+      "notes": [],
+      "arp_entry": {
+        "ip": "10.0.1.2",
+        "mac": "aabb.cc00.0200",
+        "interface": "GigabitEthernet0/1",
+        "vrf": "global"
+      },
+      "cdp_neighbor": {
+        "local_interface": "GigabitEthernet0/1",
+        "neighbor_device": "dist-sw-01",
+        "neighbor_interface": "GigabitEthernet0/0",
+        "neighbor_ip": "10.0.1.2",
+        "platform": "cisco WS-C3850",
+        "capabilities": "Switch",
+        "protocol": "CDP"
+      },
+      "route": {
+        "prefix": "10.2.0.0/16",
+        "next_hop": "10.0.1.2",
+        "egress_iface": "GigabitEthernet0/1",
+        "proto": "ospf",
+        "ad": 110,
+        "metric": 20,
+        "vrf": "global"
+      }
+    },
+    {
+      "hop_number": 3,
+      "device_name": "acc-sw-01",
+      "device_ip": "10.0.2.1",
+      "ingress_interface": "GigabitEthernet1/0/1",
+      "egress_interface": "GigabitEthernet1/0/24",
+      "vrf": "global",
+      "next_hop_ip": "10.2.20.100",
+      "next_device_name": "",
+      "method": "mac",
+      "branch": 0,
+      "ecmp_total": 1,
+      "notes": ["destination reached"],
+      "arp_entry": null,
+      "cdp_neighbor": null,
+      "route": null
+    }
+  ]
+}
+```
+
+---
+
+### CSV output example
+
+```csv
+hop,device_name,device_ip,ingress_interface,egress_interface,vrf,next_hop_ip,next_device_name,method,branch,ecmp_total,notes
+1,core-rtr-01,10.0.0.1,Vlan10,GigabitEthernet0/1,global,10.0.1.2,dist-sw-01,cdp,0,1,
+2,dist-sw-01,10.0.1.1,GigabitEthernet0/0,GigabitEthernet0/2,global,10.0.2.2,acc-sw-01,cdp,0,1,
+3,acc-sw-01,10.0.2.1,GigabitEthernet1/0/1,GigabitEthernet1/0/24,global,10.2.20.100,,mac,0,1,destination reached
+```
+
+---
+
+### `method` field values
+
+| Value | Meaning |
+|---|---|
+| `cdp` | Next device identified by CDP neighbor on egress port |
+| `lldp` | Next device identified by LLDP neighbor (non-Cisco peer) |
+| `arp` | Next hop resolved via ARP table only (no CDP/LLDP entry found) |
+| `ndp` | Next hop resolved via NDP (IPv6 neighbor discovery) |
+| `mac` | Destination MAC found in MAC address table — end of path |
+| `fhrp` | Egress interface is an FHRP virtual gateway (HSRP / VRRP / GLBP) |
+| `netbox` | Next device resolved directly from NetBox IP records |
+| `unknown` | Hop recorded but next device could not be identified |
+
+---
+
+### Credential environment variables
+
+| Variable | CLI flag equivalent | Description |
+|---|---|---|
+| `NETBOX_URL` | `--netbox-url` | NetBox base URL |
+| `NETBOX_TOKEN` | `--netbox-token` | NetBox API token |
+| `DEVICE_USER` | `--username` | SSH username |
+| `DEVICE_PASS` | `--password` | SSH password |
+| `DEVICE_SECRET` | `--secret` | Enable secret (optional) |
+
+When Vault is configured all five variables and their CLI counterparts are
+ignored — credentials come from the Vault secret exclusively.
+
+---
+
+### All `network_tracer.py` CLI flags
+
+```
+usage: network_tracer.py [-h] [options] src_ip dst_ip
+
+  Positional arguments:
+    src_ip                Source IP address (IPv4 or IPv6)
+    dst_ip                Destination IP address (IPv4 or IPv6)
+
+  NetBox (ignored when Vault is configured):
+    --netbox-url URL      NetBox base URL (env: NETBOX_URL)
+    --netbox-token TOKEN  NetBox API token (env: NETBOX_TOKEN)
+    --no-ssl-verify       Disable TLS verification for NetBox
+
+  Device credentials (ignored when Vault is configured):
+    --username USER       SSH username (env: DEVICE_USER)
+    --password PASS       SSH password (env: DEVICE_PASS)
+    --secret SECRET       Enable secret (env: DEVICE_SECRET)
+    --timeout SEC         SSH timeout in seconds (default: 30)
+
+  Trace options:
+    --reverse             Also run reverse trace (dst → src)
+    --ecmp                Trace all ECMP paths in parallel (one SSH session per path)
+    --max-hops N          Max hops before stopping (default: 30)
+    --out-dir PATH        Output directory for JSON/CSV files (default: .)
+    --verbose             Enable DEBUG logging
+
+  Vault authentication (optional — overrides --username/--password/--netbox-*):
+    --VAULT_ADDR URL      Vault server address (env: VAULT_ADDR)
+    --VAULT_ROLE_ID ID    AppRole role ID (env: VAULT_ROLE_ID)
+    --VAULT_SECRET_ID ID  AppRole secret ID (env: VAULT_SECRET_ID)
+    --use-env-only        Read Vault credentials from env vars only
+    --vault-mount MOUNT   KV v2 mount point (default: secret)
+    --vault-path PATH     KV v2 secret path (default: network/device)
 ```
