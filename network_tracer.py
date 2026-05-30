@@ -104,18 +104,6 @@ log = logging.getLogger("network_tracer")
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-# NetBox platform slug → CiscoDeviceClient os_type.
-_PLATFORM_MAP: Dict[str, str] = {
-    "ios":      "ios",
-    "ios-xe":   "iosxe",
-    "ios_xe":   "iosxe",
-    "iosxe":    "iosxe",
-    "nxos":     "nxos",
-    "nx-os":    "nxos",
-    "nx_os":    "nxos",
-    "cisco_nx": "nxos",
-}
-
 _VMWARE_KEYWORDS: Tuple[str, ...] = (
     "vmware", "esxi", "vsphere", "vswitch", "vmnic", "esx",
 )
@@ -174,112 +162,21 @@ def get_prefixes_from_netbox(
         return []
 
 
-def get_platform_from_netbox(
-    nb_url: str,
-    nb_token: str,
-    device_ip: str,
-    verify_ssl: bool = True,
-) -> Optional[str]:
-    """Return the NetBox platform slug for the device whose primary IP is *device_ip*."""
-    try:
-        nb = _get_nb_client(nb_url, nb_token, verify_ssl)
-        devices = nb.get_devices({"primary_ip4": device_ip})
-        if not devices:
-            devices = nb.get_devices({"primary_ip4": f"{device_ip}/32"})
-        if not devices:
-            log.debug("No NetBox device found for IP %s", device_ip)
-            return None
-        platform = devices[0].get("platform") or {}
-        slug = platform.get("slug") if isinstance(platform, dict) else None
-        if slug:
-            log.debug("NetBox platform for %s: %s", device_ip, slug)
-        return slug
-    except NetBoxClientError as exc:
-        log.error("NetBox platform lookup failed for %s: %s", device_ip, exc)
-        return None
-    except Exception as exc:
-        log.error("NetBox platform lookup unexpected error for %s: %s", device_ip, exc)
-        return None
 
 
-def is_ap_in_netbox(
-    nb_url: str,
-    nb_token: str,
-    ip: str,
-    verify_ssl: bool = True,
-) -> bool:
-    """Return True if the NetBox device with *ip* as its primary IP is an AP."""
-    try:
-        nb = _get_nb_client(nb_url, nb_token, verify_ssl)
-        devices = nb.get_devices({"primary_ip4": ip})
-        if not devices:
-            devices = nb.get_devices({"primary_ip4": f"{ip}/32"})
-        for dev in devices:
-            role  = dev.get("device_role") or {}
-            dtype = dev.get("device_type")  or {}
-            role_slug  = (role.get("slug",  "") if isinstance(role,  dict) else "").lower()
-            type_model = (dtype.get("model", "") if isinstance(dtype, dict) else "").lower()
-            if any(kw in role_slug or kw in type_model for kw in _AP_ROLE_KEYWORDS):
-                log.debug("Device %s identified as AP via NetBox", ip)
-                return True
-        return False
-    except Exception as exc:
-        log.debug("NetBox AP check failed for %s: %s", ip, exc)
-        return False
 
 
-def _get_device_primary_ip_from_netbox(
-    nb_url: str,
-    nb_token: str,
-    device_name: str,
-    verify_ssl: bool = True,
-) -> Optional[str]:
-    """Return the primary IPv4 address (no prefix-length) for *device_name* in NetBox.
+def resolve_neighbor_ip(neighbor_info: Dict[str, str]) -> Optional[str]:
+    """Return the CDP/LLDP-reported IP for this neighbor.
 
-    Falls back to a short-hostname match when CDP reports an FQDN.
+    Uses only the IP advertised by the neighbor itself — no NetBox lookup.
     """
-    try:
-        nb = _get_nb_client(nb_url, nb_token, verify_ssl)
-        devices = nb.get_devices({"name": device_name})
-        if not devices:
-            short = device_name.split(".")[0]
-            devices = nb.get_devices({"name": short})
-        if not devices:
-            log.debug("No NetBox device found for name %r", device_name)
-            return None
-        return nb.get_device_mgmt_ip(devices[0])
-    except Exception as exc:
-        log.debug("NetBox device IP lookup failed for %r: %s", device_name, exc)
-        return None
-
-
-def resolve_neighbor_ip(
-    neighbor_info: Dict[str, str],
-    nb_url: str,
-    nb_token: str,
-    verify_ssl: bool = True,
-) -> Optional[str]:
-    """Resolve the management IP for a CDP/LLDP neighbor.
-
-    Preference order:
-      1. NetBox primary IP for the device named in ``neighbor_id``
-         (authoritative management address, avoids transit/interface IPs).
-      2. IP address reported directly by CDP/LLDP as a fallback.
-    """
-    neighbor_id = neighbor_info.get("neighbor_id", "")
-    if neighbor_id:
-        nb_ip = _get_device_primary_ip_from_netbox(nb_url, nb_token, neighbor_id, verify_ssl)
-        if nb_ip:
-            log.debug("Resolved neighbor %s -> %s (via NetBox)", neighbor_id, nb_ip)
-            return nb_ip
-
-    cdp_ip = neighbor_info.get("neighbor_ip")
-    if cdp_ip:
-        log.debug("Resolved neighbor %s -> %s (via CDP/LLDP)", neighbor_id, cdp_ip)
-        return cdp_ip
-
-    log.debug("Cannot resolve management IP for neighbor %r", neighbor_id)
-    return None
+    ip = neighbor_info.get("neighbor_ip")
+    log.debug(
+        "Resolved neighbor %s -> %s (via CDP/LLDP)",
+        neighbor_info.get("neighbor_id", "?"), ip or "None",
+    )
+    return ip
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -333,13 +230,6 @@ def calculate_first_usable_ip(prefix: str) -> Optional[str]:
 # ─────────────────────────────────────────────────────────────────────────────
 # SSH connection helpers
 # ─────────────────────────────────────────────────────────────────────────────
-
-
-def platform_to_os_type(platform_slug: Optional[str]) -> str:
-    """Map a NetBox platform slug to a CiscoDeviceClient os_type. Defaults to 'ios'."""
-    if not platform_slug:
-        return "ios"
-    return _PLATFORM_MAP.get(platform_slug.lower(), "ios")
 
 
 def _open_device_client(
@@ -1168,10 +1058,7 @@ def run_l3_path_trace(
     gw_ingress_interface: Optional[str],
     dst_ip: str,
     initial_routes: List[Dict],
-    nb_url: str,
-    nb_token: str,
     creds: Dict[str, str],
-    verify_ssl: bool,
     max_hops: int = 15,
 ) -> List[List[Dict]]:
     """BFS traversal of all ECMP L3 paths from *gateway_ip* toward *dst_ip*.
@@ -1237,11 +1124,8 @@ def run_l3_path_trace(
 
         print(f"[L3] Hop {len(path_so_far) + 1}: connecting to {current_ip}...")
 
-        platform_slug   = get_platform_from_netbox(nb_url, nb_token, current_ip, verify_ssl)
-        current_dtype   = platform_to_os_type(platform_slug)
-
         try:
-            client = _open_device_client(current_ip, current_dtype, creds)
+            client = _open_device_client(current_ip, "ios", creds)
         except GatewayConnectionError as exc:
             complete_paths.append(
                 path_so_far + [{"hostname": current_ip, "ip": current_ip,
@@ -1348,6 +1232,7 @@ def print_l3_paths(paths: List[List[Dict]], dst_ip: str) -> None:
                 iface  = r.get("exit_interface", "")
                 src    = r.get("route_source", "")
                 tag    = r.get("route_tag", "")
+                age    = r.get("route_age", "")
                 line   = f"      Route   : {prefix}  via {nh}"
                 if iface:
                     line += f"  [{iface}]"
@@ -1355,6 +1240,8 @@ def print_l3_paths(paths: List[List[Dict]], dst_ip: str) -> None:
                     line += f"  [{src}]"
                 if tag:
                     line += f"  tag:{tag}"
+                if age:
+                    line += f"  age:{age}"
                 print(line)
                 if nh == "directly connected":
                     reached = True
@@ -1376,10 +1263,7 @@ def run_l2_trace(
     target_ip: str,
     dst_ip: str,
     gateway_ip: str,
-    nb_url: str,
-    nb_token: str,
     creds: Dict[str, str],
-    verify_ssl: bool,
     source_is_ap: bool,
     device_type: Optional[str] = None,
     max_hops: int = 30,
@@ -1406,8 +1290,7 @@ def run_l2_trace(
     """
     # ── Phase A: ARP lookup on the gateway (done exactly once) ───────────────
     if device_type is None:
-        platform_slug = get_platform_from_netbox(nb_url, nb_token, gateway_ip, verify_ssl)
-        device_type   = platform_to_os_type(platform_slug)
+        device_type = "ios"  # direct SSH — no NetBox platform lookup
 
     log.info(
         "L2 trace start: target=%s  gateway=%s  device_type=%s",
@@ -1568,7 +1451,7 @@ def run_l2_trace(
             break
 
         # Neighbor is a network device — resolve its management IP and continue.
-        neighbor_ip = resolve_neighbor_ip(neighbor_info, nb_url, nb_token, verify_ssl)
+        neighbor_ip = resolve_neighbor_ip(neighbor_info)
         if not neighbor_ip:
             final_stop_reason = (
                 f"Cannot resolve management IP for "
@@ -1591,8 +1474,7 @@ def run_l2_trace(
         )
 
         visited.add(neighbor_ip)
-        next_platform       = get_platform_from_netbox(nb_url, nb_token, neighbor_ip, verify_ssl)
-        current_device_type = platform_to_os_type(next_platform)
+        current_device_type = "ios"  # direct SSH — no NetBox platform lookup
         current_ip          = neighbor_ip
 
     # ── Inline stop detail ────────────────────────────────────────────────────
@@ -1620,10 +1502,7 @@ def run_l2_trace(
             gw_ingress_interface = gw_interface,
             dst_ip               = dst_ip,
             initial_routes       = dst_routes,
-            nb_url               = nb_url,
-            nb_token             = nb_token,
             creds                = creds,
-            verify_ssl           = verify_ssl,
             max_hops             = max_hops,
         )
         print_l3_paths(l3_paths, dst_ip)
@@ -1784,37 +1663,22 @@ def main() -> int:
         return 1
 
     print(f"[INFO] Gateway IP (first usable): {gateway}")
-    print("[INFO] Fetching gateway platform from NetBox...")
-
-    gw_platform    = get_platform_from_netbox(netbox_url, netbox_token, gateway, verify_ssl)
-    gw_device_type = platform_to_os_type(gw_platform)
-    log.info("Gateway platform: %s -> device_type: %s", gw_platform or "unknown", gw_device_type)
-
     print("[INFO] Attempting connection to gateway...")
     try:
-        hostname = connect_to_device(gateway, creds, device_type=gw_device_type)
+        hostname = connect_to_device(gateway, creds)
         print(f"[SUCCESS] Connected to {hostname}")
     except GatewayConnectionError as exc:
         print(f"[ERROR] Failed to connect: {exc}")
         log.error("Gateway connection failed: %s", exc)
         return 1
 
-    # ── Phase 2: L2 trace (ARP -> MAC table -> port-channel -> CDP/LLDP) ─────
-
-    source_is_ap = is_ap_in_netbox(netbox_url, netbox_token, src_ip, verify_ssl)
-    if source_is_ap:
-        print(f"[INFO] Source {src_ip} is an AP in NetBox — will stop at first switchport")
-
+    # ── Phase 2: L2 + L3 trace ───────────────────────────────────────────────
     run_l2_trace(
         target_ip    = src_ip,
         dst_ip       = args.dst_ip,
         gateway_ip   = gateway,
-        nb_url       = netbox_url,
-        nb_token     = netbox_token,
         creds        = creds,
-        verify_ssl   = verify_ssl,
-        source_is_ap = source_is_ap,
-        device_type  = gw_device_type,  # reuse — avoids a second NetBox platform call
+        source_is_ap = False,   # no NetBox AP lookup — CDP stop conditions handle endpoints
         max_hops     = args.max_hops,
     )
 
