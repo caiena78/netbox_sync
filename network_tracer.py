@@ -1125,6 +1125,81 @@ def print_path_summary(path_dict: Dict) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _run_l2_at_final_hop(
+    client: CiscoDeviceClient,
+    device_type: str,
+    dst_ip: str,
+) -> Dict:
+    """Run a Layer 2 trace for *dst_ip* on the device that has its subnet directly connected.
+
+    Executes the same three-step flow used in the initial L2 trace:
+      1. ``show ip arp <dst_ip>``                    → resolve to MAC address
+      2. ``show mac address-table address <mac>``     → VLAN + switchport
+      3. ``show cdp neighbors <port> detail``         → next-hop device (if any)
+
+    Returns a dict with keys:
+      dst_ip, mac, vlan, port, portchannel_members, cdp_neighbor, error
+    """
+    result: Dict = {
+        "dst_ip":              dst_ip,
+        "mac":                 None,
+        "vlan":                None,
+        "port":                None,
+        "portchannel_members": [],
+        "cdp_neighbor":        None,
+        "error":               None,
+    }
+
+    # Step 1 — ARP lookup
+    print(f"[L2]   show ip arp {dst_ip}")
+    mac = arp_lookup(client, device_type, dst_ip)
+    if not mac:
+        result["error"] = f"No ARP entry for {dst_ip}"
+        return result
+
+    result["mac"] = mac_to_cisco_fmt(mac)
+    print(f"[L2]   ARP: {dst_ip} → {mac_to_cisco_fmt(mac)}")
+
+    # Step 2 — MAC address-table lookup
+    print(f"[L2]   show mac address-table address {mac_to_cisco_fmt(mac)}")
+    mac_entry = mac_table_lookup(client, device_type, mac)
+    if not mac_entry:
+        result["error"] = f"MAC {mac_to_cisco_fmt(mac)} not in address table"
+        return result
+
+    result["vlan"] = mac_entry["vlan"]
+    result["port"] = mac_entry["interface"]
+    print(f"[L2]   MAC table: VLAN={mac_entry['vlan']}  Port={mac_entry['interface']}")
+
+    # Step 2a — port-channel expansion (if applicable)
+    check_iface = mac_entry["interface"]
+    if is_portchannel(mac_entry["interface"]):
+        members = get_portchannel_members(client, device_type, mac_entry["interface"])
+        result["portchannel_members"] = members
+        if members:
+            print(f"[L2]   Port-channel members: {', '.join(members)}")
+            check_iface = members[0]
+
+    # Step 3 — CDP/LLDP neighbor on the resolved physical port
+    print(f"[L2]   show cdp neighbors {check_iface} detail")
+    neighbor = get_neighbor_info(client, device_type, check_iface)
+    if neighbor:
+        result["cdp_neighbor"] = {
+            "hostname": neighbor.get("neighbor_id"),
+            "ip":       neighbor.get("neighbor_ip"),
+            "platform": neighbor.get("platform"),
+            "port":     neighbor.get("remote_port"),
+            "protocol": neighbor.get("protocol", "CDP"),
+        }
+        nid = neighbor.get("neighbor_id", "unknown")
+        nip = neighbor.get("neighbor_ip", "")
+        print(f"[L2]   CDP neighbor: {nid}" + (f" ({nip})" if nip else ""))
+    else:
+        print(f"[L2]   No CDP/LLDP neighbor on {check_iface} — endpoint port")
+
+    return result
+
+
 def run_l3_path_trace(
     gateway_ip: str,
     gw_hostname: str,
@@ -1255,8 +1330,9 @@ def run_l3_path_trace(
             continue
 
         hostname        = current_ip
-        ingress_ifaces: List[str]         = []
-        egress_routes:  List[Dict]        = []
+        ingress_ifaces: List[str]  = []
+        egress_routes:  List[Dict] = []
+        l2_trace:       Optional[Dict] = None
 
         try:
             try:
@@ -1273,6 +1349,12 @@ def run_l3_path_trace(
             print(f"[L3]   show ip route {dst_ip} → egress routes")
             egress_routes = get_routes_for_ip(client, dst_ip)
 
+            # If this device has the destination subnet directly connected,
+            # run the full L2 trace (ARP → MAC table → CDP) while still connected.
+            if any(r.get("next_hop") == "directly connected" for r in egress_routes):
+                print(f"[L3]   {dst_ip} subnet is directly connected — running L2 trace...")
+                l2_trace = _run_l2_at_final_hop(client, "ios", dst_ip)
+
         finally:
             try:
                 client._cli_disconnect()
@@ -1282,9 +1364,10 @@ def run_l3_path_trace(
         current_hop: Dict = {
             "hostname":           hostname,
             "ip":                 current_ip,
-            "connect_ip":         connect_ip,   # may differ from ip when NetBox fallback was used
+            "connect_ip":         connect_ip,
             "ingress_interfaces": ingress_ifaces,
             "egress_routes":      egress_routes,
+            "l2_trace":           l2_trace,
             "note":               "",
         }
         new_path    = path_so_far + [current_hop]
@@ -1391,6 +1474,37 @@ def print_l3_paths(paths: List[List[Dict]], dst_ip: str) -> None:
 
             if reached:
                 print(f"      [DESTINATION REACHED]")
+                l2 = hop.get("l2_trace")
+                if l2:
+                    print(f"\n      Layer 2 Trace  ({l2.get('dst_ip', '')})")
+                    if l2.get("error"):
+                        print(f"        Error       : {l2['error']}")
+                    else:
+                        if l2.get("mac"):
+                            print(f"        ARP MAC     : {l2['mac']}")
+                        if l2.get("vlan"):
+                            print(f"        VLAN        : {l2['vlan']}")
+                        if l2.get("port"):
+                            print(f"        Port        : {l2['port']}")
+                        if l2.get("portchannel_members"):
+                            print(f"        Po members  : {', '.join(l2['portchannel_members'])}")
+                        cdp = l2.get("cdp_neighbor")
+                        if cdp:
+                            name  = cdp.get("hostname", "unknown")
+                            nip   = cdp.get("ip", "")
+                            nport = cdp.get("port", "")
+                            plat  = cdp.get("platform", "")
+                            proto = cdp.get("protocol", "CDP")
+                            print(
+                                f"        {proto} Neighbor: {name}"
+                                + (f"  ({nip})" if nip else "")
+                            )
+                            if nport:
+                                print(f"        Remote Port : {nport}")
+                            if plat:
+                                print(f"        Platform    : {plat}")
+                        else:
+                            print(f"        CDP         : no neighbor on port (endpoint)")
 
     print()
     print(SEP)
