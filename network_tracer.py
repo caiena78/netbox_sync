@@ -703,6 +703,55 @@ def get_route_for_destination(
     return routes
 
 
+def _resolve_ingress_interfaces(
+    client: CiscoDeviceClient,
+    lookup_ip: str,
+) -> List[str]:
+    """Return the physical ingress interface(s) by resolving one BGP recursion level.
+
+    For IGP/static/connected routes, ``show ip route <lookup_ip>`` returns an
+    exit_interface directly.
+
+    For BGP routes the descriptor block has a next-hop IP (the BGP peer/route
+    reflector address) but *no* exit_interface, because BGP uses a recursive
+    next-hop resolved via IGP.  In that case a second ``show ip route <nh>``
+    on the BGP next-hop IP produces the physical interface via IGP.
+
+    Example (from user trace)::
+
+        show ip route 10.254.29.194
+          Known via "bgp 64646" ...
+          * 198.18.255.12, from 198.18.255.12, 2w3d ago   ← no interface
+
+        show ip route 198.18.255.12
+          Known via "ospf 500" ...
+          * 198.18.0.10, via TenGigabitEthernet0/0/2      ← physical interface ✓
+    """
+    ifaces:        List[str] = []
+    recursive_ips: List[str] = []
+
+    for r in get_routes_for_ip(client, lookup_ip):
+        iface = r.get("exit_interface")
+        if iface:
+            if iface not in ifaces:
+                ifaces.append(iface)
+        else:
+            nh = r.get("next_hop")
+            if nh and nh != "directly connected" and nh not in recursive_ips:
+                recursive_ips.append(nh)
+
+    if not ifaces and recursive_ips:
+        for nh_ip in recursive_ips:
+            log.debug("BGP recursive ingress resolution: show ip route %s", nh_ip)
+            print(f"[L3]   BGP recursive: show ip route {nh_ip} → ingress interface")
+            for r in get_routes_for_ip(client, nh_ip):
+                iface = r.get("exit_interface")
+                if iface and iface not in ifaces:
+                    ifaces.append(iface)
+
+    return ifaces
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase 2 — MAC table lookup
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1404,17 +1453,12 @@ def run_l3_path_trace(
             except Exception:
                 pass
 
-            # Reverse-path lookup: show ip route <src_ip> tells us which
-            # interface traffic ARRIVES ON (the interface that faces upstream
-            # toward the source).  Using src_ip works on every hop including
-            # BGP devices where looking up the previous-hop's device IP would
-            # return a recursive route with no direct exit_interface.
+            # Reverse-path lookup: show ip route <src_ip> reveals which
+            # interface traffic ARRIVES ON.  For BGP recursive routes a second
+            # lookup on the BGP next-hop is performed automatically.
             ingress_lookup_ip = src_ip or path_so_far[-1]["ip"]
             print(f"[L3]   show ip route {ingress_lookup_ip} → ingress interface")
-            for r in get_routes_for_ip(client, ingress_lookup_ip):
-                iface = r.get("exit_interface")
-                if iface and iface not in ingress_ifaces:
-                    ingress_ifaces.append(iface)
+            ingress_ifaces = _resolve_ingress_interfaces(client, ingress_lookup_ip)
 
             print(f"[L3]   show ip route {dst_ip} → egress routes")
             egress_routes = get_routes_for_ip(client, dst_ip)
