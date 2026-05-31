@@ -1885,16 +1885,210 @@ Examples:
     out = p.add_argument_group("Output format")
     out.add_argument(
         "--json",
-        action="store_true",
-        default=False,
+        nargs="?",
+        const="trace_result.json",
+        default=None,
+        metavar="FILE",
         help=(
-            "Suppress all console output and print the complete L2+L3 trace "
-            "as a single pretty-printed JSON object.  Progress messages are "
-            "silenced; only the JSON is written to stdout."
+            "Write the complete L2+L3 trace as a pretty-printed JSON object to FILE. "
+            "When FILE is omitted the output goes to trace_result.json. "
+            "All console progress messages are suppressed."
         ),
     )
 
     return p
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JSON flat-path assembly
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _flat_l2_hops(layer2: Dict) -> List[Dict]:
+    """Convert the L2 upstream path to flat hop dicts (non-gateway entries only)."""
+    hops: List[Dict] = []
+    for hop in (layer2.get("path") or []):
+        if hop.get("is_gateway"):
+            continue
+        details: Dict = {}
+        if hop.get("vlan"):
+            try:
+                details["vlan"] = int(hop["vlan"])
+            except (ValueError, TypeError):
+                details["vlan"] = hop["vlan"]
+        egress = hop.get("egress_interface")
+        if egress:
+            details["egress_interface"] = egress
+        mbrs = hop.get("ingress_portchannel_members")
+        if mbrs:
+            details["portchannel_members"] = mbrs
+        hops.append({
+            "layer":     "L2",
+            "device":    hop.get("hostname") or hop.get("switch_ip", "unknown"),
+            "interface": hop.get("ingress_interface") or "—",
+            "details":   details,
+        })
+    return hops
+
+
+def _flat_l3_hops(l3_path: List[Dict]) -> List[Dict]:
+    """Convert one L3 path (list of hop dicts) to flat hop dicts.
+
+    The first hop in *l3_path* is always the gateway (it has ``selected_route``).
+    Subsequent hops are intermediate L3 devices, ending with the hop that has
+    the destination subnet directly connected.  That final hop also carries the
+    ``l2_trace`` result which expands into additional L2 entries.
+    """
+    hops: List[Dict] = []
+
+    for hop in l3_path:
+        note     = hop.get("note", "")
+        hostname = hop.get("hostname") or hop.get("ip", "unknown")
+        ingress  = (hop.get("ingress_interfaces") or [None])[0]
+
+        if note:
+            hops.append({
+                "layer":     "L3",
+                "device":    hostname,
+                "interface": ingress or "—",
+                "details":   {"note": note},
+            })
+            continue
+
+        sel = hop.get("selected_route")  # set only on the gateway hop
+
+        if sel:
+            # Gateway hop — show which ECMP route this path follows.
+            iface   = ingress or "—"
+            details = {k: v for k, v in {
+                "gateway_ip":   hop.get("ip"),
+                "next_hop_ip":  sel.get("next_hop"),
+                "egress_iface": sel.get("exit_interface"),
+                "prefix":       sel.get("prefix"),
+                "route_source": sel.get("route_source"),
+                "route_tag":    sel.get("route_tag"),
+                "route_age":    sel.get("route_age"),
+            }.items() if v is not None}
+        else:
+            # Intermediate or final L3 hop.
+            iface    = ingress or "—"
+            egresses = hop.get("egress_routes") or []
+            dc       = next(
+                (r for r in egresses if r.get("next_hop") == "directly connected"), None
+            )
+            if dc:
+                details = {k: v for k, v in {
+                    "prefix":              dc.get("prefix"),
+                    "connected_interface": dc.get("exit_interface"),
+                    "route_source":        dc.get("route_source"),
+                }.items() if v is not None}
+            elif egresses:
+                r = egresses[0]
+                details = {k: v for k, v in {
+                    "next_hop_ip":  r.get("next_hop"),
+                    "prefix":       r.get("prefix"),
+                    "egress_iface": r.get("exit_interface"),
+                    "route_source": r.get("route_source"),
+                    "route_tag":    r.get("route_tag"),
+                }.items() if v is not None}
+            else:
+                details = {}
+
+        hops.append({
+            "layer":     "L3",
+            "device":    hostname,
+            "interface": iface,
+            "details":   details,
+        })
+
+        # L2 trace at the final hop (destination subnet is directly connected).
+        l2t = hop.get("l2_trace")
+        if l2t and not l2t.get("error"):
+            vlan_raw = l2t.get("vlan")
+            l2_det: Dict = {}
+            if l2t.get("mac"):
+                l2_det["mac"] = l2t["mac"]
+            if vlan_raw is not None:
+                try:
+                    l2_det["vlan"] = int(vlan_raw)
+                except (ValueError, TypeError):
+                    l2_det["vlan"] = vlan_raw
+            mbrs = l2t.get("portchannel_members")
+            if mbrs:
+                l2_det["portchannel_members"] = mbrs
+
+            hops.append({
+                "layer":     "L2",
+                "device":    hostname,
+                "interface": l2t.get("port") or "—",
+                "details":   l2_det,
+            })
+
+            cdp = l2t.get("cdp_neighbor")
+            if cdp and cdp.get("hostname"):
+                cdp_det = {k: v for k, v in {
+                    "protocol": cdp.get("protocol", "CDP"),
+                    "ip":       cdp.get("ip"),
+                    "platform": cdp.get("platform"),
+                }.items() if v is not None}
+                hops.append({
+                    "layer":     "L2",
+                    "device":    cdp["hostname"],
+                    "interface": cdp.get("port") or "—",
+                    "details":   cdp_det,
+                })
+
+    return hops
+
+
+def build_flat_paths(result: Dict) -> List[Dict]:
+    """Transform the combined trace result into a JSON array of flat path objects.
+
+    Each entry in the returned list is ONE complete path from source to destination.
+    When multiple ECMP L3 routes exist the L2 segment is duplicated so every
+    L3 route appears as an independent, self-contained path object.
+
+    Path structure per object:
+      src_ip, dst_ip, gateway_ip, path: [
+        {layer: "L2"|"L3", device: str, interface: str, details: {…}}, …
+      ]
+    """
+    src_ip     = result.get("src_ip", "")
+    dst_ip     = result.get("dst_ip", "")
+    gateway_ip = result.get("gateway_ip", "")
+    layer2     = result.get("layer2") or {}
+    layer3     = result.get("layer3") or []
+
+    # Shared L2 prefix: switches between the source device and the gateway.
+    l2_prefix = _flat_l2_hops(layer2)
+
+    if not layer3:
+        # L2-only result or trace that never reached L3 routing.
+        return [{
+            "src_ip":     src_ip,
+            "dst_ip":     dst_ip,
+            "gateway_ip": gateway_ip,
+            "path":       l2_prefix,
+        }]
+
+    # One flat path object per ECMP route.
+    paths: List[Dict] = []
+    for l3_path in layer3:
+        if not l3_path:
+            continue
+        paths.append({
+            "src_ip":     src_ip,
+            "dst_ip":     dst_ip,
+            "gateway_ip": gateway_ip,
+            "path":       l2_prefix + _flat_l3_hops(l3_path),
+        })
+
+    return paths or [{
+        "src_ip":     src_ip,
+        "dst_ip":     dst_ip,
+        "gateway_ip": gateway_ip,
+        "path":       l2_prefix,
+    }]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1907,13 +2101,15 @@ def main() -> int:
     args   = parser.parse_args()
     _configure_logging(verbose=args.verbose)
 
-    json_mode    = args.json
+    # args.json is None (flag absent), or a filename string (flag present).
+    json_file    = args.json               # e.g. "trace_result.json" or custom name
+    json_mode    = json_file is not None
     _orig_stdout = sys.stdout
     _trace_result: Optional[Dict] = None   # set inside try; read by finally
 
     # In JSON mode redirect stdout so no progress messages appear.
     # The finally block always runs (even after early return 1) and
-    # outputs the JSON blob — or an error object when the trace fails.
+    # writes the JSON file — or an error object when the trace fails.
     if json_mode:
         sys.stdout = io.StringIO()
 
@@ -2024,14 +2220,27 @@ def main() -> int:
     finally:
         if json_mode:
             sys.stdout = _orig_stdout
+
             if _trace_result is not None:
-                print(json.dumps(_trace_result, indent=2, default=str))
+                flat   = build_flat_paths(_trace_result)
+                output = json.dumps(flat, indent=2, default=str)
             else:
-                print(json.dumps({
+                output = json.dumps([{
                     "error":   "Trace did not complete — see log file for details",
                     "src_ip":  getattr(args, "src_ip",  ""),
                     "dst_ip":  getattr(args, "dst_ip",  ""),
-                }, indent=2))
+                }], indent=2)
+
+            try:
+                with open(json_file, "w", encoding="utf-8") as fh:
+                    fh.write(output)
+                    fh.write("\n")
+                print(f"[JSON] Trace written to {json_file}", file=sys.stderr)
+            except OSError as exc:
+                print(
+                    f"[ERROR] Cannot write JSON to {json_file!r}: {exc}",
+                    file=sys.stderr,
+                )
 
 
 if __name__ == "__main__":
