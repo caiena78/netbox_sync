@@ -669,7 +669,10 @@ def get_routes_for_ip(client: CiscoDeviceClient, ip: str) -> List[Dict[str, Opti
         log.error("Route lookup for %s failed: %s", ip, exc)
         return []
     log.debug("show ip route %s:\n%s", ip, output)
-    return _parse_all_routes(output)
+    routes = _parse_all_routes(output)
+    for r in routes:
+        r["exit_interface"] = _clean_iface(r.get("exit_interface"))
+    return routes
 
 
 def get_gateway_interface(client: CiscoDeviceClient, gateway_ip: str) -> Optional[str]:
@@ -710,6 +713,28 @@ _IFACE_RE = re.compile(
     r"|TenGigabitEthernet|Port-channel|port-channel|ae|bundle)",
     re.IGNORECASE,
 )
+
+# Validates a string as a real Cisco/NX-OS interface name.
+# Rejects garbage values like "[1/0]", "1/0", empty strings, etc.
+_VALID_IFACE_RE = re.compile(
+    r"^(?:GigabitEthernet|TenGigabitEthernet|TwentyFiveGigE|HundredGigE"
+    r"|FortyGigabitEthernet|FastEthernet|Ethernet"
+    r"|Port-channel|port-channel|Bundle-Ether|bundle-ether"
+    r"|Vlan|Loopback|Tunnel|Serial|Management|mgmt"
+    r"|Gi|Te|Twe|Hu|Fo|Fa|Eth|Po|Lo|Tu|Se|Mg|ae|BE)\d",
+    re.IGNORECASE,
+)
+
+
+def _clean_iface(iface: Optional[str]) -> Optional[str]:
+    """Return *iface* unchanged if it looks like a valid Cisco interface, else None.
+
+    Rejects values like ``[1/0]``, ``1/0``, ``—``, or empty strings that
+    occasionally appear when route parsing produces a non-interface token.
+    """
+    if not iface:
+        return None
+    return iface if _VALID_IFACE_RE.match(iface) else None
 
 
 def _parse_mac_table_output(output: str, mac: str) -> Optional[Dict[str, str]]:
@@ -1245,6 +1270,7 @@ def run_l3_path_trace(
     dst_ip: str,
     initial_routes: List[Dict],
     creds: Dict[str, str],
+    src_ip: str = "",
     nb_url: str = "",
     nb_token: str = "",
     verify_ssl: bool = True,
@@ -1253,7 +1279,7 @@ def run_l3_path_trace(
     """BFS traversal of all ECMP L3 paths from *gateway_ip* toward *dst_ip*.
 
     At every hop:
-      - ``show ip route <prev_ip>``  → ingress interfaces (how traffic arrived)
+      - ``show ip route <src_ip>``   → ingress interface (reverse-path to source)
       - ``show ip route <dst_ip>``   → egress routes (all ECMP next-hops onward)
 
     Each unique next-hop spawns a new path branch.  Returns a list of
@@ -1378,11 +1404,17 @@ def run_l3_path_trace(
             except Exception:
                 pass
 
-            prev_ip = path_so_far[-1]["ip"]
-            print(f"[L3]   show ip route {prev_ip} → ingress interfaces")
-            for r in get_routes_for_ip(client, prev_ip):
-                if r.get("exit_interface") and r["exit_interface"] not in ingress_ifaces:
-                    ingress_ifaces.append(r["exit_interface"])
+            # Reverse-path lookup: show ip route <src_ip> tells us which
+            # interface traffic ARRIVES ON (the interface that faces upstream
+            # toward the source).  Using src_ip works on every hop including
+            # BGP devices where looking up the previous-hop's device IP would
+            # return a recursive route with no direct exit_interface.
+            ingress_lookup_ip = src_ip or path_so_far[-1]["ip"]
+            print(f"[L3]   show ip route {ingress_lookup_ip} → ingress interface")
+            for r in get_routes_for_ip(client, ingress_lookup_ip):
+                iface = r.get("exit_interface")
+                if iface and iface not in ingress_ifaces:
+                    ingress_ifaces.append(iface)
 
             print(f"[L3]   show ip route {dst_ip} → egress routes")
             egress_routes = get_routes_for_ip(client, dst_ip)
@@ -1835,6 +1867,7 @@ def run_l2_trace(
             dst_ip               = dst_ip,
             initial_routes       = dst_routes,
             creds                = creds,
+            src_ip               = target_ip,
             nb_url               = nb_url,
             nb_token             = nb_token,
             verify_ssl           = verify_ssl,
@@ -2008,7 +2041,7 @@ def _flat_l3_hops(l3_path: List[Dict]) -> List[Dict]:
     for hop in l3_path:
         note     = hop.get("note", "")
         hostname = hop.get("hostname") or hop.get("ip", "unknown")
-        ingress  = (hop.get("ingress_interfaces") or [None])[0]
+        ingress  = _clean_iface((hop.get("ingress_interfaces") or [None])[0])
 
         if note:
             hops.append({
