@@ -943,6 +943,236 @@ def get_portchannel_members(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Phase 2 — interface detail (show interface <name>)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_interface_detail_nxos(output: str) -> Dict:
+    """Parse NX-OS ``show interface <name>`` output into a flat detail dict.
+
+    Returned keys (all may be ``None`` when not found in the output):
+      state, description, speed, duplex,
+      rx_runts, rx_giants, rx_crc, rx_input_error, rx_input_discard,
+      tx_output_error, tx_output_discard
+    """
+    def _int(m: Optional[re.Match]) -> Optional[int]:
+        return int(m.group(1)) if m else None
+
+    result: Dict = {
+        "state":            None,
+        "description":      None,
+        "speed":            None,
+        "duplex":           None,
+        "rx_runts":         None,
+        "rx_giants":        None,
+        "rx_crc":           None,
+        "rx_input_error":   None,
+        "rx_input_discard": None,
+        "tx_output_error":  None,
+        "tx_output_discard": None,
+    }
+    if not output:
+        return result
+
+    # ── State ─────────────────────────────────────────────────────────────────
+    # "port-channel31 is up" / "Ethernet1/1 is down" / "... admin state is down"
+    m = re.search(
+        r"^\S+\s+is\s+(up|down|administratively\s+down)",
+        output, re.IGNORECASE | re.MULTILINE,
+    )
+    if m:
+        result["state"] = m.group(1).lower().replace("  ", " ")
+
+    # ── Description ───────────────────────────────────────────────────────────
+    m = re.search(r"Description:\s*(.+)", output, re.IGNORECASE)
+    if m:
+        result["description"] = m.group(1).strip()
+
+    # ── Duplex ────────────────────────────────────────────────────────────────
+    m = re.search(r"\b(full|half)[\s-]?duplex\b", output, re.IGNORECASE)
+    if m:
+        raw = m.group(0).lower().strip()
+        result["duplex"] = re.sub(r"\s+", "-", raw) if " " in raw else raw
+
+    # ── Speed ─────────────────────────────────────────────────────────────────
+    # e.g. "100 Gb/s", "10 Gb/s", "1000 Mb/s"
+    m = re.search(r"\b(\d+(?:\.\d+)?\s*[GMK]b/s)\b", output, re.IGNORECASE)
+    if m:
+        result["speed"] = m.group(1).strip()
+
+    # ── RX / TX sections ─────────────────────────────────────────────────────
+    # NX-OS uses "  RX\n" and "  TX\n" as section headers.
+    rx_m = re.search(r"^\s+RX\s*$", output, re.MULTILINE)
+    tx_m = re.search(r"^\s+TX\s*$", output, re.MULTILINE)
+
+    if rx_m and tx_m:
+        rx_text = output[rx_m.end(): tx_m.start()]
+        tx_text = output[tx_m.end():]
+    elif rx_m:
+        rx_text = output[rx_m.end():]
+        tx_text = ""
+    else:
+        rx_text = output
+        tx_text = output
+
+    result["rx_runts"]         = _int(re.search(r"(\d+)\s+runts\b",         rx_text, re.I))
+    result["rx_giants"]        = _int(re.search(r"(\d+)\s+giants\b",        rx_text, re.I))
+    result["rx_crc"]           = _int(re.search(r"(\d+)\s+CRC\b",           rx_text, re.I))
+    result["rx_input_error"]   = _int(re.search(r"(\d+)\s+input\s+error\b", rx_text, re.I))
+    result["rx_input_discard"] = _int(re.search(r"(\d+)\s+input\s+discard\b", rx_text, re.I))
+
+    if tx_text:
+        result["tx_output_error"]   = _int(re.search(r"(\d+)\s+output\s+error\b",   tx_text, re.I))
+        result["tx_output_discard"] = _int(re.search(r"(\d+)\s+output\s+discard\b", tx_text, re.I))
+
+    return result
+
+
+def _parse_interface_detail_ios(output: str) -> Dict:
+    """Parse IOS/IOS-XE ``show interface <name>`` output into a flat detail dict.
+
+    Returned keys (all may be ``None`` when not found in the output):
+      state, description, speed, duplex,
+      runts, giants, crc, input_error,
+      total_output_drops, output_error, output_discard,
+      unknown_protocol_drops
+    """
+    def _int(m: Optional[re.Match]) -> Optional[int]:
+        return int(m.group(1)) if m else None
+
+    result: Dict = {
+        "state":                 None,
+        "description":           None,
+        "speed":                 None,
+        "duplex":                None,
+        "runts":                 None,
+        "giants":                None,
+        "crc":                   None,
+        "input_error":           None,
+        "total_output_drops":    None,
+        "output_error":          None,
+        "output_discard":        None,
+        "unknown_protocol_drops": None,
+    }
+    if not output:
+        return result
+
+    # ── State ─────────────────────────────────────────────────────────────────
+    # "Port-channel100 is up, line protocol is up (connected)"
+    # Prefer the "line protocol" state since it reflects actual forwarding.
+    m = re.search(r"line\s+protocol\s+is\s+(up|down)", output, re.IGNORECASE)
+    if m:
+        result["state"] = m.group(1).lower()
+    else:
+        m = re.search(
+            r"^\S+\s+is\s+(up|down|administratively\s+down)",
+            output, re.IGNORECASE | re.MULTILINE,
+        )
+        if m:
+            result["state"] = m.group(1).lower().replace("  ", " ")
+
+    # ── Description ───────────────────────────────────────────────────────────
+    m = re.search(r"Description:\s*(.+)", output, re.IGNORECASE)
+    if m:
+        result["description"] = m.group(1).strip()
+
+    # ── Duplex + Speed ────────────────────────────────────────────────────────
+    # "Full-duplex, 1000Mb/s, link type is auto ..."
+    # "Half-duplex, 10Mb/s ..."
+    m = re.search(r"\b(full|half|auto)[- ]?duplex\b", output, re.IGNORECASE)
+    if m:
+        raw = m.group(0).lower().strip()
+        result["duplex"] = re.sub(r"\s+", "-", raw) if " " in raw else raw
+
+    m = re.search(r"\b(\d+(?:\.\d+)?\s*[GMK]b(?:/s|ps)?)\b", output, re.IGNORECASE)
+    if m:
+        result["speed"] = m.group(1).strip()
+
+    # ── Total output drops ────────────────────────────────────────────────────
+    # "Input queue: 0/2000/0/0 ...; Total output drops: 0"
+    result["total_output_drops"] = _int(
+        re.search(r"Total\s+output\s+drops:\s*(\d+)", output, re.I)
+    )
+
+    # ── RX counters ──────────────────────────────────────────────────────────
+    # "0 runts, 0 giants, 0 throttles"
+    result["runts"]  = _int(re.search(r"\b(\d+)\s+runts\b",  output, re.I))
+    result["giants"] = _int(re.search(r"\b(\d+)\s+giants\b", output, re.I))
+
+    # "0 input errors, 0 CRC, 0 frame, 0 overrun, 0 ignored"
+    result["crc"]         = _int(re.search(r"\b(\d+)\s+CRC\b",          output, re.I))
+    result["input_error"] = _int(re.search(r"\b(\d+)\s+input\s+errors?\b", output, re.I))
+
+    # ── TX counters ──────────────────────────────────────────────────────────
+    # "0 output errors, 0 collisions, 0 interface resets"
+    result["output_error"] = _int(re.search(r"\b(\d+)\s+output\s+errors?\b", output, re.I))
+
+    # "0 unknown protocol drops"
+    result["unknown_protocol_drops"] = _int(
+        re.search(r"\b(\d+)\s+unknown\s+protocol\s+drops\b", output, re.I)
+    )
+
+    # output_discard — not always present (optional field)
+    result["output_discard"] = _int(
+        re.search(r"\b(\d+)\s+output\s+discards?\b", output, re.I)
+    )
+
+    return result
+
+
+def get_interface_detail(
+    client: CiscoDeviceClient,
+    device_type: str,
+    interface_name: str,
+) -> Dict:
+    """Run ``show interface <interface_name>`` and return parsed health fields.
+
+    Automatically selects NX-OS or IOS parsing based on the output content
+    (``admin state is`` → NX-OS; ``line protocol is`` → IOS), falling back to
+    the *device_type* hint when neither marker appears.
+
+    On any error (command failure, parse failure) logs at DEBUG level and
+    returns a dict of ``None`` values so callers always receive a consistent
+    shape regardless of device errors or unexpected output formats.
+
+    Works for all interface types already tracked by the tracer:
+      - Physical ports (GigabitEthernetX/Y, EthernetX/Y, etc.)
+      - Port-channels  (Port-channelN)
+      - Subinterfaces  (Port-channelN.M, GigabitEthernetX/Y.Z)
+    """
+    _NXOS_NULL: Dict = {
+        "state": None, "description": None, "speed": None, "duplex": None,
+        "rx_runts": None, "rx_giants": None, "rx_crc": None,
+        "rx_input_error": None, "rx_input_discard": None,
+        "tx_output_error": None, "tx_output_discard": None,
+    }
+    _IOS_NULL: Dict = {
+        "state": None, "description": None, "speed": None, "duplex": None,
+        "runts": None, "giants": None, "crc": None, "input_error": None,
+        "total_output_drops": None, "output_error": None,
+        "output_discard": None, "unknown_protocol_drops": None,
+    }
+
+    if not interface_name:
+        return {}
+
+    try:
+        output = _send_cmd(client, f"show interface {interface_name}")
+    except Exception as exc:
+        log.debug("get_interface_detail(%r): command failed: %s", interface_name, exc)
+        return _NXOS_NULL if "nxos" in device_type.lower() else _IOS_NULL
+
+    if not output or not output.strip():
+        log.debug("get_interface_detail(%r): empty output", interface_name)
+        return _NXOS_NULL if "nxos" in device_type.lower() else _IOS_NULL
+
+    # ── Detect platform from output content ──────────────────────────────────
+    if (re.search(r"\badmin\s+state\s+is\b", output, re.I)
+            or "nxos" in device_type.lower()):
+        return _parse_interface_detail_nxos(output)
+    return _parse_interface_detail_ios(output)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Phase 2 — CDP / LLDP neighbor lookup
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1156,6 +1386,7 @@ def build_path_dict(
             "ingress_portchannel_members": ingress_members,
             "egress_interface":            egress,
             "is_gateway":                  d_idx == 0,
+            "interface_detail":            d_hop.get("interface_detail"),
         })
 
     return {
@@ -1258,6 +1489,7 @@ def _run_l2_at_final_hop(
         "vlan":                None,
         "port":                None,
         "portchannel_members": [],
+        "interface_detail":    None,
         "cdp_neighbor":        None,
         "error":               None,
     }
@@ -1283,7 +1515,12 @@ def _run_l2_at_final_hop(
     result["port"] = mac_entry["interface"]
     print(f"[L2]   MAC table: VLAN={mac_entry['vlan']}  Port={mac_entry['interface']}")
 
-    # Step 2a — port-channel expansion (if applicable)
+    # Step 2a — interface health / counter detail
+    result["interface_detail"] = get_interface_detail(
+        client, device_type, mac_entry["interface"]
+    )
+
+    # Step 2b — port-channel expansion (if applicable)
     check_iface = mac_entry["interface"]
     if is_portchannel(mac_entry["interface"]):
         members = get_portchannel_members(client, device_type, mac_entry["interface"])
@@ -1510,6 +1747,21 @@ def run_l3_path_trace(
             print(f"[L3]   show ip route {dst_ip} → egress routes")
             egress_routes = get_routes_for_ip(client, dst_ip)
 
+            # ── Collect interface detail for ingress + egress interfaces ─────
+            # One show interface call per unique interface name while the
+            # session is still open; failures are silenced inside get_interface_detail.
+            _seen_ifaces: set = set()
+            iface_details: Dict[str, Dict] = {}
+            for _iface in ingress_ifaces:
+                if _iface and _iface not in _seen_ifaces:
+                    iface_details[_iface] = get_interface_detail(client, "ios", _iface)
+                    _seen_ifaces.add(_iface)
+            for _r in egress_routes:
+                _ei = _r.get("exit_interface")
+                if _ei and _ei not in _seen_ifaces:
+                    iface_details[_ei] = get_interface_detail(client, "ios", _ei)
+                    _seen_ifaces.add(_ei)
+
             # If this device has the destination subnet directly connected,
             # run the full L2 trace (ARP → MAC table → CDP) while still connected.
             if any(r.get("next_hop") == "directly connected" for r in egress_routes):
@@ -1528,6 +1780,7 @@ def run_l3_path_trace(
             "connect_ip":         connect_ip,
             "ingress_interfaces": ingress_ifaces,
             "egress_routes":      egress_routes,
+            "interface_details":  iface_details,
             "l2_trace":           l2_trace,
             "note":               "",
         }
@@ -1910,6 +2163,9 @@ def run_l2_trace(
                 else:
                     print(f"[WARN] No members resolved for {interface}")
 
+            # Step 2b — interface health / counter detail
+            iface_detail = get_interface_detail(client, current_device_type, interface)
+
             # Step 3 — CDP/LLDP on the resolved physical interface
             check_iface = portchannel_mbrs[0] if portchannel_mbrs else interface
             print(f"[INFO] Checking CDP/LLDP on {check_iface}...")
@@ -1928,6 +2184,7 @@ def run_l2_trace(
             "vlan":               mac_entry["vlan"],
             "local_interface":    mac_entry["interface"],
             "portchannel_members": portchannel_mbrs,
+            "interface_detail":   iface_detail,
             # remote_port = CDP "outgoing port" on the next-hop switch (toward device).
             # Left as None when this is a stop hop (endpoint / AP / VMware port).
             "remote_port":        neighbor_info.get("remote_port") if neighbor_info else None,
@@ -2120,6 +2377,11 @@ def _flat_l2_hops(layer2: Dict) -> List[Dict]:
             except (ValueError, TypeError):
                 details["vlan"] = hop["vlan"]
 
+        # Merge interface health/counter fields into details (no key conflicts).
+        iface_det = hop.get("interface_detail") or {}
+        if iface_det:
+            details.update(iface_det)
+
         if hop.get("is_gateway"):
             # The gateway's physical ingress port (e.g. Twe1/1/0/43) is the
             # L2 endpoint of the source segment.  It was discovered when the
@@ -2162,9 +2424,11 @@ def _flat_l3_hops(l3_path: List[Dict]) -> List[Dict]:
     hops: List[Dict] = []
 
     for hop in l3_path:
-        note     = hop.get("note", "")
-        hostname = hop.get("hostname") or hop.get("ip", "unknown")
-        ingress  = _clean_iface((hop.get("ingress_interfaces") or [None])[0])
+        note          = hop.get("note", "")
+        hostname      = hop.get("hostname") or hop.get("ip", "unknown")
+        ingress       = _clean_iface((hop.get("ingress_interfaces") or [None])[0])
+        iface_details = hop.get("interface_details") or {}
+        ingress_det   = iface_details.get(ingress, {}) if ingress else {}
 
         if note:
             hops.append({
@@ -2190,6 +2454,9 @@ def _flat_l3_hops(l3_path: List[Dict]) -> List[Dict]:
                 mbrs = l2t.get("portchannel_members")
                 if mbrs:
                     l2_det["portchannel_members"] = mbrs
+                _fb_iface_det = l2t.get("interface_detail") or {}
+                if _fb_iface_det:
+                    l2_det.update(_fb_iface_det)
                 hops.append({
                     "layer":     "L2",
                     "device":    l2_dev,
@@ -2250,6 +2517,10 @@ def _flat_l3_hops(l3_path: List[Dict]) -> List[Dict]:
             else:
                 details = {}
 
+        # Merge ingress interface health/counter fields into the L3 hop details.
+        if ingress_det:
+            details.update(ingress_det)
+
         hops.append({
             "layer":     "L3",
             "device":    hostname,
@@ -2272,6 +2543,10 @@ def _flat_l3_hops(l3_path: List[Dict]) -> List[Dict]:
             mbrs = l2t.get("portchannel_members")
             if mbrs:
                 l2_det["portchannel_members"] = mbrs
+            # Merge port interface health/counter detail from the L2 trace.
+            l2_iface_det = l2t.get("interface_detail") or {}
+            if l2_iface_det:
+                l2_det.update(l2_iface_det)
 
             hops.append({
                 "layer":     "L2",
