@@ -529,6 +529,34 @@ def _parse_all_routes(output: str) -> List[Dict[str, Optional[str]]]:
             "route_age":     age if age is not None else global_age,
         }
 
+    # ── Pattern 0: NX-OS ubest/mbest format ──────────────────────────────────
+    #
+    # NX-OS *via lines (best route marked with *, non-best without):
+    #   "    *via 172.18.0.252, Po12, [110/4], 3w2d, ospf-1, intra"
+    #   "    via 172.18.0.253, Po13, [110/4], 3w2d, ospf-1, intra"
+    # NX-OS directly connected:
+    #   "    *via 0.0.0.0, Vlan128, [0/0], 3w2d, direct"
+    #   "    *via 10.0.0.1, Vlan128, [0/0], 3w2d, local"
+    #
+    # Field order: nexthop-IP, interface, [AD/metric], age, protocol[, type][, tag N]
+    # This block runs before Pattern 1 to prevent NX-OS output from being
+    # misrouted into IOS-style descriptor parsing.
+    if re.search(r"ubest/mbest:", output, re.IGNORECASE):
+        _NXOS_VIA = re.compile(
+            r"^\s+\*?via\s+(\d+\.\d+\.\d+\.\d+),\s+([^\s,]+)"
+            r"(?:,\s+\[[^\]]+\],\s+([^,]+),\s+([^,\s]+))?"  # [AD/metric], age, protocol
+            r"(?:.*?\btag\s+(\d+))?",
+            re.IGNORECASE | re.MULTILINE,
+        )
+        for m in _NXOS_VIA.finditer(output):
+            protocol = (m.group(4) or "").lower()
+            nh       = "directly connected" if protocol in ("direct", "local") else m.group(1)
+            tag      = m.group(5) or global_tag
+            age      = m.group(3).strip() if m.group(3) else None
+            routes.append(_entry(nh, m.group(2), tag=tag, age=age))
+        if routes:
+            return routes
+
     # ── Pattern 1: IOS-XE routing descriptor block (line-by-line) ────────────
     #
     # OSPF / Static descriptor (interface present):
@@ -824,6 +852,14 @@ def get_portchannel_members(
         else:
             output  = _send_cmd(client, "show etherchannel summary")
             members = _parse_ios_portchannel_members(output, po_num)
+            if not members:
+                # Fallback: device_type may be "ios" for a Nexus that was reached
+                # via direct SSH without NetBox platform detection.
+                try:
+                    output  = _send_cmd(client, "show port-channel summary")
+                    members = _parse_nxos_portchannel_members(output, po_num)
+                except Exception:
+                    pass
     except Exception as exc:
         log.error("Port-channel member lookup failed: %s", exc)
         return []
