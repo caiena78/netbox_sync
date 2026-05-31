@@ -1,7 +1,7 @@
 [
   {
     "src_ip": "10.254.29.194",
-    "dst_ip": "10.10.218.49",
+    "dst_ip": "172.28.248.118",
     "gateway_ip": "10.254.28.1",
     "path": [
       {
@@ -29,10 +29,10 @@
           "gateway_ip": "10.254.28.1",
           "next_hop_ip": "10.254.80.14",
           "egress_iface": "TwentyFiveGigE2/5/0/3",
-          "prefix": "10.10.218.0/23",
+          "prefix": "172.28.240.0/20",
           "route_source": "ospf 105",
-          "route_tag": "91",
-          "route_age": "2w3d"
+          "route_tag": "41",
+          "route_age": "4w6d"
         }
       },
       {
@@ -40,78 +40,56 @@
         "device": "EJ-WAN-RTR-02",
         "interface": "TenGigabitEthernet0/0/0",
         "details": {
-          "next_hop_ip": "198.18.255.93",
-          "prefix": "10.10.218.0/23",
+          "next_hop_ip": "198.18.255.43",
+          "prefix": "172.28.240.0/20",
           "route_source": "bgp 65454"
         }
       },
       {
         "layer": "L3",
-        "device": "UMC-WAN-RTR-02",
+        "device": "MFC-WAN-RTR-02",
+        "interface": "TenGigabitEthernet0/0/2",
+        "details": {
+          "next_hop_ip": "10.175.100.21",
+          "prefix": "172.28.240.0/20",
+          "egress_iface": "TenGigabitEthernet0/0/0",
+          "route_source": "eigrp 105"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "chno-6880xl-1",
+        "interface": "TenGigabitEthernet2/1/1",
+        "details": {
+          "next_hop_ip": "10.175.49.5",
+          "prefix": "172.28.240.0/20",
+          "egress_iface": "Port-channel51",
+          "route_source": "eigrp 105"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "DC3-NX9K-02",
+        "interface": "Po45",
+        "details": {
+          "next_hop_ip": "172.28.248.118",
+          "prefix": "172.28.248.118/32",
+          "egress_iface": "Vlan3178"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "172.28.248.118",
         "interface": "\u2014",
         "details": {
-          "next_hop_ip": "172.18.0.145",
-          "prefix": "10.10.218.0/23",
-          "egress_iface": "TenGigabitEthernet0/0/1",
-          "route_source": "ospf 90"
-        }
-      },
-      {
-        "layer": "L3",
-        "device": "UMC-DT-MER-COR-01",
-        "interface": "Eth4/25",
-        "details": {
-          "next_hop_ip": "172.18.0.252",
-          "prefix": "10.10.218.0/23",
-          "egress_iface": "Po12"
-        }
-      },
-      {
-        "layer": "L3",
-        "device": "UMC-DT-MER-DIS-02",
-        "interface": "Port-channel2",
-        "details": {
-          "next_hop_ip": "172.18.4.227",
-          "prefix": "10.10.218.0/23",
-          "egress_iface": "Port-channel30",
-          "route_source": "ospf 1"
-        }
-      },
-      {
-        "layer": "L3",
-        "device": "UMC-DT-Utility-ACC-01",
-        "interface": "Port-channel1",
-        "details": {
-          "next_hop_ip": "172.18.4.231",
-          "prefix": "10.10.218.0/23",
-          "egress_iface": "Port-channel4",
-          "route_source": "ospf 1"
-        }
-      },
-      {
-        "layer": "L3",
-        "device": "UMC-ASC-ACC-01",
-        "interface": "Port-channel1",
-        "details": {
-          "prefix": "10.10.218.0/23",
-          "connected_interface": "Vlan2",
-          "route_source": "connected"
-        }
-      },
-      {
-        "layer": "L2",
-        "device": "UMC-ASC-ACC-01",
-        "interface": "Gi1/0/45",
-        "details": {
-          "mac": "f4a9.97bd.1e04",
-          "vlan": 2
+          "note": "Cannot connect to 172.28.248.118: connection failed for 172.28.248.118: SSH connection timed out to 172.28.248.118: TCP connection to device failed.\n\nCommon causes of this problem are:\n1. Incorrect hostname or IP address.\n2. Wrong TCP port.\n3. Intermediate firewall blocking access.\n\nDevice settings: cisco_ios 172.28.248.118:22\n\n"
         }
       }
     ]
   },
   {
     "src_ip": "10.254.29.194",
-    "dst_ip": "10.10.218.49",
+    "dst_ip": "172.28.248.118",
     "gateway_ip": "10.254.28.1",
     "path": [
       {
@@ -139,10 +117,10 @@
           "gateway_ip": "10.254.28.1",
           "next_hop_ip": "10.254.80.14",
           "egress_iface": "TwentyFiveGigE2/5/0/3",
-          "prefix": "10.10.218.0/23",
+          "prefix": "172.28.240.0/20",
           "route_source": "ospf 105",
-          "route_tag": "91",
-          "route_age": "2w3d"
+          "route_tag": "41",
+          "route_age": "4w6d"
         }
       },
       {
@@ -150,78 +128,232 @@
         "device": "EJ-WAN-RTR-02",
         "interface": "TenGigabitEthernet0/0/0",
         "details": {
-          "next_hop_ip": "198.18.255.93",
-          "prefix": "10.10.218.0/23",
+          "next_hop_ip": "198.18.255.43",
+          "prefix": "172.28.240.0/20",
           "route_source": "bgp 65454"
         }
       },
       {
         "layer": "L3",
-        "device": "UMC-WAN-RTR-02",
+        "device": "MFC-WAN-RTR-02",
+        "interface": "TenGigabitEthernet0/0/2",
+        "details": {
+          "next_hop_ip": "10.175.100.21",
+          "prefix": "172.28.240.0/20",
+          "egress_iface": "TenGigabitEthernet0/0/0",
+          "route_source": "eigrp 105"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "chno-6880xl-1",
+        "interface": "TenGigabitEthernet2/1/1",
+        "details": {
+          "next_hop_ip": "10.175.49.5",
+          "prefix": "172.28.240.0/20",
+          "egress_iface": "Port-channel51",
+          "route_source": "eigrp 105"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "DC3-NX9K-01",
+        "interface": "Po45",
+        "details": {
+          "next_hop_ip": "172.28.248.118",
+          "prefix": "172.28.248.118/32",
+          "egress_iface": "Vlan3178"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "172.28.248.118",
         "interface": "\u2014",
         "details": {
-          "next_hop_ip": "172.18.0.145",
-          "prefix": "10.10.218.0/23",
-          "egress_iface": "TenGigabitEthernet0/0/1",
-          "route_source": "ospf 90"
-        }
-      },
-      {
-        "layer": "L3",
-        "device": "UMC-DT-MER-COR-02",
-        "interface": "Eth4/24",
-        "details": {
-          "next_hop_ip": "172.18.4.27",
-          "prefix": "10.10.218.0/23",
-          "egress_iface": "Po12"
-        }
-      },
-      {
-        "layer": "L3",
-        "device": "UMC-DT-MER-DIS-02",
-        "interface": "Port-channel2",
-        "details": {
-          "next_hop_ip": "172.18.4.227",
-          "prefix": "10.10.218.0/23",
-          "egress_iface": "Port-channel30",
-          "route_source": "ospf 1"
-        }
-      },
-      {
-        "layer": "L3",
-        "device": "UMC-DT-Utility-ACC-01",
-        "interface": "Port-channel1",
-        "details": {
-          "next_hop_ip": "172.18.4.231",
-          "prefix": "10.10.218.0/23",
-          "egress_iface": "Port-channel4",
-          "route_source": "ospf 1"
-        }
-      },
-      {
-        "layer": "L3",
-        "device": "UMC-ASC-ACC-01",
-        "interface": "Port-channel1",
-        "details": {
-          "prefix": "10.10.218.0/23",
-          "connected_interface": "Vlan2",
-          "route_source": "connected"
-        }
-      },
-      {
-        "layer": "L2",
-        "device": "UMC-ASC-ACC-01",
-        "interface": "Gi1/0/45",
-        "details": {
-          "mac": "f4a9.97bd.1e04",
-          "vlan": 2
+          "note": "Cannot connect to 172.28.248.118: connection failed for 172.28.248.118: SSH connection timed out to 172.28.248.118: TCP connection to device failed.\n\nCommon causes of this problem are:\n1. Incorrect hostname or IP address.\n2. Wrong TCP port.\n3. Intermediate firewall blocking access.\n\nDevice settings: cisco_ios 172.28.248.118:22\n\n"
         }
       }
     ]
   },
   {
     "src_ip": "10.254.29.194",
-    "dst_ip": "10.10.218.49",
+    "dst_ip": "172.28.248.118",
+    "gateway_ip": "10.254.28.1",
+    "path": [
+      {
+        "layer": "L2",
+        "device": "C3750S-3H1",
+        "interface": "Gi2/0/19",
+        "details": {
+          "vlan": 128,
+          "egress_interface": "GigabitEthernet1/1/1"
+        }
+      },
+      {
+        "layer": "L2",
+        "device": "EJ-C9606R-CORE",
+        "interface": "Twe1/1/0/43",
+        "details": {
+          "vlan": 128
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "EJ-C9606R-CORE",
+        "interface": "Vlan128",
+        "details": {
+          "gateway_ip": "10.254.28.1",
+          "next_hop_ip": "10.254.80.14",
+          "egress_iface": "TwentyFiveGigE2/5/0/3",
+          "prefix": "172.28.240.0/20",
+          "route_source": "ospf 105",
+          "route_tag": "41",
+          "route_age": "4w6d"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "EJ-WAN-RTR-02",
+        "interface": "TenGigabitEthernet0/0/0",
+        "details": {
+          "next_hop_ip": "198.18.255.43",
+          "prefix": "172.28.240.0/20",
+          "route_source": "bgp 65454"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "MFC-WAN-RTR-02",
+        "interface": "TenGigabitEthernet0/0/2",
+        "details": {
+          "next_hop_ip": "10.175.100.21",
+          "prefix": "172.28.240.0/20",
+          "egress_iface": "TenGigabitEthernet0/0/0",
+          "route_source": "eigrp 105"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "chno-6880xl-1",
+        "interface": "TenGigabitEthernet2/1/1",
+        "details": {
+          "next_hop_ip": "10.175.49.5",
+          "prefix": "172.28.240.0/20",
+          "egress_iface": "Port-channel51",
+          "route_source": "eigrp 105"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "DC3-NX9K-02",
+        "interface": "Po45",
+        "details": {
+          "next_hop_ip": "172.28.248.118",
+          "prefix": "172.28.248.118/32",
+          "egress_iface": "Vlan3178"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "172.28.248.118",
+        "interface": "\u2014",
+        "details": {
+          "note": "Cannot connect to 172.28.248.118: connection failed for 172.28.248.118: SSH connection timed out to 172.28.248.118: TCP connection to device failed.\n\nCommon causes of this problem are:\n1. Incorrect hostname or IP address.\n2. Wrong TCP port.\n3. Intermediate firewall blocking access.\n\nDevice settings: cisco_ios 172.28.248.118:22\n\n"
+        }
+      }
+    ]
+  },
+  {
+    "src_ip": "10.254.29.194",
+    "dst_ip": "172.28.248.118",
+    "gateway_ip": "10.254.28.1",
+    "path": [
+      {
+        "layer": "L2",
+        "device": "C3750S-3H1",
+        "interface": "Gi2/0/19",
+        "details": {
+          "vlan": 128,
+          "egress_interface": "GigabitEthernet1/1/1"
+        }
+      },
+      {
+        "layer": "L2",
+        "device": "EJ-C9606R-CORE",
+        "interface": "Twe1/1/0/43",
+        "details": {
+          "vlan": 128
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "EJ-C9606R-CORE",
+        "interface": "Vlan128",
+        "details": {
+          "gateway_ip": "10.254.28.1",
+          "next_hop_ip": "10.254.80.14",
+          "egress_iface": "TwentyFiveGigE2/5/0/3",
+          "prefix": "172.28.240.0/20",
+          "route_source": "ospf 105",
+          "route_tag": "41",
+          "route_age": "4w6d"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "EJ-WAN-RTR-02",
+        "interface": "TenGigabitEthernet0/0/0",
+        "details": {
+          "next_hop_ip": "198.18.255.43",
+          "prefix": "172.28.240.0/20",
+          "route_source": "bgp 65454"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "MFC-WAN-RTR-02",
+        "interface": "TenGigabitEthernet0/0/2",
+        "details": {
+          "next_hop_ip": "10.175.100.21",
+          "prefix": "172.28.240.0/20",
+          "egress_iface": "TenGigabitEthernet0/0/0",
+          "route_source": "eigrp 105"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "chno-6880xl-1",
+        "interface": "TenGigabitEthernet2/1/1",
+        "details": {
+          "next_hop_ip": "10.175.49.5",
+          "prefix": "172.28.240.0/20",
+          "egress_iface": "Port-channel51",
+          "route_source": "eigrp 105"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "DC3-NX9K-01",
+        "interface": "Po45",
+        "details": {
+          "next_hop_ip": "172.28.248.118",
+          "prefix": "172.28.248.118/32",
+          "egress_iface": "Vlan3178"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "172.28.248.118",
+        "interface": "\u2014",
+        "details": {
+          "note": "Cannot connect to 172.28.248.118: connection failed for 172.28.248.118: SSH connection timed out to 172.28.248.118: TCP connection to device failed.\n\nCommon causes of this problem are:\n1. Incorrect hostname or IP address.\n2. Wrong TCP port.\n3. Intermediate firewall blocking access.\n\nDevice settings: cisco_ios 172.28.248.118:22\n\n"
+        }
+      }
+    ]
+  },
+  {
+    "src_ip": "10.254.29.194",
+    "dst_ip": "172.28.248.118",
     "gateway_ip": "10.254.28.1",
     "path": [
       {
@@ -249,9 +381,9 @@
           "gateway_ip": "10.254.28.1",
           "next_hop_ip": "10.254.80.10",
           "egress_iface": "TwentyFiveGigE2/1/0/47",
-          "prefix": "10.10.218.0/23",
+          "prefix": "172.28.240.0/20",
           "route_source": "ospf 105",
-          "route_tag": "91",
+          "route_tag": "41",
           "route_age": "2w3d"
         }
       },
@@ -260,78 +392,56 @@
         "device": "EJ-WAN-RTR-01",
         "interface": "TenGigabitEthernet0/0/1",
         "details": {
-          "next_hop_ip": "198.18.255.92",
-          "prefix": "10.10.218.0/23",
+          "next_hop_ip": "198.18.255.42",
+          "prefix": "172.28.240.0/20",
           "route_source": "bgp 64646"
         }
       },
       {
         "layer": "L3",
-        "device": "UMC-WAN-RTR-01",
+        "device": "MFC-WAN-RTR-01",
+        "interface": "TenGigabitEthernet0/0/2",
+        "details": {
+          "next_hop_ip": "10.175.100.13",
+          "prefix": "172.28.240.0/20",
+          "egress_iface": "TenGigabitEthernet0/0/1",
+          "route_source": "eigrp 105"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "chno-6880xl-1",
+        "interface": "TenGigabitEthernet2/1/1",
+        "details": {
+          "next_hop_ip": "10.175.49.5",
+          "prefix": "172.28.240.0/20",
+          "egress_iface": "Port-channel51",
+          "route_source": "eigrp 105"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "DC3-NX9K-02",
+        "interface": "Po45",
+        "details": {
+          "next_hop_ip": "172.28.248.118",
+          "prefix": "172.28.248.118/32",
+          "egress_iface": "Vlan3178"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "172.28.248.118",
         "interface": "\u2014",
         "details": {
-          "next_hop_ip": "172.18.0.153",
-          "prefix": "10.10.218.0/23",
-          "egress_iface": "TenGigabitEthernet0/0/0",
-          "route_source": "ospf 90"
-        }
-      },
-      {
-        "layer": "L3",
-        "device": "UMC-DT-MER-COR-01",
-        "interface": "Eth4/25",
-        "details": {
-          "next_hop_ip": "172.18.0.252",
-          "prefix": "10.10.218.0/23",
-          "egress_iface": "Po12"
-        }
-      },
-      {
-        "layer": "L3",
-        "device": "UMC-DT-MER-DIS-02",
-        "interface": "Port-channel2",
-        "details": {
-          "next_hop_ip": "172.18.4.227",
-          "prefix": "10.10.218.0/23",
-          "egress_iface": "Port-channel30",
-          "route_source": "ospf 1"
-        }
-      },
-      {
-        "layer": "L3",
-        "device": "UMC-DT-Utility-ACC-01",
-        "interface": "Port-channel1",
-        "details": {
-          "next_hop_ip": "172.18.4.231",
-          "prefix": "10.10.218.0/23",
-          "egress_iface": "Port-channel4",
-          "route_source": "ospf 1"
-        }
-      },
-      {
-        "layer": "L3",
-        "device": "UMC-ASC-ACC-01",
-        "interface": "Port-channel1",
-        "details": {
-          "prefix": "10.10.218.0/23",
-          "connected_interface": "Vlan2",
-          "route_source": "connected"
-        }
-      },
-      {
-        "layer": "L2",
-        "device": "UMC-ASC-ACC-01",
-        "interface": "Gi1/0/45",
-        "details": {
-          "mac": "f4a9.97bd.1e04",
-          "vlan": 2
+          "note": "Cannot connect to 172.28.248.118: connection failed for 172.28.248.118: SSH connection timed out to 172.28.248.118: TCP connection to device failed.\n\nCommon causes of this problem are:\n1. Incorrect hostname or IP address.\n2. Wrong TCP port.\n3. Intermediate firewall blocking access.\n\nDevice settings: cisco_ios 172.28.248.118:22\n\n"
         }
       }
     ]
   },
   {
     "src_ip": "10.254.29.194",
-    "dst_ip": "10.10.218.49",
+    "dst_ip": "172.28.248.118",
     "gateway_ip": "10.254.28.1",
     "path": [
       {
@@ -359,9 +469,9 @@
           "gateway_ip": "10.254.28.1",
           "next_hop_ip": "10.254.80.10",
           "egress_iface": "TwentyFiveGigE2/1/0/47",
-          "prefix": "10.10.218.0/23",
+          "prefix": "172.28.240.0/20",
           "route_source": "ospf 105",
-          "route_tag": "91",
+          "route_tag": "41",
           "route_age": "2w3d"
         }
       },
@@ -370,78 +480,232 @@
         "device": "EJ-WAN-RTR-01",
         "interface": "TenGigabitEthernet0/0/1",
         "details": {
-          "next_hop_ip": "198.18.255.92",
-          "prefix": "10.10.218.0/23",
+          "next_hop_ip": "198.18.255.42",
+          "prefix": "172.28.240.0/20",
           "route_source": "bgp 64646"
         }
       },
       {
         "layer": "L3",
-        "device": "UMC-WAN-RTR-01",
+        "device": "MFC-WAN-RTR-01",
+        "interface": "TenGigabitEthernet0/0/2",
+        "details": {
+          "next_hop_ip": "10.175.100.13",
+          "prefix": "172.28.240.0/20",
+          "egress_iface": "TenGigabitEthernet0/0/1",
+          "route_source": "eigrp 105"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "chno-6880xl-1",
+        "interface": "TenGigabitEthernet2/1/1",
+        "details": {
+          "next_hop_ip": "10.175.49.5",
+          "prefix": "172.28.240.0/20",
+          "egress_iface": "Port-channel51",
+          "route_source": "eigrp 105"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "DC3-NX9K-01",
+        "interface": "Po45",
+        "details": {
+          "next_hop_ip": "172.28.248.118",
+          "prefix": "172.28.248.118/32",
+          "egress_iface": "Vlan3178"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "172.28.248.118",
         "interface": "\u2014",
         "details": {
-          "next_hop_ip": "172.18.0.153",
-          "prefix": "10.10.218.0/23",
-          "egress_iface": "TenGigabitEthernet0/0/0",
-          "route_source": "ospf 90"
-        }
-      },
-      {
-        "layer": "L3",
-        "device": "UMC-DT-MER-COR-02",
-        "interface": "Eth4/24",
-        "details": {
-          "next_hop_ip": "172.18.4.27",
-          "prefix": "10.10.218.0/23",
-          "egress_iface": "Po12"
-        }
-      },
-      {
-        "layer": "L3",
-        "device": "UMC-DT-MER-DIS-02",
-        "interface": "Port-channel2",
-        "details": {
-          "next_hop_ip": "172.18.4.227",
-          "prefix": "10.10.218.0/23",
-          "egress_iface": "Port-channel30",
-          "route_source": "ospf 1"
-        }
-      },
-      {
-        "layer": "L3",
-        "device": "UMC-DT-Utility-ACC-01",
-        "interface": "Port-channel1",
-        "details": {
-          "next_hop_ip": "172.18.4.231",
-          "prefix": "10.10.218.0/23",
-          "egress_iface": "Port-channel4",
-          "route_source": "ospf 1"
-        }
-      },
-      {
-        "layer": "L3",
-        "device": "UMC-ASC-ACC-01",
-        "interface": "Port-channel1",
-        "details": {
-          "prefix": "10.10.218.0/23",
-          "connected_interface": "Vlan2",
-          "route_source": "connected"
-        }
-      },
-      {
-        "layer": "L2",
-        "device": "UMC-ASC-ACC-01",
-        "interface": "Gi1/0/45",
-        "details": {
-          "mac": "f4a9.97bd.1e04",
-          "vlan": 2
+          "note": "Cannot connect to 172.28.248.118: connection failed for 172.28.248.118: SSH connection timed out to 172.28.248.118: TCP connection to device failed.\n\nCommon causes of this problem are:\n1. Incorrect hostname or IP address.\n2. Wrong TCP port.\n3. Intermediate firewall blocking access.\n\nDevice settings: cisco_ios 172.28.248.118:22\n\n"
         }
       }
     ]
   },
   {
     "src_ip": "10.254.29.194",
-    "dst_ip": "10.10.218.49",
+    "dst_ip": "172.28.248.118",
+    "gateway_ip": "10.254.28.1",
+    "path": [
+      {
+        "layer": "L2",
+        "device": "C3750S-3H1",
+        "interface": "Gi2/0/19",
+        "details": {
+          "vlan": 128,
+          "egress_interface": "GigabitEthernet1/1/1"
+        }
+      },
+      {
+        "layer": "L2",
+        "device": "EJ-C9606R-CORE",
+        "interface": "Twe1/1/0/43",
+        "details": {
+          "vlan": 128
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "EJ-C9606R-CORE",
+        "interface": "Vlan128",
+        "details": {
+          "gateway_ip": "10.254.28.1",
+          "next_hop_ip": "10.254.80.10",
+          "egress_iface": "TwentyFiveGigE2/1/0/47",
+          "prefix": "172.28.240.0/20",
+          "route_source": "ospf 105",
+          "route_tag": "41",
+          "route_age": "2w3d"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "EJ-WAN-RTR-01",
+        "interface": "TenGigabitEthernet0/0/1",
+        "details": {
+          "next_hop_ip": "198.18.255.42",
+          "prefix": "172.28.240.0/20",
+          "route_source": "bgp 64646"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "MFC-WAN-RTR-01",
+        "interface": "TenGigabitEthernet0/0/2",
+        "details": {
+          "next_hop_ip": "10.175.100.13",
+          "prefix": "172.28.240.0/20",
+          "egress_iface": "TenGigabitEthernet0/0/1",
+          "route_source": "eigrp 105"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "chno-6880xl-1",
+        "interface": "TenGigabitEthernet2/1/1",
+        "details": {
+          "next_hop_ip": "10.175.49.5",
+          "prefix": "172.28.240.0/20",
+          "egress_iface": "Port-channel51",
+          "route_source": "eigrp 105"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "DC3-NX9K-02",
+        "interface": "Po45",
+        "details": {
+          "next_hop_ip": "172.28.248.118",
+          "prefix": "172.28.248.118/32",
+          "egress_iface": "Vlan3178"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "172.28.248.118",
+        "interface": "\u2014",
+        "details": {
+          "note": "Cannot connect to 172.28.248.118: connection failed for 172.28.248.118: SSH connection timed out to 172.28.248.118: TCP connection to device failed.\n\nCommon causes of this problem are:\n1. Incorrect hostname or IP address.\n2. Wrong TCP port.\n3. Intermediate firewall blocking access.\n\nDevice settings: cisco_ios 172.28.248.118:22\n\n"
+        }
+      }
+    ]
+  },
+  {
+    "src_ip": "10.254.29.194",
+    "dst_ip": "172.28.248.118",
+    "gateway_ip": "10.254.28.1",
+    "path": [
+      {
+        "layer": "L2",
+        "device": "C3750S-3H1",
+        "interface": "Gi2/0/19",
+        "details": {
+          "vlan": 128,
+          "egress_interface": "GigabitEthernet1/1/1"
+        }
+      },
+      {
+        "layer": "L2",
+        "device": "EJ-C9606R-CORE",
+        "interface": "Twe1/1/0/43",
+        "details": {
+          "vlan": 128
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "EJ-C9606R-CORE",
+        "interface": "Vlan128",
+        "details": {
+          "gateway_ip": "10.254.28.1",
+          "next_hop_ip": "10.254.80.10",
+          "egress_iface": "TwentyFiveGigE2/1/0/47",
+          "prefix": "172.28.240.0/20",
+          "route_source": "ospf 105",
+          "route_tag": "41",
+          "route_age": "2w3d"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "EJ-WAN-RTR-01",
+        "interface": "TenGigabitEthernet0/0/1",
+        "details": {
+          "next_hop_ip": "198.18.255.42",
+          "prefix": "172.28.240.0/20",
+          "route_source": "bgp 64646"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "MFC-WAN-RTR-01",
+        "interface": "TenGigabitEthernet0/0/2",
+        "details": {
+          "next_hop_ip": "10.175.100.13",
+          "prefix": "172.28.240.0/20",
+          "egress_iface": "TenGigabitEthernet0/0/1",
+          "route_source": "eigrp 105"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "chno-6880xl-1",
+        "interface": "TenGigabitEthernet2/1/1",
+        "details": {
+          "next_hop_ip": "10.175.49.5",
+          "prefix": "172.28.240.0/20",
+          "egress_iface": "Port-channel51",
+          "route_source": "eigrp 105"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "DC3-NX9K-01",
+        "interface": "Po45",
+        "details": {
+          "next_hop_ip": "172.28.248.118",
+          "prefix": "172.28.248.118/32",
+          "egress_iface": "Vlan3178"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "172.28.248.118",
+        "interface": "\u2014",
+        "details": {
+          "note": "Cannot connect to 172.28.248.118: connection failed for 172.28.248.118: SSH connection timed out to 172.28.248.118: TCP connection to device failed.\n\nCommon causes of this problem are:\n1. Incorrect hostname or IP address.\n2. Wrong TCP port.\n3. Intermediate firewall blocking access.\n\nDevice settings: cisco_ios 172.28.248.118:22\n\n"
+        }
+      }
+    ]
+  },
+  {
+    "src_ip": "10.254.29.194",
+    "dst_ip": "172.28.248.118",
     "gateway_ip": "10.254.28.1",
     "path": [
       {
@@ -469,10 +733,10 @@
           "gateway_ip": "10.254.28.1",
           "next_hop_ip": "10.254.80.6",
           "egress_iface": "TwentyFiveGigE1/1/0/47",
-          "prefix": "10.10.218.0/23",
+          "prefix": "172.28.240.0/20",
           "route_source": "ospf 105",
-          "route_tag": "91",
-          "route_age": "2w3d"
+          "route_tag": "41",
+          "route_age": "4w6d"
         }
       },
       {
@@ -480,78 +744,56 @@
         "device": "EJ-WAN-RTR-02",
         "interface": "TenGigabitEthernet0/0/0",
         "details": {
-          "next_hop_ip": "198.18.255.93",
-          "prefix": "10.10.218.0/23",
+          "next_hop_ip": "198.18.255.43",
+          "prefix": "172.28.240.0/20",
           "route_source": "bgp 65454"
         }
       },
       {
         "layer": "L3",
-        "device": "UMC-WAN-RTR-02",
+        "device": "MFC-WAN-RTR-02",
+        "interface": "TenGigabitEthernet0/0/2",
+        "details": {
+          "next_hop_ip": "10.175.100.21",
+          "prefix": "172.28.240.0/20",
+          "egress_iface": "TenGigabitEthernet0/0/0",
+          "route_source": "eigrp 105"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "chno-6880xl-1",
+        "interface": "TenGigabitEthernet2/1/1",
+        "details": {
+          "next_hop_ip": "10.175.49.5",
+          "prefix": "172.28.240.0/20",
+          "egress_iface": "Port-channel51",
+          "route_source": "eigrp 105"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "DC3-NX9K-02",
+        "interface": "Po45",
+        "details": {
+          "next_hop_ip": "172.28.248.118",
+          "prefix": "172.28.248.118/32",
+          "egress_iface": "Vlan3178"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "172.28.248.118",
         "interface": "\u2014",
         "details": {
-          "next_hop_ip": "172.18.0.145",
-          "prefix": "10.10.218.0/23",
-          "egress_iface": "TenGigabitEthernet0/0/1",
-          "route_source": "ospf 90"
-        }
-      },
-      {
-        "layer": "L3",
-        "device": "UMC-DT-MER-COR-01",
-        "interface": "Eth4/25",
-        "details": {
-          "next_hop_ip": "172.18.0.252",
-          "prefix": "10.10.218.0/23",
-          "egress_iface": "Po12"
-        }
-      },
-      {
-        "layer": "L3",
-        "device": "UMC-DT-MER-DIS-02",
-        "interface": "Port-channel2",
-        "details": {
-          "next_hop_ip": "172.18.4.227",
-          "prefix": "10.10.218.0/23",
-          "egress_iface": "Port-channel30",
-          "route_source": "ospf 1"
-        }
-      },
-      {
-        "layer": "L3",
-        "device": "UMC-DT-Utility-ACC-01",
-        "interface": "Port-channel1",
-        "details": {
-          "next_hop_ip": "172.18.4.231",
-          "prefix": "10.10.218.0/23",
-          "egress_iface": "Port-channel4",
-          "route_source": "ospf 1"
-        }
-      },
-      {
-        "layer": "L3",
-        "device": "UMC-ASC-ACC-01",
-        "interface": "Port-channel1",
-        "details": {
-          "prefix": "10.10.218.0/23",
-          "connected_interface": "Vlan2",
-          "route_source": "connected"
-        }
-      },
-      {
-        "layer": "L2",
-        "device": "UMC-ASC-ACC-01",
-        "interface": "Gi1/0/45",
-        "details": {
-          "mac": "f4a9.97bd.1e04",
-          "vlan": 2
+          "note": "Cannot connect to 172.28.248.118: connection failed for 172.28.248.118: SSH connection timed out to 172.28.248.118: TCP connection to device failed.\n\nCommon causes of this problem are:\n1. Incorrect hostname or IP address.\n2. Wrong TCP port.\n3. Intermediate firewall blocking access.\n\nDevice settings: cisco_ios 172.28.248.118:22\n\n"
         }
       }
     ]
   },
   {
     "src_ip": "10.254.29.194",
-    "dst_ip": "10.10.218.49",
+    "dst_ip": "172.28.248.118",
     "gateway_ip": "10.254.28.1",
     "path": [
       {
@@ -579,10 +821,10 @@
           "gateway_ip": "10.254.28.1",
           "next_hop_ip": "10.254.80.6",
           "egress_iface": "TwentyFiveGigE1/1/0/47",
-          "prefix": "10.10.218.0/23",
+          "prefix": "172.28.240.0/20",
           "route_source": "ospf 105",
-          "route_tag": "91",
-          "route_age": "2w3d"
+          "route_tag": "41",
+          "route_age": "4w6d"
         }
       },
       {
@@ -590,78 +832,320 @@
         "device": "EJ-WAN-RTR-02",
         "interface": "TenGigabitEthernet0/0/0",
         "details": {
-          "next_hop_ip": "198.18.255.93",
-          "prefix": "10.10.218.0/23",
+          "next_hop_ip": "198.18.255.43",
+          "prefix": "172.28.240.0/20",
           "route_source": "bgp 65454"
         }
       },
       {
         "layer": "L3",
-        "device": "UMC-WAN-RTR-02",
+        "device": "MFC-WAN-RTR-02",
+        "interface": "TenGigabitEthernet0/0/2",
+        "details": {
+          "next_hop_ip": "10.175.100.21",
+          "prefix": "172.28.240.0/20",
+          "egress_iface": "TenGigabitEthernet0/0/0",
+          "route_source": "eigrp 105"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "chno-6880xl-1",
+        "interface": "TenGigabitEthernet2/1/1",
+        "details": {
+          "next_hop_ip": "10.175.49.5",
+          "prefix": "172.28.240.0/20",
+          "egress_iface": "Port-channel51",
+          "route_source": "eigrp 105"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "DC3-NX9K-01",
+        "interface": "Po45",
+        "details": {
+          "next_hop_ip": "172.28.248.118",
+          "prefix": "172.28.248.118/32",
+          "egress_iface": "Vlan3178"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "172.28.248.118",
         "interface": "\u2014",
         "details": {
-          "next_hop_ip": "172.18.0.145",
-          "prefix": "10.10.218.0/23",
+          "note": "Cannot connect to 172.28.248.118: connection failed for 172.28.248.118: SSH connection timed out to 172.28.248.118: TCP connection to device failed.\n\nCommon causes of this problem are:\n1. Incorrect hostname or IP address.\n2. Wrong TCP port.\n3. Intermediate firewall blocking access.\n\nDevice settings: cisco_ios 172.28.248.118:22\n\n"
+        }
+      }
+    ]
+  },
+  {
+    "src_ip": "10.254.29.194",
+    "dst_ip": "172.28.248.118",
+    "gateway_ip": "10.254.28.1",
+    "path": [
+      {
+        "layer": "L2",
+        "device": "C3750S-3H1",
+        "interface": "Gi2/0/19",
+        "details": {
+          "vlan": 128,
+          "egress_interface": "GigabitEthernet1/1/1"
+        }
+      },
+      {
+        "layer": "L2",
+        "device": "EJ-C9606R-CORE",
+        "interface": "Twe1/1/0/43",
+        "details": {
+          "vlan": 128
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "EJ-C9606R-CORE",
+        "interface": "Vlan128",
+        "details": {
+          "gateway_ip": "10.254.28.1",
+          "next_hop_ip": "10.254.80.6",
+          "egress_iface": "TwentyFiveGigE1/1/0/47",
+          "prefix": "172.28.240.0/20",
+          "route_source": "ospf 105",
+          "route_tag": "41",
+          "route_age": "4w6d"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "EJ-WAN-RTR-02",
+        "interface": "TenGigabitEthernet0/0/0",
+        "details": {
+          "next_hop_ip": "198.18.255.43",
+          "prefix": "172.28.240.0/20",
+          "route_source": "bgp 65454"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "MFC-WAN-RTR-02",
+        "interface": "TenGigabitEthernet0/0/2",
+        "details": {
+          "next_hop_ip": "10.175.100.21",
+          "prefix": "172.28.240.0/20",
+          "egress_iface": "TenGigabitEthernet0/0/0",
+          "route_source": "eigrp 105"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "chno-6880xl-1",
+        "interface": "TenGigabitEthernet2/1/1",
+        "details": {
+          "next_hop_ip": "10.175.49.5",
+          "prefix": "172.28.240.0/20",
+          "egress_iface": "Port-channel51",
+          "route_source": "eigrp 105"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "DC3-NX9K-02",
+        "interface": "Po45",
+        "details": {
+          "next_hop_ip": "172.28.248.118",
+          "prefix": "172.28.248.118/32",
+          "egress_iface": "Vlan3178"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "172.28.248.118",
+        "interface": "\u2014",
+        "details": {
+          "note": "Cannot connect to 172.28.248.118: connection failed for 172.28.248.118: SSH connection timed out to 172.28.248.118: TCP connection to device failed.\n\nCommon causes of this problem are:\n1. Incorrect hostname or IP address.\n2. Wrong TCP port.\n3. Intermediate firewall blocking access.\n\nDevice settings: cisco_ios 172.28.248.118:22\n\n"
+        }
+      }
+    ]
+  },
+  {
+    "src_ip": "10.254.29.194",
+    "dst_ip": "172.28.248.118",
+    "gateway_ip": "10.254.28.1",
+    "path": [
+      {
+        "layer": "L2",
+        "device": "C3750S-3H1",
+        "interface": "Gi2/0/19",
+        "details": {
+          "vlan": 128,
+          "egress_interface": "GigabitEthernet1/1/1"
+        }
+      },
+      {
+        "layer": "L2",
+        "device": "EJ-C9606R-CORE",
+        "interface": "Twe1/1/0/43",
+        "details": {
+          "vlan": 128
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "EJ-C9606R-CORE",
+        "interface": "Vlan128",
+        "details": {
+          "gateway_ip": "10.254.28.1",
+          "next_hop_ip": "10.254.80.6",
+          "egress_iface": "TwentyFiveGigE1/1/0/47",
+          "prefix": "172.28.240.0/20",
+          "route_source": "ospf 105",
+          "route_tag": "41",
+          "route_age": "4w6d"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "EJ-WAN-RTR-02",
+        "interface": "TenGigabitEthernet0/0/0",
+        "details": {
+          "next_hop_ip": "198.18.255.43",
+          "prefix": "172.28.240.0/20",
+          "route_source": "bgp 65454"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "MFC-WAN-RTR-02",
+        "interface": "TenGigabitEthernet0/0/2",
+        "details": {
+          "next_hop_ip": "10.175.100.21",
+          "prefix": "172.28.240.0/20",
+          "egress_iface": "TenGigabitEthernet0/0/0",
+          "route_source": "eigrp 105"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "chno-6880xl-1",
+        "interface": "TenGigabitEthernet2/1/1",
+        "details": {
+          "next_hop_ip": "10.175.49.5",
+          "prefix": "172.28.240.0/20",
+          "egress_iface": "Port-channel51",
+          "route_source": "eigrp 105"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "DC3-NX9K-01",
+        "interface": "Po45",
+        "details": {
+          "next_hop_ip": "172.28.248.118",
+          "prefix": "172.28.248.118/32",
+          "egress_iface": "Vlan3178"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "172.28.248.118",
+        "interface": "\u2014",
+        "details": {
+          "note": "Cannot connect to 172.28.248.118: connection failed for 172.28.248.118: SSH connection timed out to 172.28.248.118: TCP connection to device failed.\n\nCommon causes of this problem are:\n1. Incorrect hostname or IP address.\n2. Wrong TCP port.\n3. Intermediate firewall blocking access.\n\nDevice settings: cisco_ios 172.28.248.118:22\n\n"
+        }
+      }
+    ]
+  },
+  {
+    "src_ip": "10.254.29.194",
+    "dst_ip": "172.28.248.118",
+    "gateway_ip": "10.254.28.1",
+    "path": [
+      {
+        "layer": "L2",
+        "device": "C3750S-3H1",
+        "interface": "Gi2/0/19",
+        "details": {
+          "vlan": 128,
+          "egress_interface": "GigabitEthernet1/1/1"
+        }
+      },
+      {
+        "layer": "L2",
+        "device": "EJ-C9606R-CORE",
+        "interface": "Twe1/1/0/43",
+        "details": {
+          "vlan": 128
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "EJ-C9606R-CORE",
+        "interface": "Vlan128",
+        "details": {
+          "gateway_ip": "10.254.28.1",
+          "next_hop_ip": "10.254.80.2",
+          "egress_iface": "TwentyFiveGigE1/5/0/3",
+          "prefix": "172.28.240.0/20",
+          "route_source": "ospf 105",
+          "route_tag": "41",
+          "route_age": "2w3d"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "EJ-WAN-RTR-01",
+        "interface": "TenGigabitEthernet0/0/1",
+        "details": {
+          "next_hop_ip": "198.18.255.42",
+          "prefix": "172.28.240.0/20",
+          "route_source": "bgp 64646"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "MFC-WAN-RTR-01",
+        "interface": "TenGigabitEthernet0/0/2",
+        "details": {
+          "next_hop_ip": "10.175.100.13",
+          "prefix": "172.28.240.0/20",
           "egress_iface": "TenGigabitEthernet0/0/1",
-          "route_source": "ospf 90"
+          "route_source": "eigrp 105"
         }
       },
       {
         "layer": "L3",
-        "device": "UMC-DT-MER-COR-02",
-        "interface": "Eth4/24",
+        "device": "chno-6880xl-1",
+        "interface": "TenGigabitEthernet2/1/1",
         "details": {
-          "next_hop_ip": "172.18.4.27",
-          "prefix": "10.10.218.0/23",
-          "egress_iface": "Po12"
+          "next_hop_ip": "10.175.49.5",
+          "prefix": "172.28.240.0/20",
+          "egress_iface": "Port-channel51",
+          "route_source": "eigrp 105"
         }
       },
       {
         "layer": "L3",
-        "device": "UMC-DT-MER-DIS-02",
-        "interface": "Port-channel2",
+        "device": "DC3-NX9K-02",
+        "interface": "Po45",
         "details": {
-          "next_hop_ip": "172.18.4.227",
-          "prefix": "10.10.218.0/23",
-          "egress_iface": "Port-channel30",
-          "route_source": "ospf 1"
+          "next_hop_ip": "172.28.248.118",
+          "prefix": "172.28.248.118/32",
+          "egress_iface": "Vlan3178"
         }
       },
       {
         "layer": "L3",
-        "device": "UMC-DT-Utility-ACC-01",
-        "interface": "Port-channel1",
+        "device": "172.28.248.118",
+        "interface": "\u2014",
         "details": {
-          "next_hop_ip": "172.18.4.231",
-          "prefix": "10.10.218.0/23",
-          "egress_iface": "Port-channel4",
-          "route_source": "ospf 1"
-        }
-      },
-      {
-        "layer": "L3",
-        "device": "UMC-ASC-ACC-01",
-        "interface": "Port-channel1",
-        "details": {
-          "prefix": "10.10.218.0/23",
-          "connected_interface": "Vlan2",
-          "route_source": "connected"
-        }
-      },
-      {
-        "layer": "L2",
-        "device": "UMC-ASC-ACC-01",
-        "interface": "Gi1/0/45",
-        "details": {
-          "mac": "f4a9.97bd.1e04",
-          "vlan": 2
+          "note": "Cannot connect to 172.28.248.118: connection failed for 172.28.248.118: SSH connection timed out to 172.28.248.118: TCP connection to device failed.\n\nCommon causes of this problem are:\n1. Incorrect hostname or IP address.\n2. Wrong TCP port.\n3. Intermediate firewall blocking access.\n\nDevice settings: cisco_ios 172.28.248.118:22\n\n"
         }
       }
     ]
   },
   {
     "src_ip": "10.254.29.194",
-    "dst_ip": "10.10.218.49",
+    "dst_ip": "172.28.248.118",
     "gateway_ip": "10.254.28.1",
     "path": [
       {
@@ -689,9 +1173,9 @@
           "gateway_ip": "10.254.28.1",
           "next_hop_ip": "10.254.80.2",
           "egress_iface": "TwentyFiveGigE1/5/0/3",
-          "prefix": "10.10.218.0/23",
+          "prefix": "172.28.240.0/20",
           "route_source": "ospf 105",
-          "route_tag": "91",
+          "route_tag": "41",
           "route_age": "2w3d"
         }
       },
@@ -700,78 +1184,56 @@
         "device": "EJ-WAN-RTR-01",
         "interface": "TenGigabitEthernet0/0/1",
         "details": {
-          "next_hop_ip": "198.18.255.92",
-          "prefix": "10.10.218.0/23",
+          "next_hop_ip": "198.18.255.42",
+          "prefix": "172.28.240.0/20",
           "route_source": "bgp 64646"
         }
       },
       {
         "layer": "L3",
-        "device": "UMC-WAN-RTR-01",
+        "device": "MFC-WAN-RTR-01",
+        "interface": "TenGigabitEthernet0/0/2",
+        "details": {
+          "next_hop_ip": "10.175.100.13",
+          "prefix": "172.28.240.0/20",
+          "egress_iface": "TenGigabitEthernet0/0/1",
+          "route_source": "eigrp 105"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "chno-6880xl-1",
+        "interface": "TenGigabitEthernet2/1/1",
+        "details": {
+          "next_hop_ip": "10.175.49.5",
+          "prefix": "172.28.240.0/20",
+          "egress_iface": "Port-channel51",
+          "route_source": "eigrp 105"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "DC3-NX9K-01",
+        "interface": "Po45",
+        "details": {
+          "next_hop_ip": "172.28.248.118",
+          "prefix": "172.28.248.118/32",
+          "egress_iface": "Vlan3178"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "172.28.248.118",
         "interface": "\u2014",
         "details": {
-          "next_hop_ip": "172.18.0.153",
-          "prefix": "10.10.218.0/23",
-          "egress_iface": "TenGigabitEthernet0/0/0",
-          "route_source": "ospf 90"
-        }
-      },
-      {
-        "layer": "L3",
-        "device": "UMC-DT-MER-COR-01",
-        "interface": "Eth4/25",
-        "details": {
-          "next_hop_ip": "172.18.0.252",
-          "prefix": "10.10.218.0/23",
-          "egress_iface": "Po12"
-        }
-      },
-      {
-        "layer": "L3",
-        "device": "UMC-DT-MER-DIS-02",
-        "interface": "Port-channel2",
-        "details": {
-          "next_hop_ip": "172.18.4.227",
-          "prefix": "10.10.218.0/23",
-          "egress_iface": "Port-channel30",
-          "route_source": "ospf 1"
-        }
-      },
-      {
-        "layer": "L3",
-        "device": "UMC-DT-Utility-ACC-01",
-        "interface": "Port-channel1",
-        "details": {
-          "next_hop_ip": "172.18.4.231",
-          "prefix": "10.10.218.0/23",
-          "egress_iface": "Port-channel4",
-          "route_source": "ospf 1"
-        }
-      },
-      {
-        "layer": "L3",
-        "device": "UMC-ASC-ACC-01",
-        "interface": "Port-channel1",
-        "details": {
-          "prefix": "10.10.218.0/23",
-          "connected_interface": "Vlan2",
-          "route_source": "connected"
-        }
-      },
-      {
-        "layer": "L2",
-        "device": "UMC-ASC-ACC-01",
-        "interface": "Gi1/0/45",
-        "details": {
-          "mac": "f4a9.97bd.1e04",
-          "vlan": 2
+          "note": "Cannot connect to 172.28.248.118: connection failed for 172.28.248.118: SSH connection timed out to 172.28.248.118: TCP connection to device failed.\n\nCommon causes of this problem are:\n1. Incorrect hostname or IP address.\n2. Wrong TCP port.\n3. Intermediate firewall blocking access.\n\nDevice settings: cisco_ios 172.28.248.118:22\n\n"
         }
       }
     ]
   },
   {
     "src_ip": "10.254.29.194",
-    "dst_ip": "10.10.218.49",
+    "dst_ip": "172.28.248.118",
     "gateway_ip": "10.254.28.1",
     "path": [
       {
@@ -799,9 +1261,9 @@
           "gateway_ip": "10.254.28.1",
           "next_hop_ip": "10.254.80.2",
           "egress_iface": "TwentyFiveGigE1/5/0/3",
-          "prefix": "10.10.218.0/23",
+          "prefix": "172.28.240.0/20",
           "route_source": "ospf 105",
-          "route_tag": "91",
+          "route_tag": "41",
           "route_age": "2w3d"
         }
       },
@@ -810,71 +1272,137 @@
         "device": "EJ-WAN-RTR-01",
         "interface": "TenGigabitEthernet0/0/1",
         "details": {
-          "next_hop_ip": "198.18.255.92",
-          "prefix": "10.10.218.0/23",
+          "next_hop_ip": "198.18.255.42",
+          "prefix": "172.28.240.0/20",
           "route_source": "bgp 64646"
         }
       },
       {
         "layer": "L3",
-        "device": "UMC-WAN-RTR-01",
+        "device": "MFC-WAN-RTR-01",
+        "interface": "TenGigabitEthernet0/0/2",
+        "details": {
+          "next_hop_ip": "10.175.100.13",
+          "prefix": "172.28.240.0/20",
+          "egress_iface": "TenGigabitEthernet0/0/1",
+          "route_source": "eigrp 105"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "chno-6880xl-1",
+        "interface": "TenGigabitEthernet2/1/1",
+        "details": {
+          "next_hop_ip": "10.175.49.5",
+          "prefix": "172.28.240.0/20",
+          "egress_iface": "Port-channel51",
+          "route_source": "eigrp 105"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "DC3-NX9K-02",
+        "interface": "Po45",
+        "details": {
+          "next_hop_ip": "172.28.248.118",
+          "prefix": "172.28.248.118/32",
+          "egress_iface": "Vlan3178"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "172.28.248.118",
         "interface": "\u2014",
         "details": {
-          "next_hop_ip": "172.18.0.153",
-          "prefix": "10.10.218.0/23",
-          "egress_iface": "TenGigabitEthernet0/0/0",
-          "route_source": "ospf 90"
+          "note": "Cannot connect to 172.28.248.118: connection failed for 172.28.248.118: SSH connection timed out to 172.28.248.118: TCP connection to device failed.\n\nCommon causes of this problem are:\n1. Incorrect hostname or IP address.\n2. Wrong TCP port.\n3. Intermediate firewall blocking access.\n\nDevice settings: cisco_ios 172.28.248.118:22\n\n"
         }
-      },
+      }
+    ]
+  },
+  {
+    "src_ip": "10.254.29.194",
+    "dst_ip": "172.28.248.118",
+    "gateway_ip": "10.254.28.1",
+    "path": [
       {
-        "layer": "L3",
-        "device": "UMC-DT-MER-COR-02",
-        "interface": "Eth4/24",
+        "layer": "L2",
+        "device": "C3750S-3H1",
+        "interface": "Gi2/0/19",
         "details": {
-          "next_hop_ip": "172.18.4.27",
-          "prefix": "10.10.218.0/23",
-          "egress_iface": "Po12"
-        }
-      },
-      {
-        "layer": "L3",
-        "device": "UMC-DT-MER-DIS-02",
-        "interface": "Port-channel2",
-        "details": {
-          "next_hop_ip": "172.18.4.227",
-          "prefix": "10.10.218.0/23",
-          "egress_iface": "Port-channel30",
-          "route_source": "ospf 1"
-        }
-      },
-      {
-        "layer": "L3",
-        "device": "UMC-DT-Utility-ACC-01",
-        "interface": "Port-channel1",
-        "details": {
-          "next_hop_ip": "172.18.4.231",
-          "prefix": "10.10.218.0/23",
-          "egress_iface": "Port-channel4",
-          "route_source": "ospf 1"
-        }
-      },
-      {
-        "layer": "L3",
-        "device": "UMC-ASC-ACC-01",
-        "interface": "Port-channel1",
-        "details": {
-          "prefix": "10.10.218.0/23",
-          "connected_interface": "Vlan2",
-          "route_source": "connected"
+          "vlan": 128,
+          "egress_interface": "GigabitEthernet1/1/1"
         }
       },
       {
         "layer": "L2",
-        "device": "UMC-ASC-ACC-01",
-        "interface": "Gi1/0/45",
+        "device": "EJ-C9606R-CORE",
+        "interface": "Twe1/1/0/43",
         "details": {
-          "mac": "f4a9.97bd.1e04",
-          "vlan": 2
+          "vlan": 128
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "EJ-C9606R-CORE",
+        "interface": "Vlan128",
+        "details": {
+          "gateway_ip": "10.254.28.1",
+          "next_hop_ip": "10.254.80.2",
+          "egress_iface": "TwentyFiveGigE1/5/0/3",
+          "prefix": "172.28.240.0/20",
+          "route_source": "ospf 105",
+          "route_tag": "41",
+          "route_age": "2w3d"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "EJ-WAN-RTR-01",
+        "interface": "TenGigabitEthernet0/0/1",
+        "details": {
+          "next_hop_ip": "198.18.255.42",
+          "prefix": "172.28.240.0/20",
+          "route_source": "bgp 64646"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "MFC-WAN-RTR-01",
+        "interface": "TenGigabitEthernet0/0/2",
+        "details": {
+          "next_hop_ip": "10.175.100.13",
+          "prefix": "172.28.240.0/20",
+          "egress_iface": "TenGigabitEthernet0/0/1",
+          "route_source": "eigrp 105"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "chno-6880xl-1",
+        "interface": "TenGigabitEthernet2/1/1",
+        "details": {
+          "next_hop_ip": "10.175.49.5",
+          "prefix": "172.28.240.0/20",
+          "egress_iface": "Port-channel51",
+          "route_source": "eigrp 105"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "DC3-NX9K-01",
+        "interface": "Po45",
+        "details": {
+          "next_hop_ip": "172.28.248.118",
+          "prefix": "172.28.248.118/32",
+          "egress_iface": "Vlan3178"
+        }
+      },
+      {
+        "layer": "L3",
+        "device": "172.28.248.118",
+        "interface": "\u2014",
+        "details": {
+          "note": "Cannot connect to 172.28.248.118: connection failed for 172.28.248.118: SSH connection timed out to 172.28.248.118: TCP connection to device failed.\n\nCommon causes of this problem are:\n1. Incorrect hostname or IP address.\n2. Wrong TCP port.\n3. Intermediate firewall blocking access.\n\nDevice settings: cisco_ios 172.28.248.118:22\n\n"
         }
       }
     ]

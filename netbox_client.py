@@ -3001,6 +3001,58 @@ class NetBoxClient:
                 f"iface_id={interface_id}) failed: {exc}"
             ) from exc
 
+    def clear_ip_interface_assignment(self, ip_id: int) -> dict:
+        """
+        Remove the interface assignment from an IP address record without
+        deleting the record itself.
+
+        Sets ``assigned_object_type`` and ``assigned_object_id`` to ``None``
+        so the IP is preserved in NetBox (audit trail, potential re-use) but
+        is no longer associated with any interface.
+
+        Used by :func:`_purge_stale_ip_assignments` in
+        ``sync_netbox_interfaces.py`` to clear IPs that are assigned to an
+        interface in NetBox but are absent from the live device configuration.
+
+        Parameters
+        ----------
+        ip_id : int
+            NetBox IP address primary key.
+
+        Returns
+        -------
+        dict
+            ``{"_action": "cleared", "id": ip_id}``
+
+        Raises
+        ------
+        NetBoxClientError
+            When the IP record is not found or the update fails.
+        """
+        self.log.debug("clear_ip_interface_assignment ip_id=%s", ip_id)
+        try:
+            rec = self.nb.ipam.ip_addresses.get(ip_id)
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"clear_ip_interface_assignment: IP lookup id={ip_id} failed: {exc}"
+            ) from exc
+
+        if rec is None:
+            raise NetBoxClientError(
+                f"clear_ip_interface_assignment: IP id={ip_id} not found."
+            )
+
+        try:
+            rec.update({
+                "assigned_object_type": None,
+                "assigned_object_id":   None,
+            })
+            return {"_action": "cleared", "id": ip_id}
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"clear_ip_interface_assignment(ip_id={ip_id}) failed: {exc}"
+            ) from exc
+
     def get_ip_by_address(self, address: str) -> Optional[dict]:
         """
         Return the first NetBox IP address record whose ``address`` field

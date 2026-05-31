@@ -1434,12 +1434,59 @@ def run_l3_path_trace(
                 note += f"; also tried NetBox primary {connect_ip}"
             if connect_err:
                 note += f": {connect_err}"
-            complete_paths.append(
-                path_so_far + [{"hostname": current_ip, "ip": current_ip,
-                                "connect_ip": connect_ip,
-                                "note": note,
-                                "ingress_interfaces": [], "egress_routes": []}]
-            )
+
+            unreachable_hop: Dict = {
+                "hostname":           current_ip,
+                "ip":                 current_ip,
+                "connect_ip":         connect_ip,
+                "note":               note,
+                "ingress_interfaces": [],
+                "egress_routes":      [],
+                "l2_trace":           None,
+                "l2_trace_device":    None,
+            }
+
+            # ── L2 fallback ───────────────────────────────────────────────────
+            # When the next-hop is unreachable, reconnect to the LAST
+            # successfully-reached device and run an ARP→MAC→CDP trace for
+            # dst_ip.  This recovers the egress L2 port even when the
+            # upstream L3 next-hop cannot be SSH'd into.
+            if path_so_far:
+                prev_hop         = path_so_far[-1]
+                prev_connect_ip  = prev_hop.get("connect_ip") or prev_hop.get("ip")
+                prev_hostname    = prev_hop.get("hostname") or prev_connect_ip
+                if prev_connect_ip:
+                    print(
+                        f"[L3]   Cannot reach {current_ip} — "
+                        f"attempting L2 trace for {dst_ip} on {prev_hostname} ({prev_connect_ip})..."
+                    )
+                    try:
+                        prev_client = _open_device_client(prev_connect_ip, "ios", creds)
+                        try:
+                            l2_result = _run_l2_at_final_hop(prev_client, "ios", dst_ip)
+                            unreachable_hop["l2_trace"]        = l2_result
+                            unreachable_hop["l2_trace_device"] = prev_hostname
+                            if l2_result.get("error"):
+                                print(f"[L3]   L2 fallback: {l2_result['error']}")
+                            else:
+                                port = l2_result.get("port", "?")
+                                mac  = l2_result.get("mac", "?")
+                                print(
+                                    f"[L3]   L2 fallback succeeded on {prev_hostname}: "
+                                    f"MAC={mac}  port={port}"
+                                )
+                        finally:
+                            try:
+                                prev_client._cli_disconnect()
+                            except Exception:
+                                pass
+                    except GatewayConnectionError as exc:
+                        log.debug(
+                            "L2 fallback: cannot reconnect to %s: %s",
+                            prev_connect_ip, exc,
+                        )
+
+            complete_paths.append(path_so_far + [unreachable_hop])
             continue
 
         hostname        = current_ip
@@ -1545,6 +1592,38 @@ def print_l3_paths(paths: List[List[Dict]], dst_ip: str) -> None:
 
             if note:
                 print(f"      [{note}]")
+                l2_fb = hop.get("l2_trace")
+                if l2_fb:
+                    l2_dev = hop.get("l2_trace_device") or "prev-device"
+                    print(f"\n      Layer 2 Fallback Trace ({l2_dev} → {l2_fb.get('dst_ip', dst_ip)})")
+                    if l2_fb.get("error"):
+                        print(f"        Error       : {l2_fb['error']}")
+                    else:
+                        if l2_fb.get("mac"):
+                            print(f"        ARP MAC     : {l2_fb['mac']}")
+                        if l2_fb.get("vlan"):
+                            print(f"        VLAN        : {l2_fb['vlan']}")
+                        if l2_fb.get("port"):
+                            print(f"        Port        : {l2_fb['port']}")
+                        if l2_fb.get("portchannel_members"):
+                            print(f"        Po members  : {', '.join(l2_fb['portchannel_members'])}")
+                        cdp = l2_fb.get("cdp_neighbor")
+                        if cdp:
+                            nid   = cdp.get("hostname", "unknown")
+                            nip   = cdp.get("ip", "")
+                            nport = cdp.get("port", "")
+                            plat  = cdp.get("platform", "")
+                            proto = cdp.get("protocol", "CDP")
+                            print(
+                                f"        {proto} Neighbor: {nid}"
+                                + (f"  ({nip})" if nip else "")
+                            )
+                            if nport:
+                                print(f"        Remote Port : {nport}")
+                            if plat:
+                                print(f"        Platform    : {plat}")
+                        else:
+                            print(f"        CDP         : no neighbor on port (endpoint)")
                 continue
 
             ifaces = hop.get("ingress_interfaces", [])
@@ -2094,6 +2173,42 @@ def _flat_l3_hops(l3_path: List[Dict]) -> List[Dict]:
                 "interface": ingress or "—",
                 "details":   {"note": note},
             })
+            # L2 fallback trace stored when the next-hop was unreachable —
+            # emit as L2 hops so the JSON path still shows the egress port.
+            l2t = hop.get("l2_trace")
+            l2_dev = hop.get("l2_trace_device") or hostname
+            if l2t and not l2t.get("error"):
+                vlan_raw = l2t.get("vlan")
+                l2_det: Dict = {}
+                if l2t.get("mac"):
+                    l2_det["mac"] = l2t["mac"]
+                if vlan_raw is not None:
+                    try:
+                        l2_det["vlan"] = int(vlan_raw)
+                    except (ValueError, TypeError):
+                        l2_det["vlan"] = vlan_raw
+                mbrs = l2t.get("portchannel_members")
+                if mbrs:
+                    l2_det["portchannel_members"] = mbrs
+                hops.append({
+                    "layer":     "L2",
+                    "device":    l2_dev,
+                    "interface": l2t.get("port") or "—",
+                    "details":   l2_det,
+                })
+                cdp = l2t.get("cdp_neighbor")
+                if cdp and cdp.get("hostname"):
+                    cdp_det = {k: v for k, v in {
+                        "protocol": cdp.get("protocol", "CDP"),
+                        "ip":       cdp.get("ip"),
+                        "platform": cdp.get("platform"),
+                    }.items() if v is not None}
+                    hops.append({
+                        "layer":     "L2",
+                        "device":    cdp["hostname"],
+                        "interface": cdp.get("port") or "—",
+                        "details":   cdp_det,
+                    })
             continue
 
         sel = hop.get("selected_route")  # set only on the gateway hop
