@@ -165,74 +165,81 @@ def get_prefixes_from_netbox(
 def _resolve_mgmt_ip_from_netbox(
     nb_url: str,
     nb_token: str,
-    any_ip: str,
+    next_hop_ip: str,
     verify_ssl: bool = True,
 ) -> Optional[str]:
-    """Return the primary management IP of the NetBox device that owns *any_ip*.
+    """Resolve *next_hop_ip* to a Cisco device in NetBox and return its primary IPv4.
 
-    Used as a fallback when a direct SSH connection to a routing next-hop IP
-    fails — the next-hop may be a transit or interface IP rather than the
-    management IP of the device.
+    Flow:
+      1. Search NetBox IPAM for an IP address record matching *next_hop_ip*.
+      2. Follow the assignment from that IP record → device interface → device.
+      3. Return the device's ``primary_ip4`` (the management address to SSH to).
 
-    Lookup strategy:
-      1. Check whether *any_ip* is itself the primary_ip4 of any device.
-      2. If not, search the IPAM ip_addresses table by address, follow the
-         assignment to the device interface, then return the device primary IP.
+    Returns None when the IP is not found in NetBox, is not assigned to a
+    device interface, or has no primary IPv4 set.
+
+    Note: virtual-machine interfaces are intentionally skipped — only
+    physical Cisco device interfaces are followed.
     """
     try:
         nb = _get_nb_client(nb_url, nb_token, verify_ssl)
 
-        # Fast path: *any_ip* may already be the primary management IP.
-        for search in (any_ip, f"{any_ip}/32"):
-            devs = nb.get_devices({"primary_ip4": search})
-            if devs:
-                mgmt = nb.get_device_mgmt_ip(devs[0])
-                log.debug("NetBox: %s is primary IP of %s", any_ip, devs[0].get("name", "?"))
-                return mgmt
-
-        # Slow path: find the IP address record and follow assignment → device.
+        # Step 1 — find the IPAM record for this IP.
+        # NetBox stores IPs in CIDR notation; try /32 first, then bare.
         ip_recs: list = []
-        for search in (f"{any_ip}/32", any_ip):
-            ip_recs = list(nb.nb.ipam.ip_addresses.filter(address=search))
+        for addr in (f"{next_hop_ip}/32", next_hop_ip):
+            ip_recs = list(nb.nb.ipam.ip_addresses.filter(address=addr))
             if ip_recs:
                 break
 
         if not ip_recs:
-            log.debug("NetBox: no IP record found for %s", any_ip)
+            log.debug("NetBox: no IP address record found for %s", next_hop_ip)
             return None
 
-        rec        = ip_recs[0]
-        obj_type   = str(getattr(rec, "assigned_object_type", "") or "")
-        obj_id     = getattr(rec, "assigned_object_id", None)
+        rec      = ip_recs[0]
+        obj_type = str(getattr(rec, "assigned_object_type", "") or "")
+        obj_id   = getattr(rec, "assigned_object_id", None)
 
         if not obj_id:
-            log.debug("NetBox: IP %s is not assigned to any interface", any_ip)
+            log.debug("NetBox: IP %s exists but is not assigned to any interface", next_hop_ip)
             return None
 
-        device_id: Optional[int] = None
-        if "dcim.interface" in obj_type:
-            iface = nb.nb.dcim.interfaces.get(obj_id)
-            if iface and iface.device:
-                device_id = int(iface.device.id)
-        # Virtual-machine interfaces are skipped (not SSH-able devices here).
-
-        if not device_id:
-            log.debug("NetBox: cannot determine device for IP %s (obj_type=%s)", any_ip, obj_type)
-            return None
-
-        devs = nb.get_devices({"id": device_id})
-        if devs:
-            mgmt = nb.get_device_mgmt_ip(devs[0])
+        # Step 2 — follow to the device that owns this interface.
+        if "dcim.interface" not in obj_type:
             log.debug(
-                "NetBox: resolved interface IP %s → device %s primary IP %s",
-                any_ip, devs[0].get("name", "?"), mgmt,
+                "NetBox: IP %s is assigned to %r (not a device interface) — skipping",
+                next_hop_ip, obj_type,
             )
-            return mgmt
+            return None
 
-        return None
+        iface = nb.nb.dcim.interfaces.get(obj_id)
+        if not iface or not iface.device:
+            log.debug("NetBox: interface id=%s has no associated device", obj_id)
+            return None
+
+        device_id = int(iface.device.id)
+
+        # Step 3 — get the device record and return its primary IPv4.
+        devs = nb.get_devices({"id": device_id})
+        if not devs:
+            log.debug("NetBox: device id=%s not found", device_id)
+            return None
+
+        device     = devs[0]
+        device_name = device.get("name", "unknown")
+        primary_ip  = nb.get_device_mgmt_ip(device)
+
+        if primary_ip:
+            print(
+                f"[L3]   NetBox: {next_hop_ip} → device '{device_name}' → primary IPv4 {primary_ip}"
+            )
+        else:
+            log.debug("NetBox: device '%s' has no primary IPv4 set", device_name)
+
+        return primary_ip
 
     except Exception as exc:
-        log.debug("NetBox IP resolution for %s failed: %s", any_ip, exc)
+        log.debug("NetBox resolution for %s failed: %s", next_hop_ip, exc)
         return None
 
 
@@ -1202,29 +1209,41 @@ def run_l3_path_trace(
         client     = None
         connect_err: str = ""
 
+        # ── Try direct SSH first ──────────────────────────────────────────────
         try:
             client = _open_device_client(connect_ip, "ios", creds)
         except GatewayConnectionError as exc:
             connect_err = str(exc)
             log.debug("Direct connect to %s failed: %s", connect_ip, exc)
 
+            # ── Fallback: resolve the IP to a Cisco device in NetBox ──────────
             if nb_url and nb_token:
-                print(f"[L3]   Cannot reach {current_ip} — querying NetBox for management IP...")
-                mgmt_ip = _resolve_mgmt_ip_from_netbox(nb_url, nb_token, current_ip, verify_ssl)
-                if mgmt_ip and mgmt_ip != current_ip:
-                    print(f"[L3]   NetBox resolved {current_ip} → {mgmt_ip} — retrying...")
-                    connect_ip = mgmt_ip
+                print(f"[L3]   Cannot reach {current_ip} — querying NetBox to resolve device...")
+                primary_ip = _resolve_mgmt_ip_from_netbox(
+                    nb_url, nb_token, current_ip, verify_ssl
+                )
+                if primary_ip and primary_ip != current_ip:
+                    print(f"[L3]   Connecting to device primary IPv4: {primary_ip}...")
+                    connect_ip = primary_ip
                     try:
                         client = _open_device_client(connect_ip, "ios", creds)
                         connect_err = ""
+                        print(f"[L3]   Connected via primary IP {connect_ip}")
                     except GatewayConnectionError as exc2:
                         connect_err = str(exc2)
-                        log.debug("NetBox fallback connect to %s also failed: %s", connect_ip, exc2)
+                        log.debug(
+                            "Primary IP connect to %s also failed: %s", connect_ip, exc2
+                        )
+                elif primary_ip == current_ip:
+                    log.debug(
+                        "NetBox primary IP for %s is the same address — no fallback available",
+                        current_ip,
+                    )
 
         if client is None:
             note = f"Cannot connect to {current_ip}"
             if connect_ip != current_ip:
-                note += f" (also tried NetBox primary {connect_ip})"
+                note += f"; also tried NetBox primary {connect_ip}"
             if connect_err:
                 note += f": {connect_err}"
             complete_paths.append(
