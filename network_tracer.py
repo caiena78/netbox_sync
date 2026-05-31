@@ -1905,17 +1905,45 @@ Examples:
 
 
 def _flat_l2_hops(layer2: Dict) -> List[Dict]:
-    """Convert the L2 upstream path to flat hop dicts (non-gateway entries only)."""
+    """Convert the L2 upstream path to flat hop dicts, including the gateway's
+    physical ingress port as the final L2 entry.
+
+    For every switch in the L2 path the ``ingress_interface`` is the port facing
+    the source device and ``egress_interface`` is the uplink toward the gateway.
+    The gateway itself is special — its ``ingress_interface`` is the *physical*
+    downlink port (e.g. ``Twe1/1/0/43``) while its ``egress_interface`` is the
+    SVI (e.g. ``Vlan128``).  The physical downlink belongs to the L2 segment;
+    the SVI belongs to the L3 segment and is emitted by ``_flat_l3_hops``.
+
+    This information comes directly from the downstream MAC/CDP trace — no
+    additional commands are needed.
+    """
     hops: List[Dict] = []
     for hop in (layer2.get("path") or []):
-        if hop.get("is_gateway"):
-            continue
+        device  = hop.get("hostname") or hop.get("switch_ip", "unknown")
         details: Dict = {}
         if hop.get("vlan"):
             try:
                 details["vlan"] = int(hop["vlan"])
             except (ValueError, TypeError):
                 details["vlan"] = hop["vlan"]
+
+        if hop.get("is_gateway"):
+            # The gateway's physical ingress port (e.g. Twe1/1/0/43) is the
+            # L2 endpoint of the source segment.  It was discovered when the
+            # initial trace ran CDP on the gateway's MAC-table interface and
+            # stored as ingress_interface in the reversed upstream path.
+            # The SVI (egress_interface = Vlan128) starts the L3 segment.
+            physical_ingress = hop.get("ingress_interface")
+            if physical_ingress:
+                hops.append({
+                    "layer":     "L2",
+                    "device":    device,
+                    "interface": physical_ingress,
+                    "details":   details,
+                })
+            continue
+
         egress = hop.get("egress_interface")
         if egress:
             details["egress_interface"] = egress
@@ -1924,7 +1952,7 @@ def _flat_l2_hops(layer2: Dict) -> List[Dict]:
             details["portchannel_members"] = mbrs
         hops.append({
             "layer":     "L2",
-            "device":    hop.get("hostname") or hop.get("switch_ip", "unknown"),
+            "device":    device,
             "interface": hop.get("ingress_interface") or "—",
             "details":   details,
         })
