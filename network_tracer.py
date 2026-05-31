@@ -25,7 +25,9 @@ tracing, and full hop-by-hop output.
 from __future__ import annotations
 
 import argparse
+import io
 import ipaddress
+import json
 import logging
 import os
 import re
@@ -1880,6 +1882,18 @@ Examples:
     tr.add_argument("--out-dir",  default=".",         help="Output directory for JSON/CSV (default: current dir)")
     tr.add_argument("--verbose",  action="store_true", help="Enable DEBUG logging")
 
+    out = p.add_argument_group("Output format")
+    out.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help=(
+            "Suppress all console output and print the complete L2+L3 trace "
+            "as a single pretty-printed JSON object.  Progress messages are "
+            "silenced; only the JSON is written to stdout."
+        ),
+    )
+
     return p
 
 
@@ -1893,107 +1907,131 @@ def main() -> int:
     args   = parser.parse_args()
     _configure_logging(verbose=args.verbose)
 
-    # ── Credential resolution ─────────────────────────────────────────────────
-    if _VAULT_AVAILABLE and is_vault_configured(args):
-        try:
-            addr, role_id, secret_id = resolve_vault_auth(args)
-            vc = VaultClient(
-                addr, role_id, secret_id,
-                mount=getattr(args, "vault_mount", "secret"),
-                path=getattr(args, "vault_path",  "network/device"),
-            )
-            secrets = vc.get_secrets()
-        except VaultError as exc:
-            log.error("Vault error: %s", exc)
-            return 1
-        username     = secrets["user"]
-        password     = secrets["password"]
-        netbox_url   = secrets["netbox_url"]
-        netbox_token = secrets["netbox_token"]
-        log.info("Credentials loaded from Vault")
-    else:
-        username     = args.username     or os.environ.get("DEVICE_USER",  "")
-        password     = args.password     or os.environ.get("DEVICE_PASS",  "")
-        netbox_url   = args.netbox_url   or os.environ.get("NETBOX_URL",   "")
-        netbox_token = args.netbox_token or os.environ.get("NETBOX_TOKEN", "")
+    json_mode    = args.json
+    _orig_stdout = sys.stdout
+    _trace_result: Optional[Dict] = None   # set inside try; read by finally
 
-    # ── Validate required credentials ─────────────────────────────────────────
-    errors: List[str] = []
-    if not netbox_url:
-        errors.append("NetBox URL required (--netbox-url, NETBOX_URL, or Vault)")
-    if not netbox_token:
-        errors.append("NetBox token required (--netbox-token, NETBOX_TOKEN, or Vault)")
-    if not username:
-        errors.append("SSH username required (--username, DEVICE_USER, or Vault)")
-    if not password:
-        errors.append("SSH password required (--password, DEVICE_PASS, or Vault)")
-    if errors:
-        for e in errors:
-            print(f"ERROR: {e}", file=sys.stderr)
-        parser.print_usage(sys.stderr)
-        return 1
+    # In JSON mode redirect stdout so no progress messages appear.
+    # The finally block always runs (even after early return 1) and
+    # outputs the JSON blob — or an error object when the trace fails.
+    if json_mode:
+        sys.stdout = io.StringIO()
 
-    verify_ssl = not args.no_ssl_verify
-    src_ip     = args.src_ip
-
-    creds: Dict[str, str] = {
-        "username": username,
-        "password": password,
-        "secret":   args.secret,
-        "timeout":  str(args.timeout),
-    }
-
-    # ── Phase 1: locate the gateway and verify SSH connectivity ───────────────
-
-    print(f"[INFO] Source IP: {src_ip}")
-
-    prefixes = get_prefixes_from_netbox(netbox_url, netbox_token, verify_ssl, contains=src_ip)
-    if not prefixes:
-        print(f"[ERROR] No matching subnet found for {src_ip} in NetBox")
-        log.error("No NetBox prefix contains %s", src_ip)
-        return 1
-
-    matched = find_longest_prefix_match(src_ip, prefixes)
-    if not matched:
-        print(f"[ERROR] No matching subnet found for {src_ip} in NetBox")
-        log.error("Longest-prefix match failed for %s among %d candidates", src_ip, len(prefixes))
-        return 1
-
-    print(f"[INFO] Matched subnet: {matched}")
-
-    gateway = calculate_first_usable_ip(matched)
-    if not gateway:
-        print(f"[ERROR] Could not determine gateway for subnet {matched}")
-        log.error("calculate_first_usable_ip(%r) returned None", matched)
-        return 1
-
-    print(f"[INFO] Gateway IP (first usable): {gateway}")
-    print("[INFO] Attempting connection to gateway...")
     try:
-        hostname = connect_to_device(gateway, creds)
-        print(f"[SUCCESS] Connected to {hostname}")
-    except GatewayConnectionError as exc:
-        print(f"[ERROR] Failed to connect: {exc}")
-        log.error("Gateway connection failed: %s", exc)
-        return 1
+        # ── Credential resolution ─────────────────────────────────────────────
+        if _VAULT_AVAILABLE and is_vault_configured(args):
+            try:
+                addr, role_id, secret_id = resolve_vault_auth(args)
+                vc = VaultClient(
+                    addr, role_id, secret_id,
+                    mount=getattr(args, "vault_mount", "secret"),
+                    path=getattr(args, "vault_path",  "network/device"),
+                )
+                secrets = vc.get_secrets()
+            except VaultError as exc:
+                log.error("Vault error: %s", exc)
+                return 1
+            username     = secrets["user"]
+            password     = secrets["password"]
+            netbox_url   = secrets["netbox_url"]
+            netbox_token = secrets["netbox_token"]
+            log.info("Credentials loaded from Vault")
+        else:
+            username     = args.username     or os.environ.get("DEVICE_USER",  "")
+            password     = args.password     or os.environ.get("DEVICE_PASS",  "")
+            netbox_url   = args.netbox_url   or os.environ.get("NETBOX_URL",   "")
+            netbox_token = args.netbox_token or os.environ.get("NETBOX_TOKEN", "")
 
-    # ── Phase 2: L2 + L3 trace → collect all data, print once at the end ─────
-    result = run_l2_trace(
-        target_ip    = src_ip,
-        dst_ip       = args.dst_ip,
-        gateway_ip   = gateway,
-        creds        = creds,
-        source_is_ap = False,   # CDP stop conditions handle endpoints
-        max_hops     = args.max_hops,
-        nb_url       = netbox_url,
-        nb_token     = netbox_token,
-        verify_ssl   = verify_ssl,
-    )
+        # ── Validate required credentials ─────────────────────────────────────
+        errors: List[str] = []
+        if not netbox_url:
+            errors.append("NetBox URL required (--netbox-url, NETBOX_URL, or Vault)")
+        if not netbox_token:
+            errors.append("NetBox token required (--netbox-token, NETBOX_TOKEN, or Vault)")
+        if not username:
+            errors.append("SSH username required (--username, DEVICE_USER, or Vault)")
+        if not password:
+            errors.append("SSH password required (--password, DEVICE_PASS, or Vault)")
+        if errors:
+            for e in errors:
+                print(f"ERROR: {e}", file=sys.stderr)
+            parser.print_usage(sys.stderr)
+            return 1
 
-    if result:
-        print_trace_summary(result)
+        verify_ssl = not args.no_ssl_verify
+        src_ip     = args.src_ip
 
-    return 0
+        creds: Dict[str, str] = {
+            "username": username,
+            "password": password,
+            "secret":   args.secret,
+            "timeout":  str(args.timeout),
+        }
+
+        # ── Phase 1: locate the gateway and verify SSH connectivity ───────────
+        print(f"[INFO] Source IP: {src_ip}")
+
+        prefixes = get_prefixes_from_netbox(netbox_url, netbox_token, verify_ssl, contains=src_ip)
+        if not prefixes:
+            print(f"[ERROR] No matching subnet found for {src_ip} in NetBox")
+            log.error("No NetBox prefix contains %s", src_ip)
+            return 1
+
+        matched = find_longest_prefix_match(src_ip, prefixes)
+        if not matched:
+            print(f"[ERROR] No matching subnet found for {src_ip} in NetBox")
+            log.error("Longest-prefix match failed for %s among %d candidates", src_ip, len(prefixes))
+            return 1
+
+        print(f"[INFO] Matched subnet: {matched}")
+
+        gateway = calculate_first_usable_ip(matched)
+        if not gateway:
+            print(f"[ERROR] Could not determine gateway for subnet {matched}")
+            log.error("calculate_first_usable_ip(%r) returned None", matched)
+            return 1
+
+        print(f"[INFO] Gateway IP (first usable): {gateway}")
+        print("[INFO] Attempting connection to gateway...")
+        try:
+            hostname = connect_to_device(gateway, creds)
+            print(f"[SUCCESS] Connected to {hostname}")
+        except GatewayConnectionError as exc:
+            print(f"[ERROR] Failed to connect: {exc}")
+            log.error("Gateway connection failed: %s", exc)
+            return 1
+
+        # ── Phase 2: L2 + L3 trace → collect all data, print once at the end ─
+        result = run_l2_trace(
+            target_ip    = src_ip,
+            dst_ip       = args.dst_ip,
+            gateway_ip   = gateway,
+            creds        = creds,
+            source_is_ap = False,
+            max_hops     = args.max_hops,
+            nb_url       = netbox_url,
+            nb_token     = netbox_token,
+            verify_ssl   = verify_ssl,
+        )
+
+        _trace_result = result
+
+        if result and not json_mode:
+            print_trace_summary(result)
+
+        return 0
+
+    finally:
+        if json_mode:
+            sys.stdout = _orig_stdout
+            if _trace_result is not None:
+                print(json.dumps(_trace_result, indent=2, default=str))
+            else:
+                print(json.dumps({
+                    "error":   "Trace did not complete — see log file for details",
+                    "src_ip":  getattr(args, "src_ip",  ""),
+                    "dst_ip":  getattr(args, "dst_ip",  ""),
+                }, indent=2))
 
 
 if __name__ == "__main__":
