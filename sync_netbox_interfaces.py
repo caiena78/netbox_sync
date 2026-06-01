@@ -1503,54 +1503,291 @@ def _nb_find_ip_by_cidr(
         return None
 
 
-def _correct_ip_assignment(
-    nb: NetBoxClient,
-    device_name: str,
-    ip_cidr: str,
-    target_device_id: int,
+def _backup_ip_metadata(nb: NetBoxClient, ip_id: int) -> Dict:
+    """
+    Return a restorable snapshot of all metadata fields from an IP record.
+
+    Fields captured: description, dns_name, status, role, tenant, vrf,
+    tags (as list of IDs), custom_fields, comments, nat_inside, nat_outside.
+
+    Used before a delete+recreate so no human-maintained data is lost.
+    Returns an empty-but-valid dict on any lookup failure.
+    """
+    backup: Dict = {
+        "description":   None,
+        "dns_name":      None,
+        "status":        None,
+        "role":          None,
+        "tenant":        None,
+        "vrf":           None,
+        "tags":          [],
+        "custom_fields": {},
+        "comments":      None,
+        "nat_inside":    None,
+        "nat_outside":   None,
+    }
+    try:
+        rec = nb.nb.ipam.ip_addresses.get(ip_id)
+        if not rec:
+            return backup
+
+        backup["description"] = getattr(rec, "description", None) or None
+        backup["dns_name"]    = getattr(rec, "dns_name",    None) or None
+        backup["comments"]    = getattr(rec, "comments",    None) or None
+
+        # Choice fields: pynetbox returns {"value": "...", "label": "..."}
+        for field in ("status", "role"):
+            val = getattr(rec, field, None)
+            if val:
+                backup[field] = val.value if hasattr(val, "value") else str(val)
+
+        # FK fields: reduce to integer ID for the create payload
+        for field in ("tenant", "vrf"):
+            val = getattr(rec, field, None)
+            if val:
+                backup[field] = int(val.id)
+
+        # Tags: list of tag objects → list of IDs
+        tags = getattr(rec, "tags", None)
+        if tags:
+            backup["tags"] = [int(t.id) for t in tags if hasattr(t, "id")]
+
+        # custom_fields: already a plain dict in pynetbox
+        cf = getattr(rec, "custom_fields", None)
+        if cf:
+            backup["custom_fields"] = dict(cf)
+
+        # NAT FK → integer ID
+        for field in ("nat_inside", "nat_outside"):
+            val = getattr(rec, field, None)
+            if val:
+                backup[field] = int(val.id)
+
+    except Exception as exc:
+        log.debug("_backup_ip_metadata(ip_id=%s): %s", ip_id, exc)
+
+    return backup
+
+
+def _is_ip_primary_on_any_device(nb: NetBoxClient, ip_id: int) -> bool:
+    """
+    Return True when *ip_id* is set as primary_ip4 or primary_ip6 on any
+    device in NetBox.  Used as a safety guard before deleting an IP record:
+    deleting a primary IP would break the device's reachability in NetBox.
+    """
+    try:
+        for filter_name in ("primary_ip4_id", "primary_ip6_id"):
+            if list(nb.nb.dcim.devices.filter(**{filter_name: ip_id})):
+                return True
+    except Exception as exc:
+        log.debug("_is_ip_primary_on_any_device(ip_id=%s): %s", ip_id, exc)
+    return False
+
+
+def _safe_update_or_recreate_ip(
+    nb:               NetBoxClient,
+    device_name:      str,
+    ip_id:            int,
+    new_cidr:         str,
+    target_iface_id:  int,
+    nb_vrf_id:        Optional[int],
+    backup:           Dict,
+    dry_run:          bool,
+    counters:         Dict[str, int],
+) -> str:
+    """
+    Apply a corrective change to an existing IP record in the safest way.
+
+    Strategy
+    --------
+    1. Build the PATCH payload (new ``address``, reassigned interface, VRF).
+    2. Try ``update_ip_address_fields()`` — a single PATCH that corrects the
+       address *and* the assignment in one round-trip.
+    3. If the PATCH raises, fall back to delete + recreate:
+       a. Verify the record is not a primary IP (to avoid breaking NetBox
+          reachability).  If it is, log a warning and return ``"skipped"``.
+       b. Delete the old record.
+       c. Recreate with all backed-up metadata plus the corrected CIDR and
+          the new interface assignment.
+
+    Returns one of: ``"updated"`` | ``"recreated"`` | ``"skipped"``.
+
+    Parameters
+    ----------
+    backup : dict
+        Metadata captured before modification (from ``_backup_ip_metadata``).
+        Used only in the recreate path.
+    """
+    patch: Dict = {
+        "address":              new_cidr,
+        "assigned_object_type": "dcim.interface",
+        "assigned_object_id":   target_iface_id,
+    }
+    if nb_vrf_id is not None:
+        patch["vrf"] = nb_vrf_id
+
+    # ── Dry-run ───────────────────────────────────────────────────────────────
+    if dry_run:
+        log.info(
+            "DRY-RUN  %-30s  would PATCH ip_id=%s  address→%s  iface_id→%s",
+            device_name, ip_id, new_cidr, target_iface_id,
+        )
+        return "updated"
+
+    # ── Attempt 1: PATCH ──────────────────────────────────────────────────────
+    try:
+        nb.update_ip_address_fields(ip_id, patch)
+        log.info(
+            "%-30s  IP id=%s PATCHed → address=%s  iface_id=%s",
+            device_name, ip_id, new_cidr, target_iface_id,
+        )
+        return "updated"
+    except NetBoxClientError as patch_exc:
+        log.warning(
+            "%-30s  IP id=%s PATCH failed (%s) — attempting delete+recreate",
+            device_name, ip_id, patch_exc,
+        )
+
+    # ── Attempt 2: delete + recreate ──────────────────────────────────────────
+    # Safety: never delete an IP that is the primary IP of a device.
+    if _is_ip_primary_on_any_device(nb, ip_id):
+        log.warning(
+            "%-30s  IP id=%s is a device primary IP — cannot delete; "
+            "manual correction required for address %s",
+            device_name, ip_id, new_cidr,
+        )
+        counters["ip_conflicts_skipped"] = counters.get("ip_conflicts_skipped", 0) + 1
+        return "skipped"
+
+    try:
+        nb.delete_ip_address(ip_id)
+        log.info("%-30s  IP id=%s deleted (will recreate as %s)", device_name, ip_id, new_cidr)
+    except NetBoxClientError as del_exc:
+        log.warning(
+            "%-30s  IP id=%s delete failed: %s — skipping",
+            device_name, ip_id, del_exc,
+        )
+        counters["ip_conflicts_skipped"] = counters.get("ip_conflicts_skipped", 0) + 1
+        return "skipped"
+
+    # Build recreate payload from backup + new values
+    recreate_payload: Dict = {
+        "address":              new_cidr,
+        "status":               "active",
+        "assigned_object_type": "dcim.interface",
+        "assigned_object_id":   target_iface_id,
+    }
+    if nb_vrf_id is not None:
+        recreate_payload["vrf"] = nb_vrf_id
+    for field in (
+        "description", "dns_name", "status", "role",
+        "tenant", "comments", "nat_inside", "nat_outside",
+    ):
+        val = backup.get(field)
+        if val is not None:
+            recreate_payload[field] = val
+    if backup.get("tags"):
+        recreate_payload["tags"] = backup["tags"]
+    if backup.get("custom_fields"):
+        recreate_payload["custom_fields"] = backup["custom_fields"]
+
+    try:
+        result = nb.create_ip_address(recreate_payload)
+        log.info(
+            "%-30s  IP recreated id=%s  address=%s  iface_id=%s  "
+            "(description=%r  dns_name=%r  tags=%s)",
+            device_name,
+            result.get("id"),
+            new_cidr,
+            target_iface_id,
+            backup.get("description"),
+            backup.get("dns_name"),
+            len(backup.get("tags") or []),
+        )
+        counters["ip_force_recreated"] = counters.get("ip_force_recreated", 0) + 1
+        return "recreated"
+    except NetBoxClientError as create_exc:
+        log.error(
+            "%-30s  IP recreate failed for %s on iface_id=%s: %s",
+            device_name, new_cidr, target_iface_id, create_exc,
+        )
+        counters["ip_conflicts_skipped"] = counters.get("ip_conflicts_skipped", 0) + 1
+        return "skipped"
+
+
+def _correct_ip_and_subnet(
+    nb:                NetBoxClient,
+    device_name:       str,
+    ip_cidr:           str,
+    target_device_id:  int,
     target_iface_name: str,
-    nb_vrf_id: Optional[int],
-    dry_run: bool,
-    counters: Dict[str, int],
+    nb_vrf_id:         Optional[int],
+    dry_run:           bool,
+    counters:          Dict[str, int],
 ) -> None:
     """
-    Ensure *ip_cidr* is assigned to *target_device_id*/*target_iface_name*.
+    Ensure the live IP *ip_cidr* (including the correct subnet mask) is
+    assigned to *target_device_id*/*target_iface_name* in NetBox.
 
-    Wraps :meth:`NetBoxClient.ensure_ip_on_interface` with:
+    Three cases handled in order:
 
-    - **Pre-flight global lookup** so corrective log messages include the
-      old device/interface name when the IP is being moved.
-    - **VRF-conflict guard**: when the live VRF and the NetBox record's VRF
-      disagree *and* the IP is currently on a *different* device, the
-      correction is skipped and a warning logged rather than blindly
-      moving the IP.  Same-device VRF mismatches are handled safely by
-      ``ensure_ip_on_interface`` (delete + recreate).
-    - **Structured counters** incremented in-place on *counters*:
-      ``ip_assignments_corrected``, ``ip_reassignments``,
-      ``ip_conflicts_skipped``.
+    **Case 1 — Exact CIDR match found**
+      The IP record with the correct address/mask already exists.
+      If it is on the wrong interface/device, reassign it.
+      Delegates to ``ensure_ip_on_interface`` (existing battle-tested path).
 
-    Dry-run gate: when *dry_run* is ``True``, nothing is written to NetBox
-    but the same log lines and counters are produced so operators can
-    preview exactly what *would* change.
+    **Case 2 — Same host IP, different prefix length (subnet mismatch)**
+      Device has ``10.1.1.1/24``; NetBox has ``10.1.1.1/32``.
+      If ``ensure_ip_on_interface`` were called without this check it would
+      silently CREATE a second record and leave the ``/32`` as a duplicate.
+      Instead:
+        a. Try a single PATCH that updates ``address`` and the assignment.
+        b. If PATCH fails: backup all metadata → delete → recreate with the
+           corrected CIDR and all backed-up fields restored.
 
-    Interface not found: if the target interface does not yet exist in
-    NetBox a DEBUG message is logged and the function returns silently;
-    Stage 1 is expected to create it first.
+    **Case 3 — IP not in NetBox at all**
+      Create it via ``ensure_ip_on_interface`` (existing path).
+
+    Safety guards
+    -------------
+    * VRF conflict on cross-device moves → skip + warn.
+    * IP is a device primary_ip → skip delete+recreate + warn.
+    * Multiple records with the same host IP → use the one with matching
+      VRF; log a warning if ambiguous.
+
+    Counters incremented
+    --------------------
+    ``ip_assignments_corrected``, ``ip_reassignments``,
+    ``ip_subnet_corrections``, ``ip_force_recreated``,
+    ``ip_conflicts_skipped``.
     """
-    # ── Pre-flight: find IP globally to build corrective-action context ───────
-    existing      = _nb_find_ip_by_cidr(nb, ip_cidr)
-    is_wrong_iface = False
+    host_ip = ip_cidr.split("/")[0]
 
-    if existing is not None:
-        rec_vrf_id     = existing.get("vrf_id")
-        assigned_type  = existing.get("assigned_object_type", "")
-        assigned_id    = existing.get("assigned_object_id")
-        assigned_dev   = existing.get("assigned_device_name") or "?"
-        assigned_iface = existing.get("assigned_iface_name") or f"id={assigned_id}"
+    # ── Resolve target interface ID (needed for direct PATCH) ──────────────────
+    # We fetch it lazily below only when needed.
+    _target_iface_id: Optional[int] = None
 
-        # VRF conflict guard: skip cross-device moves when VRFs disagree.
+    def _get_target_iface_id() -> Optional[int]:
+        nonlocal _target_iface_id
+        if _target_iface_id is None:
+            _target_iface_id = _nb_get_interface_id(
+                nb, target_device_id, target_iface_name
+            )
+        return _target_iface_id
+
+    # ── Search 1: exact CIDR ───────────────────────────────────────────────────
+    exact = _nb_find_ip_by_cidr(nb, ip_cidr)
+
+    if exact is not None:
+        # Case 1 — exact address found; handle assignment via existing path.
+        rec_vrf_id     = exact.get("vrf_id")
+        assigned_type  = exact.get("assigned_object_type", "")
+        assigned_id    = exact.get("assigned_object_id")
+        assigned_dev   = exact.get("assigned_device_name") or "?"
+        assigned_iface = exact.get("assigned_iface_name") or f"id={assigned_id}"
+
         vrf_conflict = (
-            nb_vrf_id  is not None
+            nb_vrf_id is not None
             and rec_vrf_id is not None
             and rec_vrf_id != nb_vrf_id
             and assigned_dev != device_name
@@ -1561,15 +1798,13 @@ def _correct_ip_assignment(
                 "live_vrf_id=%s  nb_record_vrf_id=%s  "
                 "currently on %s/%s — SKIPPED",
                 device_name, ip_cidr,
-                nb_vrf_id, rec_vrf_id,
-                assigned_dev, assigned_iface,
+                nb_vrf_id, rec_vrf_id, assigned_dev, assigned_iface,
             )
             counters["ip_conflicts_skipped"] = (
                 counters.get("ip_conflicts_skipped", 0) + 1
             )
             return
 
-        # Detect cross-interface assignment for richer log output.
         is_dcim_iface  = "interface" in assigned_type.lower()
         is_wrong_iface = (
             is_dcim_iface
@@ -1578,41 +1813,178 @@ def _correct_ip_assignment(
         )
         if is_wrong_iface:
             log.info(
-                "%-30s  IP %-22s CORRECTING: %s/%s → %s",
+                "%-30s  IP %-22s REASSIGNING: %s/%s → %s",
                 device_name, ip_cidr, assigned_dev, assigned_iface,
                 target_iface_name,
             )
 
-    # ── Dry-run ───────────────────────────────────────────────────────────────
-    if dry_run:
-        if existing is None:
-            log.info(
-                "DRY-RUN  %-30s  would CREATE IP %-22s → %s",
-                device_name, ip_cidr, target_iface_name,
+        if dry_run:
+            msg = (
+                f"DRY-RUN  {device_name:<30}  "
+                f"would {'REASSIGN' if is_wrong_iface else 'assign'} "
+                f"IP {ip_cidr:<22} "
+                + (f"from {assigned_dev}/{assigned_iface} " if is_wrong_iface else "")
+                + f"→ {target_iface_name}"
             )
-        elif is_wrong_iface:
-            log.info(
-                "DRY-RUN  %-30s  would REASSIGN IP %-22s from %s/%s → %s",
-                device_name, ip_cidr,
-                existing.get("assigned_device_name", "?"),
-                existing.get("assigned_iface_name", "?"),
-                target_iface_name,
+            log.info(msg)
+            counters["ip_assignments_corrected"] = (
+                counters.get("ip_assignments_corrected", 0) + 1
             )
+            if is_wrong_iface:
+                counters["ip_reassignments"] = (
+                    counters.get("ip_reassignments", 0) + 1
+                )
+            return
+
+        try:
+            result = nb.ensure_ip_on_interface(
+                ip_cidr=ip_cidr,
+                device_id=target_device_id,
+                interface_name=target_iface_name,
+                vrf_id=nb_vrf_id,
+            )
+            action = result.get("_action", "skipped")
+            if action in ("created", "updated"):
+                counters["ip_assignments_corrected"] = (
+                    counters.get("ip_assignments_corrected", 0) + 1
+                )
+                if action == "updated" and is_wrong_iface:
+                    counters["ip_reassignments"] = (
+                        counters.get("ip_reassignments", 0) + 1
+                    )
+                    log.info(
+                        "%-30s  IP %-22s reassigned from %s/%s → %s",
+                        device_name, ip_cidr,
+                        exact.get("assigned_device_name", "?"),
+                        exact.get("assigned_iface_name", "?"),
+                        target_iface_name,
+                    )
+                else:
+                    log.info(
+                        "%-30s  IP %-22s → %s (%s)",
+                        device_name, ip_cidr, target_iface_name, action,
+                    )
+            else:
+                log.debug(
+                    "%-30s  IP %-22s already on %s — no change",
+                    device_name, ip_cidr, target_iface_name,
+                )
+        except NetBoxClientError as exc:
+            if "not found" in str(exc).lower():
+                log.debug(
+                    "%-30s  IP %r → %r: interface not in NetBox yet — skipping",
+                    device_name, ip_cidr, target_iface_name,
+                )
+            else:
+                log.warning(
+                    "%-30s  IP %r → %r failed: %s",
+                    device_name, ip_cidr, target_iface_name, exc,
+                )
+        return
+
+    # ── Search 2: host IP only — catches subnet-mask mismatches ────────────────
+    # e.g. live device has 10.1.1.1/24 but NetBox stores 10.1.1.1/32
+    try:
+        host_matches = nb.find_ips_by_host_address(host_ip)
+    except NetBoxClientError as exc:
+        log.debug("_correct_ip_and_subnet: host search for %s failed: %s", host_ip, exc)
+        host_matches = []
+
+    # Filter to records in the correct VRF (or global if vrf_id is None)
+    vrf_candidates = []
+    for rec in host_matches:
+        rec_vrf_raw = rec.get("vrf")
+        if isinstance(rec_vrf_raw, dict):
+            rec_vrf_id = rec_vrf_raw.get("id")
         else:
-            log.info(
-                "DRY-RUN  %-30s  would assign IP %-22s → %s",
-                device_name, ip_cidr, target_iface_name,
+            rec_vrf_id = None
+        if nb_vrf_id is None and rec_vrf_id is not None:
+            continue   # caller wants global table; this record is in a VRF
+        if nb_vrf_id is not None and rec_vrf_id != nb_vrf_id:
+            continue   # VRF mismatch — skip
+        vrf_candidates.append(rec)
+
+    if vrf_candidates:
+        # Case 2 — same host IP, different prefix-length in NetBox
+        if len(vrf_candidates) > 1:
+            log.warning(
+                "%-30s  host %s has %d records in NetBox with the same VRF context "
+                "— using first; manual deduplication may be required",
+                device_name, host_ip, len(vrf_candidates),
             )
-        counters["ip_assignments_corrected"] = (
-            counters.get("ip_assignments_corrected", 0) + 1
+
+        nb_rec       = vrf_candidates[0]
+        existing_id  = nb_rec["id"]
+        existing_cidr = (
+            nb_rec.get("address") or
+            (nb_rec.get("address", {}).get("address") if isinstance(nb_rec.get("address"), dict) else None)
+        ) or f"{host_ip}/?"
+
+        log.info(
+            "%-30s  SUBNET MISMATCH  host=%s  nb=%s  live=%s",
+            device_name, host_ip, existing_cidr, ip_cidr,
         )
-        if is_wrong_iface:
-            counters["ip_reassignments"] = (
-                counters.get("ip_reassignments", 0) + 1
+
+        target_iface_id = _get_target_iface_id()
+        if target_iface_id is None:
+            log.debug(
+                "%-30s  subnet correction skipped — interface %r not in NetBox yet",
+                device_name, target_iface_name,
+            )
+            return
+
+        if dry_run:
+            log.info(
+                "DRY-RUN  %-30s  would UPDATE ip_id=%s  %s → %s  iface=%s",
+                device_name, existing_id, existing_cidr, ip_cidr, target_iface_name,
+            )
+            counters["ip_subnet_corrections"] = (
+                counters.get("ip_subnet_corrections", 0) + 1
+            )
+            counters["ip_assignments_corrected"] = (
+                counters.get("ip_assignments_corrected", 0) + 1
+            )
+            return
+
+        # Backup before any destructive change
+        backup = _backup_ip_metadata(nb, existing_id)
+
+        outcome = _safe_update_or_recreate_ip(
+            nb              = nb,
+            device_name     = device_name,
+            ip_id           = existing_id,
+            new_cidr        = ip_cidr,
+            target_iface_id = target_iface_id,
+            nb_vrf_id       = nb_vrf_id,
+            backup          = backup,
+            dry_run         = False,
+            counters        = counters,
+        )
+
+        if outcome in ("updated", "recreated"):
+            counters["ip_subnet_corrections"] = (
+                counters.get("ip_subnet_corrections", 0) + 1
+            )
+            counters["ip_assignments_corrected"] = (
+                counters.get("ip_assignments_corrected", 0) + 1
             )
         return
 
-    # ── Live: delegate to ensure_ip_on_interface ─────────────────────────────
+    # ── Case 3: not in NetBox at all — create it ────────────────────────────────
+    log.info(
+        "%-30s  IP %-22s not in NetBox — creating on %s",
+        device_name, ip_cidr, target_iface_name,
+    )
+    if dry_run:
+        log.info(
+            "DRY-RUN  %-30s  would CREATE IP %-22s → %s",
+            device_name, ip_cidr, target_iface_name,
+        )
+        counters["ip_assignments_corrected"] = (
+            counters.get("ip_assignments_corrected", 0) + 1
+        )
+        return
+
     try:
         result = nb.ensure_ip_on_interface(
             ip_cidr=ip_cidr,
@@ -1620,34 +1992,14 @@ def _correct_ip_assignment(
             interface_name=target_iface_name,
             vrf_id=nb_vrf_id,
         )
-        action = result.get("_action", "skipped")
-
-        if action in ("created", "updated"):
+        if result.get("_action") in ("created", "updated"):
             counters["ip_assignments_corrected"] = (
                 counters.get("ip_assignments_corrected", 0) + 1
             )
-            if action == "updated" and is_wrong_iface:
-                counters["ip_reassignments"] = (
-                    counters.get("ip_reassignments", 0) + 1
-                )
-                log.info(
-                    "%-30s  IP %-22s reassigned from %s/%s → %s",
-                    device_name, ip_cidr,
-                    existing.get("assigned_device_name", "?"),   # type: ignore[union-attr]
-                    existing.get("assigned_iface_name", "?"),    # type: ignore[union-attr]
-                    target_iface_name,
-                )
-            else:
-                log.info(
-                    "%-30s  IP %-22s → %s (%s)",
-                    device_name, ip_cidr, target_iface_name, action,
-                )
-        else:
-            log.debug(
-                "%-30s  IP %-22s already on %s — no change",
-                device_name, ip_cidr, target_iface_name,
+            log.info(
+                "%-30s  IP %-22s → %s (%s)",
+                device_name, ip_cidr, target_iface_name, result.get("_action"),
             )
-
     except NetBoxClientError as exc:
         if "not found" in str(exc).lower():
             log.debug(
@@ -1655,7 +2007,14 @@ def _correct_ip_assignment(
                 device_name, ip_cidr, target_iface_name,
             )
         else:
-            raise
+            log.warning(
+                "%-30s  IP %r → %r: create failed: %s",
+                device_name, ip_cidr, target_iface_name, exc,
+            )
+
+
+# Backward-compatible alias — internal callers use _correct_ip_and_subnet directly.
+_correct_ip_assignment = _correct_ip_and_subnet
 
 
 def _purge_stale_ip_assignments(
@@ -3588,6 +3947,8 @@ def sync_device(
         "interfaces_skipped_missing_module":         0,
         "ip_assignments_corrected":                  0,
         "ip_reassignments":                          0,
+        "ip_subnet_corrections":                     0,
+        "ip_force_recreated":                        0,
         "stale_ip_assignments_removed":              0,
         "ip_conflicts_skipped":                      0,
         "errors":                          [],
@@ -4184,6 +4545,7 @@ def sync_device(
         summary["svi_prefixes_updated"]  = pfx_updated
         summary["errors"].extend(svi_errors)
         for _k in ("ip_assignments_corrected", "ip_reassignments",
+                   "ip_subnet_corrections", "ip_force_recreated",
                    "stale_ip_assignments_removed", "ip_conflicts_skipped"):
             summary[_k] = summary.get(_k, 0) + svi_ip_corr.get(_k, 0)
 
@@ -4223,6 +4585,7 @@ def sync_device(
         summary["routed_ips_assigned"]       = p_ips
         summary["errors"].extend(p_errors)
         for _k in ("ip_assignments_corrected", "ip_reassignments",
+                   "ip_subnet_corrections", "ip_force_recreated",
                    "stale_ip_assignments_removed", "ip_conflicts_skipped"):
             summary[_k] = summary.get(_k, 0) + p_ip_corr.get(_k, 0)
 

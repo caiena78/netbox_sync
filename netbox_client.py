@@ -3053,6 +3053,150 @@ class NetBoxClient:
                 f"clear_ip_interface_assignment(ip_id={ip_id}) failed: {exc}"
             ) from exc
 
+    def get_ip_full_record(self, ip_id: int) -> dict:
+        """
+        Return the complete NetBox IP address record as a plain dict.
+
+        All fields are included — description, dns_name, status, role,
+        tenant, vrf, tags, custom_fields, comments, nat_inside,
+        nat_outside — so the caller can create an identical record after
+        a delete/recreate operation.
+
+        Raises
+        ------
+        NetBoxClientError
+            When the record is not found or the API call fails.
+        """
+        self.log.debug("get_ip_full_record ip_id=%s", ip_id)
+        try:
+            rec = self.nb.ipam.ip_addresses.get(ip_id)
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"get_ip_full_record: lookup id={ip_id} failed: {exc}"
+            ) from exc
+        if rec is None:
+            raise NetBoxClientError(f"get_ip_full_record: id={ip_id} not found")
+        return self._to_dict(rec)
+
+    def update_ip_address_fields(self, ip_id: int, fields: dict) -> dict:
+        """
+        PATCH arbitrary fields on an existing IP address record.
+
+        *fields* may include ``address`` (to correct the prefix length),
+        ``assigned_object_type``, ``assigned_object_id``, ``description``,
+        ``dns_name``, ``vrf``, ``status``, ``role``, ``tenant``, ``tags``,
+        ``custom_fields``, etc.
+
+        Returns the updated record dict with ``"_action": "updated"``.
+
+        Raises
+        ------
+        NetBoxClientError
+            When the record is not found or the PATCH fails.
+        """
+        self.log.debug("update_ip_address_fields ip_id=%s fields=%s", ip_id, list(fields))
+        try:
+            rec = self.nb.ipam.ip_addresses.get(ip_id)
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"update_ip_address_fields: lookup id={ip_id} failed: {exc}"
+            ) from exc
+        if rec is None:
+            raise NetBoxClientError(f"update_ip_address_fields: id={ip_id} not found")
+        try:
+            rec.update(fields)
+            d = self._to_dict(rec)
+            d["_action"] = "updated"
+            return d
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"update_ip_address_fields(ip_id={ip_id}): {exc}"
+            ) from exc
+
+    def delete_ip_address(self, ip_id: int) -> bool:
+        """
+        Delete an IP address record by primary key.
+
+        Returns ``True`` on success, ``False`` when the record does not
+        exist (idempotent).
+
+        Raises
+        ------
+        NetBoxClientError
+            When the API call fails for any reason other than not-found.
+        """
+        self.log.debug("delete_ip_address ip_id=%s", ip_id)
+        try:
+            rec = self.nb.ipam.ip_addresses.get(ip_id)
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"delete_ip_address: lookup id={ip_id} failed: {exc}"
+            ) from exc
+        if rec is None:
+            return False
+        try:
+            rec.delete()
+            return True
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"delete_ip_address(ip_id={ip_id}): {exc}"
+            ) from exc
+
+    def create_ip_address(self, payload: dict) -> dict:
+        """
+        Create an IP address record from *payload*.
+
+        *payload* must include at minimum ``address``.
+        All other standard fields (``assigned_object_type``,
+        ``assigned_object_id``, ``vrf``, ``description``, ``dns_name``,
+        ``status``, ``role``, ``tenant``, ``tags``, ``custom_fields``)
+        are passed through unchanged.
+
+        Returns the new record dict with ``"_action": "created"``.
+
+        Raises
+        ------
+        NetBoxClientError
+            When the API call fails.
+        """
+        self.log.debug("create_ip_address address=%r", payload.get("address"))
+        try:
+            rec = self.nb.ipam.ip_addresses.create(payload)
+            d   = self._to_dict(rec)
+            d["_action"] = "created"
+            return d
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"create_ip_address({payload.get('address', '?')!r}): {exc}"
+            ) from exc
+
+    def find_ips_by_host_address(self, host_ip: str) -> list:
+        """
+        Return all IP address records whose host part equals *host_ip*,
+        regardless of prefix length.
+
+        E.g. querying ``"10.1.1.1"`` returns records for ``"10.1.1.1/24"``,
+        ``"10.1.1.1/32"``, etc.
+
+        This is used to detect subnet-mask mismatches: the live device
+        reports ``10.1.1.1/24`` but NetBox stores ``10.1.1.1/32``.
+
+        Returns a list of plain dicts (``_to_dict`` applied to each record).
+
+        Raises
+        ------
+        NetBoxClientError
+            On API failure.
+        """
+        self.log.debug("find_ips_by_host_address host=%r", host_ip)
+        try:
+            recs = list(self.nb.ipam.ip_addresses.filter(address=host_ip))
+            return [self._to_dict(r) for r in recs]
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"find_ips_by_host_address({host_ip!r}): {exc}"
+            ) from exc
+
     def get_ip_by_address(self, address: str) -> Optional[dict]:
         """
         Return the first NetBox IP address record whose ``address`` field
