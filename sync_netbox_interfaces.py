@@ -1763,17 +1763,36 @@ def _correct_ip_and_subnet(
     """
     host_ip = ip_cidr.split("/")[0]
 
-    # ── Resolve target interface ID (needed for direct PATCH) ──────────────────
-    # We fetch it lazily below only when needed.
-    _target_iface_id: Optional[int] = None
+    # ── Resolve target interface ID (needed for fast-path + direct PATCH) ──────
+    # Fetched once here; reused throughout the function.
+    _target_iface_id: Optional[int] = _nb_get_interface_id(
+        nb, target_device_id, target_iface_name
+    )
 
     def _get_target_iface_id() -> Optional[int]:
-        nonlocal _target_iface_id
-        if _target_iface_id is None:
-            _target_iface_id = _nb_get_interface_id(
-                nb, target_device_id, target_iface_name
-            )
         return _target_iface_id
+
+    # ── Fast path: IP is already correct — touch timestamp and return ───────────
+    # Check before any global IP search so the common "already correct" case
+    # costs only two cheap API calls (interface-id lookup + IPs-for-interface)
+    # instead of the full global CIDR search + ensure_ip_on_interface round-trip.
+    if _target_iface_id is not None:
+        for rec in _nb_get_ips_for_interface(nb, _target_iface_id):
+            if rec["address"] == ip_cidr:
+                # Correct IP is already on the correct interface.
+                log.debug(
+                    "%-30s  IP %-22s already on %s — no change",
+                    device_name, ip_cidr, target_iface_name,
+                )
+                if not dry_run:
+                    try:
+                        nb.touch_ip_last_update(rec["id"])
+                    except Exception as exc:
+                        log.debug(
+                            "%-30s  IP %-22s timestamp update failed: %s",
+                            device_name, ip_cidr, exc,
+                        )
+                return
 
     # ── Search 1: exact CIDR ───────────────────────────────────────────────────
     exact = _nb_find_ip_by_cidr(nb, ip_cidr)
