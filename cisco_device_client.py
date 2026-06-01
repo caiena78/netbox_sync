@@ -1995,21 +1995,101 @@ class CiscoDeviceClient:
         1. ``show interfaces``    via Genie  (gives IP + prefix in ``ipv4`` key)
         2. ``show ip interface``  via Genie  (detailed, includes prefix length)
         3. ``show ip interface brief``  via TextFSM  (IP only, no prefix length)
+
+        After each Genie/TextFSM parse, ``_resolve_missing_prefix_lengths`` is
+        called.  This handles two cases where prefix lengths are absent:
+
+        * Older IOS Genie schema — ``ipv4`` dict is keyed by the bare host IP
+          (e.g. ``"198.18.255.82"``) instead of CIDR (``"198.18.255.82/32"``).
+        * TextFSM ``show ip interface brief`` — the template captures only the
+          host address; Loopback /32 entries silently vanish without this fix.
+
+        The resolver runs ``show ip interface`` as raw CLI (not Genie) and
+        extracts ``Internet address is <x.x.x.x/n>`` lines with a regex,
+        which is reliable across IOS / IOS-XE versions and all interface types
+        including Loopback, Tunnel, and management interfaces.
         """
         raw, parsed, parser = self._cli_run_command("show interfaces", parse=True)
         if parser == "genie" and isinstance(parsed, dict):
-            return self._extract_ip_from_genie_show_int(parsed)
+            return self._resolve_missing_prefix_lengths(
+                self._extract_ip_from_genie_show_int(parsed)
+            )
 
         raw2, parsed2, parser2 = self._cli_run_command("show ip interface", parse=True)
         if parser2 == "genie" and isinstance(parsed2, dict):
-            return self._extract_ip_from_genie_ip_int(parsed2)
+            return self._resolve_missing_prefix_lengths(
+                self._extract_ip_from_genie_ip_int(parsed2)
+            )
 
         raw3, parsed3, parser3 = self._cli_run_command(
             "show ip interface brief", parse=True
         )
         if parser3 == "textfsm" and isinstance(parsed3, list):
-            return self._extract_ip_from_textfsm_brief(parsed3)
+            return self._resolve_missing_prefix_lengths(
+                self._extract_ip_from_textfsm_brief(parsed3)
+            )
         return []
+
+    def _resolve_missing_prefix_lengths(self, entries: List[dict]) -> List[dict]:
+        """
+        Fill in missing prefix lengths for entries whose ``ip`` field is a
+        bare host address (e.g. ``"198.18.255.82"`` instead of
+        ``"198.18.255.82/32"``).
+
+        Runs ``show ip interface`` once as raw CLI and parses
+        ``Internet address is <ip>/<prefix>`` lines with a regex.  This is
+        more reliable than Genie for mixed IOS/IOS-XE environments because
+        the text format of that line has not changed across major releases.
+
+        Entries that already have a ``/`` in their ``ip`` field are returned
+        unchanged — no extra command is issued when all prefixes are already
+        present.
+        """
+        needs_prefix = [e for e in entries if e.get("ip") and "/" not in e["ip"]]
+        if not needs_prefix:
+            return entries
+
+        # Build {interface_name: "x.x.x.x/n"} from raw show ip interface output.
+        cidr_map: Dict[str, str] = {}
+        try:
+            raw_ip_int, _, _ = self._cli_run_command("show ip interface", parse=False)
+            current_iface: Optional[str] = None
+            for line in raw_ip_int.splitlines():
+                # Matches: "Loopback0 is up, line protocol is up"
+                hdr = re.match(
+                    r"^(\S+)\s+is\s+(?:up|down|administratively\s+down)",
+                    line, re.IGNORECASE,
+                )
+                if hdr:
+                    current_iface = hdr.group(1)
+                    continue
+                if current_iface:
+                    # Matches: "  Internet address is 198.18.255.82/32"
+                    m = re.search(
+                        r"Internet\s+address\s+is\s+(\d+\.\d+\.\d+\.\d+/\d+)",
+                        line, re.IGNORECASE,
+                    )
+                    if m:
+                        cidr_map[current_iface] = m.group(1)
+        except Exception as exc:
+            self.log.debug(
+                "_resolve_missing_prefix_lengths: show ip interface failed: %s", exc
+            )
+
+        result = []
+        for entry in entries:
+            ip = entry.get("ip") or ""
+            if ip and "/" not in ip:
+                cidr = cidr_map.get(entry.get("name", ""))
+                if cidr:
+                    entry = dict(entry)
+                    entry["ip"] = cidr
+                    self.log.debug(
+                        "_resolve_missing_prefix_lengths: %s  %s → %s",
+                        entry["name"], ip, cidr,
+                    )
+            result.append(entry)
+        return result
 
     def _ip_nxos_cli(self) -> List[dict]:
         """Collect interface IPs from NX-OS."""
@@ -2026,8 +2106,14 @@ class CiscoDeviceClient:
         """
         Extract IPs from Genie ``show interfaces`` output.
 
-        Genie places IPv4 info under ``interface["ipv4"]`` as a dict keyed
-        by ``"x.x.x.x/n"`` where each value carries a ``"secondary"`` flag.
+        Genie places IPv4 info under ``interface["ipv4"]`` as a dict.
+
+        **IOS-XE / newer Genie**: key is already ``"x.x.x.x/n"`` (CIDR).
+        **IOS / older Genie**: key is a bare host address ``"x.x.x.x"``
+        with ``prefix_length`` stored in the value dict.
+
+        Both forms are handled so that Loopback, Tunnel, and management
+        interfaces with ``255.255.255.255`` masks are not silently lost.
         """
         result = []
         for name, data in parsed.items():
@@ -2038,7 +2124,14 @@ class CiscoDeviceClient:
             if isinstance(ipv4, dict):
                 for ip_key, ip_info in ipv4.items():
                     if isinstance(ip_info, dict) and not ip_info.get("secondary"):
-                        ip_cidr = ip_key   # already "x.x.x.x/24"
+                        key_str = str(ip_key)
+                        if "/" in key_str:
+                            # IOS-XE / new Genie: key is already CIDR
+                            ip_cidr = key_str
+                        else:
+                            # IOS / old Genie: key is bare IP; get prefix from value
+                            pfx = str(ip_info.get("prefix_length", "")).strip()
+                            ip_cidr = f"{key_str}/{pfx}" if pfx else key_str
                         break
             result.append({
                 "name": name,
