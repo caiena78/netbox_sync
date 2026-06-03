@@ -2050,25 +2050,32 @@ class CiscoDeviceClient:
             return entries
 
         # Build {interface_name: "x.x.x.x/n"} from raw show ip interface output.
+        #
+        # IOS/IOS-XE interface header:  "GigabitEthernet0/0/0 is up, ..."
+        # NX-OS interface header:       "Ethernet1/1, Interface status is ..."
+        #
+        # IOS/IOS-XE IP line:  "  Internet address is 10.1.1.1/30"
+        # NX-OS IP line:       "  IP address: 10.1.1.1/30, IP subnet: ..."
+        _HDR_RE = re.compile(
+            r"^(\S+?)(?:,|\s+is\s+(?:up|down|administratively\s+down))",
+            re.IGNORECASE,
+        )
+        _IP_RE = re.compile(
+            r"(?:Internet\s+address\s+is|IP\s+address:)\s+"
+            r"(\d+\.\d+\.\d+\.\d+/\d+)",
+            re.IGNORECASE,
+        )
         cidr_map: Dict[str, str] = {}
         try:
             raw_ip_int, _, _ = self._cli_run_command("show ip interface", parse=False)
             current_iface: Optional[str] = None
             for line in raw_ip_int.splitlines():
-                # Matches: "Loopback0 is up, line protocol is up"
-                hdr = re.match(
-                    r"^(\S+)\s+is\s+(?:up|down|administratively\s+down)",
-                    line, re.IGNORECASE,
-                )
+                hdr = _HDR_RE.match(line)
                 if hdr:
                     current_iface = hdr.group(1)
                     continue
                 if current_iface:
-                    # Matches: "  Internet address is 198.18.255.82/32"
-                    m = re.search(
-                        r"Internet\s+address\s+is\s+(\d+\.\d+\.\d+\.\d+/\d+)",
-                        line, re.IGNORECASE,
-                    )
+                    m = _IP_RE.search(line)
                     if m:
                         cidr_map[current_iface] = m.group(1)
         except Exception as exc:
@@ -2092,14 +2099,26 @@ class CiscoDeviceClient:
         return result
 
     def _ip_nxos_cli(self) -> List[dict]:
-        """Collect interface IPs from NX-OS."""
+        """Collect interface IPs from NX-OS.
+
+        ``show ip interface brief`` (TextFSM or Genie) never includes prefix
+        lengths — it only returns the host address.  ``_resolve_missing_prefix_lengths``
+        is called on every result so that routed Ethernet and Port-channel
+        interfaces get their /prefix filled in from ``show ip interface``.
+        Without this fix, any NX-OS physical routed interface is silently
+        skipped by ``_sync_prefixes`` because ``"/" not in ip_cidr``.
+        """
         raw, parsed, parser = self._cli_run_command(
             "show ip interface brief", parse=True
         )
         if parser == "textfsm" and isinstance(parsed, list):
-            return self._extract_ip_from_textfsm_brief(parsed)
+            return self._resolve_missing_prefix_lengths(
+                self._extract_ip_from_textfsm_brief(parsed)
+            )
         if parser == "genie" and isinstance(parsed, dict):
-            return self._extract_ip_from_genie_show_int(parsed)
+            return self._resolve_missing_prefix_lengths(
+                self._extract_ip_from_genie_show_int(parsed)
+            )
         return []
 
     def _extract_ip_from_genie_show_int(self, parsed: dict) -> List[dict]:
