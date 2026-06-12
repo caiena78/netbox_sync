@@ -1125,7 +1125,11 @@ def _get_cdp_iface_neighbors(
     log.debug("%-30s  CDP per-iface detail cmd: %s", device_name, cmd)
 
     try:
-        raw = cisco.send_command(cmd)
+        # Use the client's internal CLI runner with parse=False so we get the
+        # raw text back without Genie/TextFSM overhead.  _cli_run_command
+        # reuses the already-open Netmiko connection established by
+        # get_cdp_neighbors() and raises TransportError on failure.
+        raw, _, _ = cisco._cli_run_command(cmd, parse=False)
     except Exception as exc:
         log.warning(
             "%-30s  CDP per-iface command %r failed: %s "
