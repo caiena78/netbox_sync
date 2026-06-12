@@ -5,10 +5,38 @@ netbox_cables.py
 Discover physical connectivity via CDP and create cables in NetBox.
 
 SAFETY GUARANTEES
-- Never modifies or deletes an existing cable.
+- Never creates a cable from ambiguous CDP discovery data.
+- Never modifies or deletes an existing cable unless --force is specified.
 - Skips any interface that already has a cable on either side.
 - Skips SVIs, LAGs, Loopbacks, Tunnels, and other logical interfaces.
 - Skips neighbors whose device cannot be resolved in NetBox.
+
+Ambiguous-neighbor detection
+-----------------------------
+For every local interface discovered via the global CDP table, the script
+issues a per-interface detail query::
+
+    show cdp neighbors <interface> detail      (IOS / IOS-XE)
+    show cdp neighbors interface <iface> detail  (NX-OS)
+
+to confirm that exactly **one** device is attached to that interface.
+
+Deduplication rules (applied before the ambiguity count):
+
+* Same neighbor name + same remote port  → counts as **one** neighbor.
+* Same neighbor name + different port    → counts as **multiple** neighbors.
+* Different neighbor names               → counts as **multiple** neighbors.
+* Parse failure or uncertain output      → treated as **ambiguous** (fail-safe).
+
+Ambiguous result handling:
+
+* **Without** ``--force``: the interface is skipped; no cable is created or
+  deleted.  A WARNING is logged.
+* **With** ``--force``: any existing cable on that local interface is
+  **deleted**; no replacement cable is created.  Deletion is scoped to
+  only the cable on the specific local interface being processed.
+* ``--force --dry-run``: deletion is logged as *would-delete* only; no
+  NetBox write occurs.
 
 Virtual Chassis support
 -----------------------
@@ -49,6 +77,13 @@ Usage examples
 --------------
     python netbox_cables.py --device-filter '{"status":"active"}'
     python netbox_cables.py --device sw1 --dry-run
+    python netbox_cables.py --device sw1 --force
+    python netbox_cables.py --device sw1 --force --dry-run
+
+    # --force on an interface with multiple CDP neighbors:
+    #   - deletes any existing cable on that local interface
+    #   - does NOT create a replacement cable
+    #   - use --dry-run to preview without writing
 """
 
 from __future__ import annotations
@@ -325,12 +360,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help=(
-            "Replace cables that connect to the wrong device. "
+            "Replace cables that connect to the wrong device, and handle "
+            "ambiguous interfaces. "
             "Without --force, any interface that already has a cable is "
-            "skipped unconditionally. With --force, the script checks whether "
-            "the existing cable matches the CDP-discovered peer. If it does not "
-            "match, the wrong cable is deleted and the correct one is created. "
-            "Cables that are already correct are left untouched."
+            "skipped unconditionally, and any interface with multiple CDP "
+            "neighbors is skipped with a warning. "
+            "With --force, the script checks whether the existing cable "
+            "matches the CDP-discovered peer. If it does not match, the wrong "
+            "cable is deleted and the correct one is created. Cables that are "
+            "already correct are left untouched. "
+            "For interfaces where more than one distinct CDP neighbor is "
+            "detected (ambiguous), --force deletes any existing cable on that "
+            "local interface but does NOT create a replacement. "
+            "Combine with --dry-run to preview all deletions without writing."
         ),
     )
     run.add_argument("--max-workers", type=int, default=5)
@@ -878,6 +920,257 @@ def _get_or_create_interface(
 
 
 # --------------------------------------------------------------------------- #
+# Per-interface CDP detail ambiguity detection                                 #
+# --------------------------------------------------------------------------- #
+
+def _parse_cdp_detail_output(raw: str, device_name: str) -> Optional[List[dict]]:
+    """
+    Parse raw output from ``show cdp neighbors <interface> detail``.
+
+    Returns
+    -------
+    list of dict
+        One entry per neighbor block found.  Empty list means the output
+        unambiguously showed zero neighbors on this interface.
+    None
+        Output is malformed or uncertain.  Caller must treat as ambiguous
+        (fail-safe — do not create a cable).
+
+    Each dict has keys: neighbor_name, neighbor_ip, local_interface,
+    remote_interface.
+    """
+    if not raw:
+        return []
+
+    # Normalize Windows / Cisco CR+LF line endings
+    raw = raw.replace("\r", "")
+    raw_stripped = raw.strip()
+    raw_lower = raw_stripped.lower()
+
+    # ── Explicit "no neighbor" responses ─────────────────────────────────
+    _NO_NEIGHBOR_HINTS = (
+        "% no cdp",
+        "no cdp neighbor",
+        "total cdp entries displayed : 0",
+        "total entries displayed : 0",
+        "0 cdp neighbor",
+        "no neighbor found",
+    )
+    if any(h in raw_lower for h in _NO_NEIGHBOR_HINTS):
+        log.debug("%-30s  CDP detail: explicit no-neighbor response", device_name)
+        return []
+
+    # ── Command-not-understood / error responses → fail safe ─────────────
+    _CMD_ERROR_HINTS = (
+        "% invalid input",
+        "% incomplete command",
+        "% ambiguous command",
+        "% error:",
+        "invalid command at",
+    )
+    if any(h in raw_lower for h in _CMD_ERROR_HINTS):
+        log.debug(
+            "%-30s  CDP detail: command error in output — fail safe",
+            device_name,
+        )
+        return None
+
+    # ── Locate all Device ID markers and parse one block per marker ───────
+    # Using finditer on Device ID lines is more robust than splitting on
+    # dash-separators because some platforms omit separators for single
+    # neighbors and others repeat them.
+    dev_id_iter = list(re.finditer(r'Device\s+ID\s*:\s*(.+)', raw_stripped, re.IGNORECASE))
+
+    if not dev_id_iter:
+        # Non-empty output with no Device ID lines found.
+        # Accept as "no neighbors" only if the output looks like a known
+        # CDP summary header/footer; otherwise fail safe.
+        if "cdp" in raw_lower and ("neighbor" in raw_lower or "entries" in raw_lower):
+            log.debug("%-30s  CDP detail: header/footer only — zero neighbors", device_name)
+            return []
+        log.debug(
+            "%-30s  CDP detail: non-empty output but no Device ID lines — fail safe",
+            device_name,
+        )
+        return None
+
+    neighbors: List[dict] = []
+
+    for idx, dev_match in enumerate(dev_id_iter):
+        neighbor_name = dev_match.group(1).strip()
+        if not neighbor_name:
+            log.debug(
+                "%-30s  CDP detail: empty Device ID at match %d — fail safe",
+                device_name, idx,
+            )
+            return None
+
+        # Extract the block from this Device ID to the start of the next one
+        block_start = dev_match.start()
+        block_end   = dev_id_iter[idx + 1].start() if idx + 1 < len(dev_id_iter) else len(raw_stripped)
+        block       = raw_stripped[block_start:block_end]
+
+        # IP address — handles IOS ("IP address:"), IOS-XE ("IPv4 address:"),
+        # NX-OS ("IPv4 Address:") and bare "IP:" variants.
+        ip_match = re.search(
+            r'(?:IPv4\s+[Aa]ddress|IP\s+[Aa]ddress|IP\s*:)\s*[:\s]*'
+            r'(\d{1,3}(?:\.\d{1,3}){3})',
+            block,
+            re.IGNORECASE,
+        )
+        neighbor_ip = ip_match.group(1).strip() if ip_match else None
+
+        # Interface line:
+        #   "Interface: GigabitEthernet1/0/1,  Port ID (outgoing port): Gi1/0/24"
+        iface_match = re.search(
+            r'Interface\s*:\s*(\S+?)\s*,\s*'
+            r'Port\s+ID\s*\(outgoing\s+port\)\s*:\s*(\S+)',
+            block,
+            re.IGNORECASE,
+        )
+        if not iface_match:
+            # We know a device is present but cannot determine which interface
+            # it's on — this is uncertain, not zero.  Fail safe.
+            log.debug(
+                "%-30s  CDP detail: Device ID %r found but no Interface/Port-ID "
+                "line — fail safe",
+                device_name, neighbor_name,
+            )
+            return None
+
+        neighbors.append({
+            "neighbor_name":    neighbor_name,
+            "neighbor_ip":      neighbor_ip,
+            "local_interface":  iface_match.group(1).strip().rstrip(","),
+            "remote_interface": iface_match.group(2).strip().rstrip(","),
+        })
+
+    return neighbors
+
+
+def _dedup_cdp_neighbors(neighbors: List[dict], device_name: str) -> List[dict]:
+    """
+    Deduplicate CDP neighbors from per-interface detail output.
+
+    Deduplication key: (normalized_neighbor_name, expanded_remote_interface)
+
+    * Same device name + same remote port  → ONE entry (exact duplicate).
+    * Same device name + different ports   → MULTIPLE entries.
+    * Different device names               → MULTIPLE entries.
+    """
+    seen: Set[tuple] = set()
+    deduped: List[dict] = []
+
+    for nbr in neighbors:
+        raw_name = nbr.get("neighbor_name") or ""
+        # Strip serial-number suffix "(XYZABC)" consistent with _resolve_neighbor
+        clean_name = re.sub(r"\s*\([^)]*\).*$", "", raw_name).strip().lower()
+
+        raw_remote = nbr.get("remote_interface") or ""
+        try:
+            expanded_remote = CiscoDeviceClient._expand_iface(raw_remote).lower()
+        except Exception:
+            expanded_remote = raw_remote.lower()
+
+        key = (clean_name, expanded_remote)
+        if key in seen:
+            log.debug(
+                "%-30s  CDP dedup: dropping exact duplicate neighbor=%r remote=%r",
+                device_name, clean_name, expanded_remote,
+            )
+            continue
+        seen.add(key)
+        deduped.append(nbr)
+
+    return deduped
+
+
+def _get_cdp_iface_neighbors(
+    cisco: CiscoDeviceClient,
+    local_iface_name: str,
+    device_name: str,
+    os_type: str,
+) -> Optional[List[dict]]:
+    """
+    Run ``show cdp neighbors <interface> detail`` and return a deduplicated
+    list of structured neighbor dicts for that specific local interface.
+
+    Parameters
+    ----------
+    cisco : CiscoDeviceClient
+        Connected client for the device under discovery.
+    local_iface_name : str
+        Full (expanded) local interface name, e.g. ``"GigabitEthernet1/0/1"``.
+    device_name : str
+        Human-readable device name used in log messages.
+    os_type : str
+        Platform type (``"ios"``, ``"iosxe"``, ``"nxos"``) used to select
+        the correct CLI syntax.
+
+    Returns
+    -------
+    list of dict
+        Deduplicated neighbor list (may be empty — zero neighbors confirmed).
+        Call ``_is_ambiguous_cdp_result()`` to evaluate.
+    None
+        The command failed or the output could not be parsed with confidence.
+        Callers **must** treat ``None`` as ambiguous (fail-safe).
+    """
+    # NX-OS requires the "interface" keyword before the interface name
+    if os_type == "nxos":
+        cmd = f"show cdp neighbors interface {local_iface_name} detail"
+    else:
+        cmd = f"show cdp neighbors {local_iface_name} detail"
+
+    log.debug("%-30s  CDP per-iface detail cmd: %s", device_name, cmd)
+
+    try:
+        raw = cisco.send_command(cmd)
+    except Exception as exc:
+        log.warning(
+            "%-30s  CDP per-iface command %r failed: %s "
+            "— treating interface as ambiguous (fail-safe)",
+            device_name, cmd, exc,
+        )
+        return None
+
+    neighbors = _parse_cdp_detail_output(raw, device_name)
+
+    if neighbors is None:
+        log.warning(
+            "%-30s  CDP detail for %s could not be parsed confidently "
+            "— treating as ambiguous (fail-safe)",
+            device_name, local_iface_name,
+        )
+        return None
+
+    before_dedup = len(neighbors)
+    deduped = _dedup_cdp_neighbors(neighbors, device_name)
+
+    log.debug(
+        "%-30s  %s: CDP detail parsed=%d  after-dedup=%d",
+        device_name, local_iface_name, before_dedup, len(deduped),
+    )
+
+    return deduped
+
+
+def _is_ambiguous_cdp_result(neighbors: Optional[List[dict]]) -> bool:
+    """
+    Return ``True`` when the per-interface CDP result must be treated as
+    ambiguous (ineligible for cable creation or unforced skip).
+
+    ``None``        → command / parse failure → ambiguous (fail-safe)
+    ``[]``          → zero neighbors confirmed → NOT ambiguous
+    ``[one]``       → exactly one neighbor     → NOT ambiguous
+    ``[a, b, …]``  → multiple neighbors        → ambiguous
+    """
+    if neighbors is None:
+        return True
+    return len(neighbors) > 1
+
+
+# --------------------------------------------------------------------------- #
 # Per-device cable processing                                                  #
 # --------------------------------------------------------------------------- #
 
@@ -889,11 +1182,19 @@ def process_device_cables(
     """
     Discover CDP neighbors on one device and create cables in NetBox.
 
-    SAFETY GUARANTEES (unchanged)
-    - Never modifies an existing cable.
+    SAFETY GUARANTEES
+    - Never creates a cable from ambiguous (multiple-neighbor) CDP data.
+    - Never modifies an existing cable unless --force is specified.
     - Skips any pair where either interface already has a cable.
     - Skips logical interfaces (SVIs, LAGs, loopbacks, tunnels …).
     - Skips neighbors that cannot be resolved in NetBox.
+
+    Ambiguous interfaces (multiple distinct CDP neighbors on the same local
+    port) are handled as follows:
+    - Without --force: skipped with a WARNING; no cable created or deleted.
+    - With --force:    existing cable on that local interface is deleted;
+                       no replacement cable is created.
+    - With --force --dry-run: deletion is logged only; no write occurs.
 
     Returns a JSON-serialisable summary dict.
     """
@@ -901,15 +1202,17 @@ def process_device_cables(
     device_id   = device.get("id")
 
     summary: dict = {
-        "device":                 device_name,
-        "status":                 "failed",
-        "neighbors_seen":         0,
-        "cables_created":         0,
-        "cables_replaced":        0,
-        "skipped_existing_cable": 0,
-        "skipped_missing_device": 0,
-        "skipped_logical_iface":  0,
-        "errors":                 [],
+        "device":                          device_name,
+        "status":                          "failed",
+        "neighbors_seen":                  0,
+        "cables_created":                  0,
+        "cables_replaced":                 0,
+        "skipped_existing_cable":          0,
+        "skipped_missing_device":          0,
+        "skipped_logical_iface":           0,
+        "skipped_ambiguous_neighbor":      0,
+        "deleted_ambiguous_existing_cable": 0,
+        "errors":                          [],
     }
 
     # ── Hard gate: primary IP required ────────────────────────────────────
@@ -985,6 +1288,129 @@ def process_device_cables(
             )
             summary["skipped_logical_iface"] += 1
             continue
+
+        # ── Per-interface CDP detail ambiguity check ──────────────────────
+        # Run "show cdp neighbors <interface> detail" to confirm exactly one
+        # neighbor is attached to this local port.  More than one distinct
+        # neighbor (after deduplication) makes the interface ambiguous and
+        # ineligible for cable creation regardless of other conditions.
+        log.debug(
+            "%-30s  checking CDP detail for %s",
+            device_name, local_iface_name,
+        )
+        cdp_detail_nbrs = _get_cdp_iface_neighbors(
+            cisco, local_iface_name, device_name, os_type
+        )
+
+        if _is_ambiguous_cdp_result(cdp_detail_nbrs):
+            # Build a readable description of why it's ambiguous
+            if cdp_detail_nbrs is None:
+                ambig_reason = "CDP detail command failed or output unparseable"
+            else:
+                ambig_reason = (
+                    f"{len(cdp_detail_nbrs)} distinct CDP neighbor(s) detected "
+                    f"after deduplication"
+                )
+
+            log.warning(
+                "%-30s  AMBIGUOUS %s — %s",
+                device_name, local_iface_name, ambig_reason,
+            )
+
+            if not args.force:
+                # Safe mode: skip silently with a clear warning; do not touch
+                # any existing cable.
+                log.warning(
+                    "%-30s  SKIP ambiguous interface %s "
+                    "(multiple CDP neighbors; use --force to delete existing cable)",
+                    device_name, local_iface_name,
+                )
+                summary["skipped_ambiguous_neighbor"] += 1
+                continue
+
+            # ── --force + ambiguous: delete existing cable, no replacement ─
+            # Resolve the local interface record to look up any existing cable.
+            # We do NOT resolve the remote side — no cable will be created.
+            local_iface_rec = _get_or_create_interface(nb, device_id, local_iface_name)
+            if not local_iface_rec:
+                log.warning(
+                    "%-30s  AMBIGUOUS FORCE: could not resolve local interface %s "
+                    "— skipping",
+                    device_name, local_iface_name,
+                )
+                summary["skipped_ambiguous_neighbor"] += 1
+                continue
+
+            local_id = local_iface_rec["id"]
+
+            # Honour the seen-set so we do not attempt the same interface twice
+            # if it appears in multiple global CDP entries.
+            if local_id in seen_local_iface_ids:
+                continue
+
+            seen_local_iface_ids.add(local_id)
+
+            # Check whether the local interface currently has a cable.
+            try:
+                local_cabled = nb.interface_has_cable(local_id)
+            except NetBoxClientError as exc:
+                log.warning(
+                    "%-30s  AMBIGUOUS FORCE: cable-check failed for %s: %s "
+                    "— skipping delete",
+                    device_name, local_iface_name, exc,
+                )
+                summary["skipped_ambiguous_neighbor"] += 1
+                continue
+
+            if local_cabled:
+                try:
+                    cable_info = nb.get_interface_cable_info(local_id)
+                    cable_id   = cable_info["cable_id"]
+
+                    if args.dry_run:
+                        log.info(
+                            "DRY-RUN  %-30s  AMBIGUOUS FORCE would delete cable "
+                            "id=%s on %s (%s) — no replacement cable created",
+                            device_name, cable_id, local_iface_name, ambig_reason,
+                        )
+                        summary["deleted_ambiguous_existing_cable"] += 1
+                    else:
+                        nb.delete_cable(cable_id)
+                        log.warning(
+                            "%-30s  AMBIGUOUS FORCE: deleted cable id=%s on %s "
+                            "(%s) — no replacement cable created",
+                            device_name, cable_id, local_iface_name, ambig_reason,
+                        )
+                        summary["deleted_ambiguous_existing_cable"] += 1
+
+                except NetBoxClientError as exc:
+                    log.warning(
+                        "%-30s  AMBIGUOUS FORCE: failed to get/delete cable on %s: %s",
+                        device_name, local_iface_name, exc,
+                    )
+                    summary["errors"].append(
+                        f"Ambiguous force delete {local_iface_name!r}: {exc}"
+                    )
+            else:
+                if args.dry_run:
+                    log.info(
+                        "DRY-RUN  %-30s  AMBIGUOUS FORCE: no existing cable on %s "
+                        "— nothing would be deleted; no cable created",
+                        device_name, local_iface_name,
+                    )
+                else:
+                    log.info(
+                        "%-30s  AMBIGUOUS FORCE: no existing cable on %s to delete",
+                        device_name, local_iface_name,
+                    )
+
+            # Count as skipped regardless (no cable was created)
+            summary["skipped_ambiguous_neighbor"] += 1
+            # CRITICAL: never fall through to cable creation for ambiguous interfaces
+            continue
+
+        # ── Unambiguous path: existing cable workflow ─────────────────────
+        # cdp_detail_nbrs is [] or [single_neighbor] — proceed normally.
 
         # ── Resolve neighbor device (VC-first, with suffix fallback) ─────
         neighbor_device = _resolve_neighbor(nb, neighbor_dev_name, neighbor_ip)
@@ -1306,37 +1732,47 @@ def main() -> None:
                 summaries.append(result)
                 log.info(
                     "%-30s  status=%-8s  seen=%d  created=%d  replaced=%d  "
-                    "skip_cable=%d  skip_no_dev=%d  errs=%d",
+                    "skip_cable=%d  skip_no_dev=%d  skip_ambiguous=%d  "
+                    "del_ambiguous=%d  errs=%d",
                     device_name, result.get("status", "?"),
                     result.get("neighbors_seen", 0),
                     result.get("cables_created", 0),
                     result.get("cables_replaced", 0),
                     result.get("skipped_existing_cable", 0),
                     result.get("skipped_missing_device", 0),
+                    result.get("skipped_ambiguous_neighbor", 0),
+                    result.get("deleted_ambiguous_existing_cable", 0),
                     len(result.get("errors", [])),
                 )
             except Exception as exc:
                 log.error("Unexpected error for %s: %s", device_name, exc)
                 summaries.append({
-                    "device":                 device_name,
-                    "status":                 "failed",
-                    "neighbors_seen":         0,
-                    "cables_created":         0,
-                    "skipped_existing_cable": 0,
-                    "skipped_missing_device": 0,
-                    "skipped_logical_iface":  0,
-                    "errors":                 [str(exc)],
+                    "device":                          device_name,
+                    "status":                          "failed",
+                    "neighbors_seen":                  0,
+                    "cables_created":                  0,
+                    "cables_replaced":                 0,
+                    "skipped_existing_cable":          0,
+                    "skipped_missing_device":          0,
+                    "skipped_logical_iface":           0,
+                    "skipped_ambiguous_neighbor":      0,
+                    "deleted_ambiguous_existing_cable": 0,
+                    "errors":                          [str(exc)],
                 })
 
     summaries.sort(key=lambda s: s.get("device", ""))
 
-    total_created  = sum(s.get("cables_created", 0)         for s in summaries)
-    total_replaced = sum(s.get("cables_replaced", 0)        for s in summaries)
-    total_skipped  = sum(s.get("skipped_existing_cable", 0) for s in summaries)
+    total_created           = sum(s.get("cables_created", 0)                  for s in summaries)
+    total_replaced          = sum(s.get("cables_replaced", 0)                 for s in summaries)
+    total_skipped           = sum(s.get("skipped_existing_cable", 0)          for s in summaries)
+    total_ambiguous_skipped = sum(s.get("skipped_ambiguous_neighbor", 0)      for s in summaries)
+    total_ambiguous_deleted = sum(s.get("deleted_ambiguous_existing_cable", 0) for s in summaries)
+
     log.info(
         "DONE  devices=%d  cables_created=%d  cables_replaced=%d  "
-        "skipped_existing=%d",
+        "skipped_existing=%d  skipped_ambiguous=%d  deleted_ambiguous=%d",
         len(summaries), total_created, total_replaced, total_skipped,
+        total_ambiguous_skipped, total_ambiguous_deleted,
     )
 
     print(json.dumps(summaries, indent=2))
