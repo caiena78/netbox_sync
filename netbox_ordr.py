@@ -100,6 +100,10 @@ _REQUIRED_KEYS = frozenset({
 # The first one found in the first device record is used for all devices.
 _ORDR_MAC_FIELDS = ("macAddress", "mac", "MacAddress", "MAC", "clientMacToken")
 
+# Matches tokens that look like a Cisco interface name (letter + digits + slash)
+# e.g. Gi1/0/1, Eth1/1, Te1/0/1, Po1.  Excludes plain words like "Port".
+_IFACE_TOKEN_RE = re.compile(r'^[A-Za-z]+[\d/]+', re.ASCII)
+
 log = logging.getLogger("netbox_ordr")
 
 
@@ -205,7 +209,7 @@ def fetch_ordr_mac_set(secrets: Dict[str, str]) -> Set[str]:
             current_url = origin + next_path
             data = _ordr_get(current_url, {}, user, password)
         else:
-            data = _ordr_get(devices_url, {"tenantGuid": tenant_guid}, user, password)
+            data = _ordr_get(devices_url, {"tenantGuid": tenant_guid, "limit": 1000}, user, password)
 
         batch = data.get("Devices", [])
         all_devices.extend(batch)
@@ -386,6 +390,53 @@ def _resolve_device_list(args: argparse.Namespace, nb: NetBoxClient) -> List[dic
 # Per-device processing                                                        #
 # --------------------------------------------------------------------------- #
 
+def _expand_iface_safe(name: str) -> str:
+    """Expand a Cisco abbreviated interface name; return original on failure."""
+    try:
+        return CiscoDeviceClient._expand_iface(name)
+    except Exception:
+        return name
+
+
+def _get_trunk_interfaces(
+    cisco: CiscoDeviceClient,
+    device_name: str,
+    os_type: str,
+) -> Set[str]:
+    """
+    Return a set of expanded, lowercase interface names that are in trunk mode.
+
+    Runs 'show interfaces trunk' (IOS/IOS-XE) or 'show interface trunk' (NX-OS)
+    and extracts port names from every line whose first token looks like an
+    interface name (contains a slash — handles Gi1/0/1, Eth1/1, Te1/0/1, Po1).
+    Using a set means ports that appear in multiple output sections (IOS prints
+    them in three separate tables) are only counted once.
+
+    Returns an empty set and logs a warning if the command fails.
+    """
+    cmd = "show interface trunk" if os_type == "nxos" else "show interfaces trunk"
+    try:
+        raw, _, _ = cisco._cli_run_command(cmd, parse=False)
+    except Exception as exc:
+        log.warning(
+            "%-30s  Could not retrieve trunk ports (%s): %s "
+            "— all MAC entries will be checked (no trunk filtering)",
+            device_name, cmd, exc,
+        )
+        return set()
+
+    trunk_ifaces: Set[str] = set()
+    for line in raw.splitlines():
+        parts = line.strip().split()
+        if not parts:
+            continue
+        if _IFACE_TOKEN_RE.match(parts[0]):
+            trunk_ifaces.add(_expand_iface_safe(parts[0]).lower())
+
+    log.debug("%-30s  trunk ports detected: %d", device_name, len(trunk_ifaces))
+    return trunk_ifaces
+
+
 def _write_missing_log(
     log_dir: Path,
     device_name: str,
@@ -473,10 +524,25 @@ def process_device(
         cisco._cli_disconnect()
         return summary
 
+    trunk_ifaces = _get_trunk_interfaces(cisco, device_name, os_type)
     cisco._cli_disconnect()
 
+    # Filter to access-port MACs only
+    if trunk_ifaces:
+        before = len(mac_entries)
+        mac_entries = [
+            e for e in mac_entries
+            if _expand_iface_safe(e.get("interface", "")).lower() not in trunk_ifaces
+        ]
+        skipped = before - len(mac_entries)
+        if skipped:
+            log.info(
+                "%-30s  Skipped %d MAC(s) learned on trunk ports",
+                device_name, skipped,
+            )
+
     summary["mac_count"] = len(mac_entries)
-    log.info("%-30s  MAC table: %d entry(ies)", device_name, len(mac_entries))
+    log.info("%-30s  MAC table (access ports): %d entry(ies)", device_name, len(mac_entries))
 
     if not mac_entries:
         summary["status"] = "success"
