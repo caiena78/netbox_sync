@@ -2,3 +2,5 @@
 __pycache__
 missing_ap_models.txt
 .json
+enviroment.txt
+logs/*
