@@ -46,6 +46,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set
+from urllib.parse import urlparse
 
 import hvac
 import hvac.exceptions
@@ -77,6 +78,17 @@ PLATFORM_SLUG_MAP: Dict[str, str] = {
 
 _ORDR_BASE_URL     = "https://pdmg5uxb.cloud.ordr.net"
 _ORDR_DEVICES_PATH = "/Rest/Devices"
+
+
+def _ordr_origin(url: str) -> str:
+    """Return just scheme+host from *url*, discarding any path component.
+
+    Prevents double-path errors when ORDR_URL in Vault already includes
+    a path segment (e.g. 'https://host/Rest') and _ORDR_DEVICES_PATH
+    would otherwise be appended on top of it.
+    """
+    p = urlparse(url)
+    return f"{p.scheme}://{p.netloc}"
 
 # All keys the script requires from the Vault secret (or env vars)
 _REQUIRED_KEYS = frozenset({
@@ -178,19 +190,19 @@ def fetch_ordr_mac_set(secrets: Dict[str, str]) -> Set[str]:
     common field names.  Returns an empty set (with a warning) when the MAC
     field cannot be determined.
     """
-    base_url    = secrets.get("ORDR_URL", _ORDR_BASE_URL) or _ORDR_BASE_URL
+    origin      = _ordr_origin(secrets.get("ORDR_URL", _ORDR_BASE_URL) or _ORDR_BASE_URL)
     tenant_guid = secrets["ORDR_TENANTGUID"]
     user        = secrets["ORDR_USER"]
     password    = secrets["ORDR_PASSWORD"]
 
-    devices_url = base_url.rstrip("/") + _ORDR_DEVICES_PATH
+    devices_url = origin + _ORDR_DEVICES_PATH
     all_devices: List[dict] = []
     next_path: Optional[str] = None
 
     log.info("Fetching Ordr device inventory (tenant=%s) ...", tenant_guid)
     while True:
         if next_path:
-            current_url = base_url.rstrip("/") + next_path
+            current_url = origin + next_path
             data = _ordr_get(current_url, {}, user, password)
         else:
             data = _ordr_get(devices_url, {"tenantGuid": tenant_guid}, user, password)
@@ -241,12 +253,12 @@ def _lookup_mac_ordr(mac: str, secrets: Dict[str, str]) -> bool:
     Per-MAC Ordr lookup.  Used as a fallback when bulk MAC extraction fails.
     Returns True if the MAC is found in Ordr, False otherwise.
     """
-    base_url    = secrets.get("ORDR_URL", _ORDR_BASE_URL) or _ORDR_BASE_URL
+    origin      = _ordr_origin(secrets.get("ORDR_URL", _ORDR_BASE_URL) or _ORDR_BASE_URL)
     tenant_guid = secrets["ORDR_TENANTGUID"]
     user        = secrets["ORDR_USER"]
     password    = secrets["ORDR_PASSWORD"]
 
-    devices_url = base_url.rstrip("/") + _ORDR_DEVICES_PATH
+    devices_url = origin + _ORDR_DEVICES_PATH
     try:
         data = _ordr_get(
             devices_url,
