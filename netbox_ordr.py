@@ -37,6 +37,7 @@ Usage examples
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import logging
 import os
@@ -171,6 +172,43 @@ def _normalize_mac(mac: str) -> str:
     if len(stripped) != 12 or not all(c in "0123456789abcdef" for c in stripped):
         return mac.lower()
     return ":".join(stripped[i:i + 2] for i in range(0, 12, 2))
+
+
+def _is_ip(s: str) -> bool:
+    try:
+        ipaddress.ip_address(s)
+        return True
+    except ValueError:
+        return False
+
+
+def _parse_arp_output(raw: str) -> List[dict]:
+    """
+    Parse 'show ip arp' output from IOS/IOS-XE or NX-OS.
+
+    IOS/IOS-XE line format:
+        Internet  10.0.0.1  0  0050.5678.abcd  ARPA  Vlan100
+    NX-OS line format:
+        10.0.0.1  00:10:23  0050.5678.abcd  Ethernet1/1
+    """
+    entries = []
+    for line in raw.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        ip_str = mac_str = None
+        if parts[0].lower() == "internet" and len(parts) >= 5:
+            ip_str, mac_str = parts[1], parts[3]
+        elif _is_ip(parts[0]) and len(parts) >= 3:
+            ip_str, mac_str = parts[0], parts[2]
+        if not ip_str or not mac_str or mac_str in ("--", "Incomplete"):
+            continue
+        try:
+            ipaddress.ip_address(ip_str)
+        except ValueError:
+            continue
+        entries.append({"ip": ip_str, "mac": _normalize_mac(mac_str)})
+    return entries
 
 
 # --------------------------------------------------------------------------- #
@@ -442,8 +480,13 @@ def _write_missing_log(
     device_name: str,
     mgmt_ip: str,
     missing: List[dict],
+    global_arp: Dict[str, str],
 ) -> None:
-    """Write missing MACs to logs/<device_name>_<ip>.txt."""
+    """Write missing MACs to logs/<device_name>_<ip>.txt.
+
+    Each line includes mac, ip (resolved from the global ARP table), vlan,
+    and interface.  IP is 'unknown' when the MAC has no ARP entry.
+    """
     safe_name = re.sub(r"[^\w\-.]", "_", device_name)
     safe_ip   = mgmt_ip.replace(":", "_")   # guard against IPv6
     log_path  = log_dir / f"{safe_name}_{safe_ip}.txt"
@@ -455,13 +498,15 @@ def _write_missing_log(
         f"Management IP: {mgmt_ip}",
         f"Run: {now}",
         f"Missing from Ordr ({len(missing)} MAC(s)):",
-        "",
+        f"{'MAC':<20}  {'IP':<18}  {'VLAN':<8}  Interface",
+        "-" * 72,
     ]
     for entry in sorted(missing, key=lambda e: e.get("mac", "")):
         mac   = entry.get("mac", "unknown")
-        vlan  = entry.get("vlan", "?")
+        vlan  = str(entry.get("vlan", "?"))
         iface = entry.get("interface", "?")
-        lines.append(f"  {mac}  vlan={vlan}  interface={iface}")
+        ip    = global_arp.get(_normalize_mac(mac), "unknown")
+        lines.append(f"  {mac:<18}  {ip:<18}  {vlan:<8}  {iface}")
 
     log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     log.info("%-30s  log written: %s", device_name, log_path)
@@ -472,11 +517,19 @@ def process_device(
     args: argparse.Namespace,
     secrets: Dict[str, str],
     ordr_mac_set: Set[str],
-    log_dir: Path,
 ) -> dict:
     """
-    Collect the MAC address table from one switch and check each entry against
-    the Ordr device inventory.  Missing MACs are written to a log file.
+    Collect the MAC address table and ARP table from one switch, then check
+    each MAC entry against the Ordr device inventory.
+
+    Log writing is deferred to main() so that the global ARP table (merged
+    across all devices) can be used to resolve IP addresses for MACs that
+    were learned on a different switch than the one holding the ARP entry.
+
+    Returns a summary dict that includes:
+      _mgmt_ip    — management IP (used by main() for log file naming)
+      _arp        — list of {ip, mac} dicts collected from this device
+      _missing    — MAC entries not found in Ordr (to be logged)
     """
     device_name = device.get("name", "unknown")
     summary: dict = {
@@ -485,6 +538,9 @@ def process_device(
         "mac_count":     0,
         "missing_count": 0,
         "errors":        [],
+        "_mgmt_ip":      None,
+        "_arp":          [],
+        "_missing":      [],
     }
 
     if not _device_has_primary_ip(device):
@@ -497,6 +553,7 @@ def process_device(
     if not mgmt_ip:
         summary["errors"].append("No management IP — cannot connect")
         return summary
+    summary["_mgmt_ip"] = mgmt_ip
 
     os_type = _get_os_type(device)
     if not os_type:
@@ -523,6 +580,15 @@ def process_device(
         summary["errors"].append(f"MAC table collection failed: {exc}")
         cisco._cli_disconnect()
         return summary
+
+    # Collect ARP table while still connected
+    try:
+        raw_arp, _, _ = cisco._cli_run_command("show ip arp", parse=False)
+        arp_entries = _parse_arp_output(raw_arp)
+        summary["_arp"] = arp_entries
+        log.info("%-30s  ARP entries collected: %d", device_name, len(arp_entries))
+    except Exception as exc:
+        log.warning("%-30s  Could not collect ARP table: %s", device_name, exc)
 
     trunk_ifaces = _get_trunk_interfaces(cisco, device_name, os_type)
     cisco._cli_disconnect()
@@ -562,13 +628,11 @@ def process_device(
             missing.append(entry)
 
     summary["missing_count"] = len(missing)
+    summary["_missing"]      = missing
     log.info(
         "%-30s  missing from Ordr: %d / %d MAC(s)",
         device_name, len(missing), len(mac_entries),
     )
-
-    if missing:
-        _write_missing_log(log_dir, device_name, mgmt_ip, missing)
 
     summary["status"] = "success"
     return summary
@@ -745,7 +809,7 @@ def main() -> None:
 
     with ThreadPoolExecutor(max_workers=args.max_workers) as pool:
         future_to_device = {
-            pool.submit(process_device, device, args, secrets, ordr_mac_set, log_dir): device
+            pool.submit(process_device, device, args, secrets, ordr_mac_set): device
             for device in devices
         }
         for future in as_completed(future_to_device):
@@ -770,9 +834,44 @@ def main() -> None:
                     "mac_count":     0,
                     "missing_count": 0,
                     "errors":        [str(exc)],
+                    "_mgmt_ip":      None,
+                    "_arp":          [],
+                    "_missing":      [],
                 })
 
     summaries.sort(key=lambda s: s.get("device", ""))
+
+    # ── Build global ARP table (mac → ip) across all devices ─────────────
+    # Done after all threads finish so every ARP contribution is available
+    # before any log file is written.  First-seen IP wins for duplicate MACs.
+    global_arp: Dict[str, str] = {}
+    for result in summaries:
+        for entry in result.get("_arp", []):
+            mac = entry.get("mac", "")
+            ip  = entry.get("ip", "")
+            if mac and ip:
+                global_arp.setdefault(mac, ip)
+
+    log.info("Global ARP table built: %d unique MAC→IP mapping(s)", len(global_arp))
+
+    # ── Write per-device log files with IP merged from global ARP ─────────
+    for result in summaries:
+        missing = result.get("_missing", [])
+        mgmt_ip = result.get("_mgmt_ip") or "unknown"
+        if missing:
+            _write_missing_log(
+                log_dir,
+                result["device"],
+                mgmt_ip,
+                missing,
+                global_arp,
+            )
+
+    # Strip internal fields before printing JSON summary
+    for result in summaries:
+        result.pop("_mgmt_ip", None)
+        result.pop("_arp",     None)
+        result.pop("_missing", None)
 
     total_macs    = sum(s.get("mac_count",     0) for s in summaries)
     total_missing = sum(s.get("missing_count", 0) for s in summaries)
