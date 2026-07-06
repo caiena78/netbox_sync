@@ -77,6 +77,9 @@ _CF_UNUSED_TIME  = "unused_time"    # integer — threshold in seconds
 _CF_UNUSED_PORTS = "unused_ports"   # integer — count written back after each run
 _CF_STATE_UPDATE = "state_update"   # datetime string — UTC timestamp of last run
 
+# Interface-level custom field: True when the port qualifies as unused.
+_CF_UNUSED_IF    = "unused"
+
 # Matches:  "Last input 00:02:13,"  "Last input never,"  "Last input 3w2d,"
 # Captures everything between "Last input " and the first comma or newline.
 _LAST_INPUT_RE = re.compile(r"Last input\s+([^,\n]+)", re.IGNORECASE)
@@ -505,6 +508,8 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
         "admin_down_ports":     0,
         "threshold_ports":      0,
         "mode_excluded_ports":  0,
+        "unused_if_updated":    0,
+        "unused_if_unchanged":  0,
         "errors":               [],
     }
 
@@ -699,6 +704,7 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
     threshold_cnt     = 0
     skipped_cnt       = 0   # DOWN ports excluded due to missing/unparseable last_input
     mode_excluded_cnt = 0   # ports skipped because they are not L2 access
+    unused_iface_set: set = set()   # interfaces that qualified as unused this run
 
     # ── Build merged interface → state mapping ────────────────────────────
     # seed from show interfaces status (existing source; may have fewer entries)
@@ -770,6 +776,7 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
                     # Treat as infinite inactivity — always exceeds any threshold.
                     unused_ports  += 1
                     threshold_cnt += 1
+                    unused_iface_set.add(iface_name)
                     log.debug(
                         "%-30s  %s: last_input='never' — infinite inactivity, "
                         "counted as unused",
@@ -787,6 +794,7 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
                     elif li_secs > unused_time_secs:
                         unused_ports  += 1
                         threshold_cnt += 1
+                        unused_iface_set.add(iface_name)
         # UP, ADMIN DOWN, NO HW, and any other state: do NOT increment unused_ports
 
         log.debug(
@@ -969,6 +977,70 @@ def update_device_state(device: dict, nb: NetBoxClient, args) -> dict:
         summary["last_input_unchanged"],
     )
 
+    # ── Per-interface "unused" CF update ─────────────────────────────────────
+    # Set the boolean "unused" custom field on every interface:
+    #   True  — port qualified as unused this run (counted in unused_ports)
+    #   False — everything else (UP, ADMIN DOWN, virtual, mode-excluded, etc.)
+    unused_if_updated   = 0
+    unused_if_unchanged = 0
+
+    for iface_name in all_iface_states:
+        target_id = resolve_target_device_id(iface_name, device_id, vc_member_map)
+        is_unused = iface_name in unused_iface_set
+
+        if args.dry_run:
+            log.info(
+                "DRY-RUN  %-30s  would set unused=%s for %s",
+                device_name, is_unused, iface_name,
+            )
+            continue
+
+        try:
+            nb_rec = nb.get_interface_by_name(target_id, iface_name)
+        except NetBoxClientError as exc:
+            err = f"unused CF lookup {iface_name!r}: {exc}"
+            log.warning("%-30s  %s", device_name, err)
+            summary["errors"].append(err)
+            continue
+
+        if nb_rec is None:
+            log.debug(
+                "%-30s  unused CF: %s not in NetBox — skipped",
+                device_name, iface_name,
+            )
+            continue
+
+        current_unused = (nb_rec.get("custom_fields") or {}).get(_CF_UNUSED_IF)
+        if current_unused == is_unused:
+            unused_if_unchanged += 1
+            log.debug(
+                "%-30s  unused CF unchanged for %s (%s)",
+                device_name, iface_name, is_unused,
+            )
+            continue
+
+        try:
+            nb.update_interface(
+                nb_rec["id"],
+                {"custom_fields": {_CF_UNUSED_IF: is_unused}},
+            )
+            unused_if_updated += 1
+            log.info(
+                "%-30s  unused CF updated for %s: %s → %s",
+                device_name, iface_name, current_unused, is_unused,
+            )
+        except NetBoxClientError as exc:
+            err = f"unused CF update {iface_name!r}: {exc}"
+            log.warning("%-30s  %s", device_name, err)
+            summary["errors"].append(err)
+
+    summary["unused_if_updated"]   = unused_if_updated
+    summary["unused_if_unchanged"] = unused_if_unchanged
+    log.info(
+        "%-30s  unused CF: updated=%d unchanged=%d",
+        device_name, unused_if_updated, unused_if_unchanged,
+    )
+
     cisco._cli_disconnect()
     summary["status"] = "success"
     return summary
@@ -1100,11 +1172,13 @@ def main() -> None:
     log.info(
         "DONE  devices=%d ok=%d failed=%d  "
         "states: updated=%d unchanged=%d  "
-        "last_input: updated=%d",
+        "last_input: updated=%d  "
+        "unused CF: updated=%d",
         len(summaries), total_ok, total_fail,
         sum(s.get("states_updated",      0) for s in summaries),
         sum(s.get("states_unchanged",    0) for s in summaries),
         sum(s.get("last_input_updated",  0) for s in summaries),
+        sum(s.get("unused_if_updated",   0) for s in summaries),
     )
 
     print(json.dumps(summaries, indent=2))
