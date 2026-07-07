@@ -319,30 +319,34 @@ def parse_switch_uptime(show_version_output: str) -> Dict[int, str]:
 
     Stack switches
     --------------
-    Looks for sections headed by ``Switch <N>`` followed by a separator line
-    and a ``Switch uptime :`` field:
-
-        Switch 01
-        ---------
-        Switch uptime                 : 4 years, 40 weeks, 3 days, 1 hour, 10 minutes
+    Non-active stack members have a dedicated section headed by ``Switch <N>``
+    with a ``Switch uptime :`` field:
 
         Switch 02
         ---------
         Switch uptime                 : 2 years, 19 weeks, 5 days, 22 hours, 15 minutes
 
-    Returns ``{1: "4 years, 40 weeks...", 2: "2 years, 19 weeks..."}``.
+    The **active** (master) member — switch 1 on C9300 stacks — does NOT get
+    a ``Switch 01`` section.  Its uptime appears only in the global hostname
+    line near the top of the output:
+
+        EJ-Y2H1-9300S-4 uptime is 1 year, 7 weeks, 4 days, 10 hours, 52 minutes
+
+    This function handles both: it first collects non-active members from
+    their sections, then always attempts to fill switch 1 from the global
+    hostname line when it was not already found in a section.
+
+    Returns ``{1: "1 year...", 2: "2 years...", ...}``.
 
     Single switch
     -------------
-    Falls back to the global uptime line:
-
-        hostname uptime is 4 years, 40 weeks, 3 days
-
-    Returns ``{1: "4 years, 40 weeks, 3 days"}``.
+    When there are no ``Switch <N>`` section headers at all, the same global
+    hostname line is used and ``{1: "..."}`` is returned.
     """
     result: Dict[int, str] = {}
 
-    # Per-stack-member header: "Switch 01" on its own line
+    # Per-stack-member header: "Switch 02" / "Switch 03" … on its own line.
+    # The active member (switch 1) on C9300 stacks never has such a header.
     _stack_header_re = re.compile(r"^Switch\s+(\d+)\s*$", re.MULTILINE)
     _stack_uptime_re = re.compile(r"Switch\s+uptime\s*:\s*(.+)", re.IGNORECASE)
 
@@ -359,9 +363,11 @@ def parse_switch_uptime(show_version_output: str) -> Dict[int, str]:
             else:
                 log.debug("No 'Switch uptime' found in Switch %s section", sw_num)
 
-    # Fallback: single-chassis global uptime line
-    # Example: "hostname uptime is 4 years, 40 weeks, 3 days"
-    if not result:
+    # Always attempt to fill switch 1 from the global hostname uptime line.
+    # On C9300 stacks the active member reports uptime here, not in a section.
+    # Also serves as the sole source for standalone (non-stacked) switches.
+    # Example: "EJ-Y2H1-9300S-4 uptime is 1 year, 7 weeks, 4 days, ..."
+    if 1 not in result:
         m = re.search(r"^\S+\s+uptime\s+is\s+(.+)$",
                       show_version_output, re.MULTILINE | re.IGNORECASE)
         if m:
