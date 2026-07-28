@@ -19,6 +19,7 @@ classes (`CiscoDeviceClient`, `NetBoxClient`) and two runnable programs.
 | `netbox_ap.py` | CDP-based Cisco Access Point discovery — creates/updates AP devices, interfaces, IPs, and `software_version` in NetBox |
 | `netbox_shoretel.py` | LLDP-based ShoreTel and Mitel IP phone discovery — creates/updates phone devices, interfaces, IPs, cables, and `software_version` / `last_seen` in NetBox |
 | `netbox_device_modules.py` | Hardware module inventory sync — reads `show inventory` from Cisco devices and creates/updates linecards, supervisors, and power supplies in NetBox |
+| `find_dhcp_helper.py` | Searches Cisco devices for a DHCP helper/relay address in the running-config and writes matching device names to a text file |
 | `network_tracer.py` | Network path tracer — reconstructs the hop-by-hop path between two IPs using NetBox, ARP/NDP, MAC tables, CDP/LLDP, VRFs, FHRP, and routing tables; IPv4 + IPv6; parallel ECMP |
 | `example_usage.py` | Short usage examples for both classes |
 | `requirements.txt` | Python package dependencies |
@@ -2247,6 +2248,176 @@ python netbox_device_modules.py --site-slug dc1
 # Legacy shorthand (equivalent to --device-filter)
 python netbox_device_modules.py --site dc1 --role distribution --limit 10
 ```
+
+---
+
+## Running `find_dhcp_helper.py`
+
+`find_dhcp_helper.py` connects to Cisco IOS / IOS-XE / NX-OS devices pulled
+from NetBox and checks whether a given DHCP helper (relay) address appears
+anywhere in the running-config. For every device it runs:
+
+```
+show running-config | include <dhcp-helper-ip>
+```
+
+Any device where the address is found has its name written to the output
+file (default: `helper_devices.txt`, one device name per line).
+
+Device selection, NetBox connection, credentials, and Vault flags are
+identical to `sync_netbox_interfaces.py` — the same `--device`, `--devices`,
+`--device-file`, `--device-filter`, `--all`, and `--site-slug` filters work
+here too.
+
+Logs go to **stderr**.
+
+---
+
+### Quickstart — credentials from Vault environment variables
+
+```bash
+export VAULT_ADDR=https://vault.example.org
+export VAULT_ROLE_ID=your-role-id
+export VAULT_SECRET_ID=your-secret-id
+
+python find_dhcp_helper.py \
+    --dhcp-helper 10.10.10.10 \
+    --device-filter '{"status": "active"}'
+```
+
+### All matching devices with a filter (legacy credentials)
+
+```bash
+python find_dhcp_helper.py \
+    --netbox-url https://netbox.example.org \
+    --netbox-token your-api-token \
+    --username svc-netauto \
+    --password s3cr3t \
+    --dhcp-helper 10.10.10.10 \
+    --device-filter '{"platform": "iosxe", "status": "active"}'
+```
+
+### Single device
+
+```bash
+python find_dhcp_helper.py \
+    --dhcp-helper 10.10.10.10 \
+    --device core-sw-01
+```
+
+### Comma-separated list of devices
+
+```bash
+python find_dhcp_helper.py \
+    --dhcp-helper 10.10.10.10 \
+    --devices "core-sw-01,acc-sw-01,acc-sw-02"
+```
+
+### Device list from a file
+
+```bash
+python find_dhcp_helper.py \
+    --dhcp-helper 10.10.10.10 \
+    --device-file /etc/netauto/devices.txt
+```
+
+### Limit to a single site
+
+```bash
+# Check only devices in the "lakeview" site
+python find_dhcp_helper.py \
+    --dhcp-helper 10.10.10.10 \
+    --site-slug lakeview
+
+# Combine with a device-filter (both conditions must match)
+python find_dhcp_helper.py \
+    --dhcp-helper 10.10.10.10 \
+    --site-slug westpark \
+    --device-filter '{"status": "active"}'
+```
+
+### Custom output file
+
+```bash
+python find_dhcp_helper.py \
+    --dhcp-helper 10.10.10.10 \
+    --device-filter '{"status": "active"}' \
+    --output-file dhcp_10_10_10_10.txt
+```
+
+### Increase concurrency and verbosity
+
+```bash
+python find_dhcp_helper.py \
+    --dhcp-helper 10.10.10.10 \
+    --device-filter '{"status": "active"}' \
+    --max-workers 10 \
+    --timeout 60 \
+    --log-level DEBUG
+```
+
+---
+
+### Output file example
+
+`helper_devices.txt`:
+
+```
+acc-sw-01
+core-rtr-02
+dist-sw-03
+```
+
+Devices that could not be checked (no primary IP in NetBox, unsupported
+platform, SSH failure, etc.) are logged as warnings on stderr and simply
+omitted from the output file — they are not treated as "not found".
+
+---
+
+### All `find_dhcp_helper.py` CLI flags
+
+```
+usage: find_dhcp_helper.py [-h]
+
+  NetBox connection (ignored when Vault is configured; required otherwise):
+    --netbox-url URL          NetBox base URL (env: NETBOX_URL; ignored when Vault is configured)
+    --netbox-token TOKEN      NetBox API token (env: NETBOX_API; ignored when Vault is configured)
+    --netbox-verify-ssl / --no-netbox-verify-ssl
+
+  Device selection (pick one, or omit for all):
+    --device NAME             Single device name
+    --devices NAME,...        Comma-separated device names
+    --device-file PATH        File with one device name per line (#comments ignored)
+    --device-filter JSON      NetBox DCIM device filter as JSON (default: {})
+    --all                     Explicit "process all" flag
+    --site-slug SLUG          Limit to devices in this site (slug, optional)
+
+  Cisco credentials (ignored when Vault is configured; required otherwise):
+    --username USER           SSH username (env: CISCO_SRV_ACCOUNT; ignored when Vault is configured)
+    --password PASS           SSH password (env: CISCO_SRV_PWD; ignored when Vault is configured)
+    --enable-secret SECRET    Enable-mode secret (env: CISCO_ENABLE_PWD; optional)
+
+  Runtime options:
+    --dhcp-helper IP          DHCP helper/relay address to search for (required)
+    --output-file PATH        File to write matching device names to (default: helper_devices.txt)
+    --max-workers N           Concurrent threads (default: 5)
+    --timeout SEC             Device timeout seconds (default: 30)
+    --log-level {DEBUG,INFO,WARNING,ERROR}    (default: INFO)
+    --log-file PATH           Also write logs to this file (appended, UTF-8)
+
+  Vault authentication:
+    --VAULT_ADDR URL          Vault server address (env: VAULT_ADDR)
+    --VAULT_ROLE_ID ROLE_ID   AppRole role ID (env: VAULT_ROLE_ID)
+    --VAULT_SECRET_ID ID      AppRole secret ID (env: VAULT_SECRET_ID)
+    --use-env-only            Read Vault credentials from env vars only
+    --vault-mount MOUNT       KV v2 mount point (default: secret)
+    --vault-path PATH         KV v2 secret path (default: network/device)
+```
+
+**Note on supported platforms** — `find_dhcp_helper.py` uses
+`CiscoDeviceClient`, which only speaks `ios`, `iosxe`, and `nxos`. Devices
+whose NetBox platform slug maps to anything else (or has no mapping) are
+skipped with a logged reason and excluded from the output file.
 
 ---
 
