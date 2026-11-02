@@ -50,6 +50,7 @@ import os
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from cisco_device_client import CiscoDeviceClient, CiscoDeviceClientError
@@ -4110,6 +4111,15 @@ def sync_device(
         "%-30s  collected %d interface(s) via %s",
         device_name, _n_ifaces, summary["transport_used"],
     )
+
+    # ── last_seen: interface collection succeeded, so the device is reachable ─
+    if not args.dry_run:
+        ts = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for _dev_id in all_vc_device_ids:
+            try:
+                nb.update_device_custom_fields(_dev_id, {"last_seen": ts})
+            except NetBoxClientError as exc:
+                log.warning("%-30s  last_seen update failed: %s", device_name, exc)
 
     # ── Collect VRF assignments from running-config (always CLI) ──────────
     # This is independent of the transport used for interface inventory.
