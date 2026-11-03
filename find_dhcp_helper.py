@@ -130,6 +130,8 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Concurrent device threads (default: 5)")
     run.add_argument("--timeout", type=int, default=30, metavar="SEC",
                      help="Device timeout seconds (default: 30)")
+    run.add_argument("--read-timeout", type=int, default=90, metavar="SEC",
+                     help="Seconds to wait for the command output (default: 90)")
     run.add_argument(
         "--log-level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -296,7 +298,12 @@ def check_device_for_helper(
             enable_secret=args.enable_secret,
             timeout=args.timeout,
         ) as cisco:
-            raw, _parsed, _parser = cisco._cli_run_command(command, parse=False)
+            # Netmiko's default 10s read_timeout is too short for a full
+            # running-config scan on busy/large devices.
+            cisco._cli_connect()
+            raw = cisco._cli_connection.send_command(
+                command, read_timeout=args.read_timeout
+            )
     except (CiscoDeviceClientError, Exception) as exc:
         result["error"] = str(exc)
         return result
