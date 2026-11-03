@@ -4367,6 +4367,50 @@ class NetBoxClient:
                 f"{interface_name!r}: {exc}"
             ) from exc
 
+    def sync_interface_dhcp_helpers(
+        self,
+        device_id: int,
+        desired: Dict[str, str],
+        dry_run: bool = False,
+    ) -> int:
+        """
+        Make the ``dhcp_helper`` custom field of every interface on
+        *device_id* match *desired* (``{interface_name: "ip1,ip2"}``);
+        interfaces absent from *desired* are cleared.  Interfaces whose
+        current list already matches (order/spacing ignored) are not touched.
+
+        Returns the number of interfaces updated (or that would be, in
+        *dry_run*).
+        """
+        def _norm(v: Any) -> frozenset:
+            return frozenset(p.strip() for p in str(v or "").split(",") if p.strip())
+
+        try:
+            records = list(self.nb.dcim.interfaces.filter(device_id=device_id))
+        except pynetbox.RequestError as exc:
+            raise NetBoxClientError(
+                f"sync_interface_dhcp_helpers: list failed for "
+                f"device_id={device_id}: {exc}"
+            ) from exc
+
+        changed = 0
+        for rec in records:
+            cur = (self._to_dict(rec).get("custom_fields") or {}).get("dhcp_helper")
+            want = desired.get(rec.name, "")
+            if _norm(cur) == _norm(want):
+                continue
+            changed += 1
+            if dry_run:
+                continue
+            try:
+                rec.update({"custom_fields": {"dhcp_helper": want or None}})
+            except pynetbox.RequestError as exc:
+                raise NetBoxClientError(
+                    f"sync_interface_dhcp_helpers: write failed for "
+                    f"{rec.name!r}: {exc}"
+                ) from exc
+        return changed
+
     # ----------------------------------------------------------------------- #
     # Platform management                                                      #
     # ----------------------------------------------------------------------- #

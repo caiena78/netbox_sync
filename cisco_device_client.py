@@ -326,6 +326,14 @@ _IP_VRF_FWD_RE = re.compile(r"^\s+ip\s+vrf\s+forwarding\s+(\S+)\s*$", re.IGNOREC
 # NX-OS: "  vrf member CORP"
 _VRF_MEMBER_RE = re.compile(r"^\s+vrf\s+member\s+(\S+)\s*$", re.IGNORECASE)
 
+# DHCP relay targets: IOS/IOS-XE "ip helper-address [global|vrf X] A.B.C.D",
+# NX-OS "ip dhcp relay address A.B.C.D [use-vrf X]".
+_DHCP_HELPER_RE = re.compile(
+    r"^\s+ip\s+(?:helper-address\s+(?:global\s+|vrf\s+\S+\s+)?"
+    r"|dhcp\s+relay\s+address\s+)(\d{1,3}(?:\.\d{1,3}){3})\b",
+    re.IGNORECASE,
+)
+
 # --------------------------------------------------------------------------- #
 # Main class                                                                   #
 # --------------------------------------------------------------------------- #
@@ -2791,6 +2799,41 @@ class CiscoDeviceClient:
                     break
 
         return result
+
+    def get_interface_dhcp_helper_map(self) -> Optional[Dict[str, str]]:
+        """
+        Return ``{interface_name: "ip1,ip2"}`` for every interface that has
+        DHCP helper / relay addresses (sorted numerically, comma separated,
+        no spaces).  Interfaces without helpers are absent.
+
+        Returns ``None`` when the interface config could not be retrieved, so
+        callers never mistake a failed fetch for "no helpers anywhere".
+        """
+        self._cli_connect()
+        raw = self._get_all_interfaces_raw_config()
+        if not raw:
+            return None
+
+        found: Dict[str, set] = {}
+        current: Optional[str] = None
+        for line in raw.splitlines():
+            m = _IFACE_HDR_RE.match(line)
+            if m:
+                current = m.group(1)
+                continue
+            if line and not line[0].isspace() and line.strip() not in ("!", ""):
+                current = None
+                continue
+            if current is None:
+                continue
+            h = _DHCP_HELPER_RE.match(line)
+            if h:
+                found.setdefault(current, set()).add(h.group(1))
+
+        return {
+            name: ",".join(sorted(ips, key=lambda s: tuple(int(o) for o in s.split("."))))
+            for name, ips in found.items()
+        }
 
     # ----------------------------------------------------------------------- #
     # NX-OS Port-Channel HSRP IP discovery                                    #

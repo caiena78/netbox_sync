@@ -4668,6 +4668,28 @@ def sync_device(
     summary["interface_states_updated"] = state_updated
     summary["errors"].extend(state_errors)
 
+    # ── Stage 6.5: DHCP helper addresses → dhcp_helper custom field ──────
+    try:
+        helper_map = cisco.get_interface_dhcp_helper_map()
+        if helper_map is None:
+            # Config fetch failed: skip, or we would clear every field.
+            summary["errors"].append("DHCP helper: interface config unavailable")
+        else:
+            desired: Dict[int, Dict[str, str]] = {d: {} for d in all_vc_device_ids}
+            for _name, _ips in helper_map.items():
+                _n = expand_interface_name(_name)
+                desired[resolve_target_device_id(_n, device_id, vc_member_map)][_n] = _ips
+            n_helper = sum(
+                nb.sync_interface_dhcp_helpers(d, m, dry_run=args.dry_run)
+                for d, m in desired.items()
+            )
+            summary["dhcp_helpers_updated"] = n_helper
+            if n_helper:
+                log.info("%-30s  dhcp_helper %s on %d interface(s)", device_name,
+                         "would update" if args.dry_run else "updated", n_helper)
+    except (CiscoDeviceClientError, NetBoxClientError) as exc:
+        summary["errors"].append(f"DHCP helper sync: {exc}")
+
     # ── Stage 7: Software, platform, and VC propagation ──────────────────
     sw_updated, plat_updated, vc_updated, fact_errors = _sync_device_facts(
         cisco=cisco,
